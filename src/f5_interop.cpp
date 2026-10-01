@@ -691,6 +691,8 @@ public:
     const char* serial() const override { return ser; }
     const char* model() const override { return g_foreignModel; }
     bool writable() const override { return rw; }
+    // The staging region is what the NVMe READ is sized against (see kIscsiOff).
+    uint32_t maxTransfer() const override { return (uint32_t)kIscsiBytes; }
 
     bool read(uint64_t lba, uint32_t nblocks, void* out) override {
         return xfer(NVMEOF_OPC_READ, lba, nblocks, out);
@@ -1415,7 +1417,7 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
     //   * 0x07 and 0x0f -> SUCCESS (Number of Queues and Keep Alive Timeout)
     //
     // ON A DISCOVERY CONTROLLER THE EXPECTATION FLIPS, and getting that wrong is a
-    // mistake this project has now made three times (鎼?.50(4), then the log pages,
+    // mistake this project has now made three times (閹?.50(4), then the log pages,
     // then here): a discovery controller has no write cache, no namespaces and no
     // event mask, so nvmet refuses all four.  The discovery session against Linux
     // reported three FAILs on a perfectly good peer because of it - the checks below
@@ -3910,7 +3912,7 @@ int main(int argc, char** argv) {
                "  %s -initiator <serverIp> <port> <localIp> [-subnqn <nqn>] [-hostnqn <nqn>]\n"
                "               [-queues <n>] [-blocks <n>] [-discover]\n"
                "               [-authkey <DHHC-1:..>] [-authctrlkey <DHHC-1:..>] [-authskip]\n"
-               "               [-iscsi <port> [-iscsiaddr <ip>] [-iscsirw] [-iscsitrace]]\n"
+               "               [-iscsi <port> [-iscsiaddr <ip>] [-iscsirw] [-iscsitrace] [-iscsitime]]\n"
                "  %s -target    <ip> <port> [-serve <n>] [-authkey <DHHC-1:..>]\n"
                "                          [-authdhgroup 2048|3072|4096] [-reconnectwait <s>]\n"
                "                          (n = 1 by default; 0 = keep serving)\n"
@@ -4008,6 +4010,11 @@ int main(int argc, char** argv) {
         // this bridge may be somebody's real disk and nvmet cannot mark it read-only.
         else if (strcmp(argv[i], "-iscsitrace") == 0) {
             g_iscsiTrace = true;
+        }
+        // Aggregate per-command data-path timing (total / NVMe / Data-In send).
+        // One line per SCSI READ, so it can stay on during a throughput run.
+        else if (strcmp(argv[i], "-iscsitime") == 0) {
+            g_iscsiTime = true;
         }
         else if (strcmp(argv[i], "-iscsirw") == 0) {
             g_iscsiReadWrite = true;

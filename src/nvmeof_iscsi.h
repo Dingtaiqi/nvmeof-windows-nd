@@ -62,6 +62,13 @@
 //  only when something is broken - so: off by default, -iscsitrace to turn them on.
 // ---------------------------------------------------------------------------
 static bool g_iscsiTrace = false;
+//  Aggregate data-path timing (-iscsitime), separate from the per-PDU trace.
+//  The per-PDU trace is 16x too expensive to measure with - it perturbs what it
+//  measures - but throughput alone cannot say WHERE the ~0.5 ms per Data-In PDU
+//  goes: it is either this bridge's NVMe read plus socket write, or the Windows
+//  initiator's receive path.  One line per SCSI command, three numbers, answers
+//  it: total, NVMe-staging, and Data-In-send.  Cheap enough to leave on.
+static bool g_iscsiTime = false;
 #include <thread>
 
 // ---------------------------------------------------------------------------
@@ -243,6 +250,13 @@ public:
     virtual const char* serial() const = 0;           // VPD 0x80 / 0x83
     virtual const char* model() const = 0;
     virtual bool writable() const = 0;
+    // Largest NVMe transfer this backend can stage in one command, in bytes; 0 means
+    // "no preference, keep the iSCSI chunk size".  It exists so the target can size
+    // an NVMe READ independently of the Data-In PDU size: the two limits come from
+    // different places (the initiator's MaxRecvDataSegmentLength versus the backend's
+    // registered staging buffer), and pinning them together is what made a 1 MiB READ
+    // cost sixteen submit-and-wait round trips instead of four (DESIGN 8.57).
+    virtual uint32_t maxTransfer() const { return 0; }
     virtual bool read(uint64_t lba, uint32_t nblocks, void* buf) = 0;
     virtual bool write(uint64_t lba, uint32_t nblocks, const void* buf) = 0;
     virtual bool flush() = 0;
@@ -820,7 +834,17 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
                 // "=NotUnderstood" entries seen in that earlier round.
                 offer("HeaderDigest", "None");            // we do not do CRC32C
                 offer("DataDigest", "None");
-                offer("MaxConnections", "1");
+                // MaxConnections: Windows offers 32 and this bridge answers 4 rather than 1.
+                // MEASURED NEGATIVE RESULT: it does not make Windows open more than one
+                // connection.  With this answered as 4, `iscsicli SessionList` still reports
+                // "Number Connections: 1" and throughput is unchanged within run-to-run
+                // noise (79 vs 76 MB/s at depth 1, ~230 MB/s both at depth 8).  A responder
+                // may only lower this value and 4 <= the initiator's 32, so it stays at 4:
+                // it costs nothing and it lets a manually configured multi-connection
+                // session work, but the extra connections have to be asked for explicitly.
+                // Parallelism here comes from the initiator's own queue depth, per the
+                // concurrency numbers recorded with the READ path below.
+                offer("MaxConnections", "4");
                 offer("InitialR2T", "Yes");               // every write is R2T-driven
                 offer("ImmediateData", "No");             // ... which requires this
                 offer("MaxRecvDataSegmentLength", recvLen);
@@ -1118,50 +1142,104 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
             return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
         }
         uint32_t offset = 0, dataSn = 0;
+        // Aggregate timing for this command (see g_iscsiTime above).
+        auto tCmd = std::chrono::steady_clock::now();
+        long long nvmeTotalUs = 0, sendTotalUs = 0;
+        uint32_t pduCount = 0;
         while (offset < bytes) {
-            uint32_t chunk = (uint32_t)((bytes - offset) < maxChunk ? (bytes - offset) : maxChunk);
-            if (chunk % bs) chunk -= chunk % bs;
-            if (chunk == 0) break;
+            // ---- one NVMe read per *staging unit*, one Data-In PDU per chunk ----
+            //
+            // SIZING THE NVMe TRANSFER SEPARATELY FROM THE PDU IS THE WHOLE POINT.
+            // The loop used to read 64 KiB and send it, then read the next 64 KiB and
+            // send that: sixteen submit-and-wait round trips for a 1 MiB READ, because
+            // the NVMe unit was pinned to the largest iSCSI data segment the initiator
+            // will accept.
+            //
+            // HOW BIG A TRANSFER ARRIVES WAS MEASURED OFF THE WIRE, NOT ASSUMED.
+            // Windows sizes the CDB to the request: a 64 KiB read arrives as one
+            // READ(10) with edtl = 65536, and a 1 MiB read arrives as FOUR READ(10)s
+            // with edtl = 262144 each (captured with -iscsitrace; the transfer length
+            // is in the CDB, which is why the trace prints edtl).  So a 256 KiB
+            // command stages 256 KiB in one NVMe read and emits four 64 KiB Data-In
+            // PDUs, which is exactly this change, and it is worth +17% at 1 MiB
+            // (102.1 -> 119.7 MB/s, DESIGN 8.57/8.59) because it removes three
+            // submit-and-wait round trips per command.
+            //
+            // An earlier draft of this comment claimed the opposite - that Windows
+            // caps every READ at 64 KiB and the decoupling never engages.  That came
+            // from extrapolating per-command times instead of reading the CDB, and it
+            // was wrong: the times fit both stories, the wire fits only one.
+            //
+            // The real constraint on this path was measured too (-iscsitime, one
+            // aggregate line per command): a 64 KiB READ costs 755 us total, of which
+            // NVMe staging is 115 us and the Data-In socket write is 635 us, with
+            // nothing else measurable.  A 256 KiB command costs 1922 us = 218 us NVMe
+            // + 1653 us for four PDUs.  So the path is LATENCY-bound per command and
+            // the PDU write dominates it, which is why a single synchronous reader
+            // (depth 1) sees ~79 MB/s at 64 KiB and ~119 MB/s at 1 MiB while the same
+            // bridge measured 230.6 MB/s with 8 concurrent readers.  A throughput
+            // number for this bridge is meaningless without its queue depth.
+            uint32_t unitCap = be.maxTransfer();
+            // No capacity test here: the scratch vector is resized to whatever the
+            // backend wants to stage.  An earlier version consulted
+            // scratch.capacity() first, which is 0 on the first command of a session,
+            // so the unit stayed pinned at one Data-In PDU and the change did nothing
+            // measurable - the guard defeated the feature it was guarding.
+            if (unitCap == 0) unitCap = maxChunk;    // backend has no preference: old shape
+            uint32_t unit = (uint32_t)((bytes - offset) < unitCap ? (bytes - offset) : unitCap);
+            if (unit % bs) unit -= unit % bs;
+            if (unit == 0) break;
             uint64_t curLba = lba + offset / bs;
             // The buffer must EXIST before the backend writes into it.  With one
             // connection per thread the scratch vector arrives empty, and an empty
             // vector's data() is a null pointer - which is exactly what the target
             // side logged: an SGL with addr 0x0.  The read then "failed" with a bare
             // NVMe status and no explanation anywhere on the wire.
-            if (scratch.size() < chunk) scratch.resize(chunk);
+            if (scratch.size() < unit) scratch.resize(unit);
             // Time the NVMe submission separately from everything else.  A streaming
             // test that showed a flat ~45 ms per SCSI command could be either the
             // bridge's own round trip or the initiator's turnaround, and the two have
             // completely different fixes - so measure rather than argue.
             auto tNvme = std::chrono::steady_clock::now();
-            bool nvmeOk = be.read(curLba, chunk / bs, scratch.data());
+            bool nvmeOk = be.read(curLba, unit / bs, scratch.data());
             long long nvmeUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tNvme).count();
             if (nvmeUs >= 1000) {
-                if (g_iscsiTrace) printf("    [iscsi] NVMe READ %u blocks took %lld us\n", chunk / bs, nvmeUs);
+                if (g_iscsiTrace) printf("    [iscsi] NVMe READ %u blocks took %lld us\n", unit / bs, nvmeUs);
             }
+            nvmeTotalUs += nvmeUs;
             if (!nvmeOk) {
                 printf("  [iscsi] READ lba=%llu blocks=%u failed on the NVMe side\n",
-                       (unsigned long long)curLba, chunk / bs);
+                       (unsigned long long)curLba, unit / bs);
                 uint8_t s[18];
                 uint32_t sl = buildSense(s, 0x04 /*HARDWARE ERROR*/, 0x11 /*unrecovered read*/, 0);
                 return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
             }
-            // Data-In padding: the data segment must end on a 4-byte boundary
-            // (RFC 7143 11.1).  Windows reads the length, but a short PDU here is
-            // the classic "works until the transfer length is odd" bug.
-            uint32_t pad = (4 - (chunk % 4)) % 4;
-            uint8_t tail[3] = {};
-            bool last = (offset + chunk >= bytes);
-            if (!sendDataIn(bhs.itt(), scratch.data(), chunk, offset, dataSn++, last)) return false;
-            if (pad) {
-                // Padding goes BEFORE the header of the next PDU in the stream, but
-                // since this is the last PDU of the sequence when pad != 0 in
-                // practice, sending it as part of the data segment is wrong - so it
-                // is appended only when the PDU is final.  A non-final PDU with a
-                // non-multiple-of-4 length cannot happen: chunks are block-sized.
-                (void)tail;
+            // Hand the staged bytes out as Data-In PDUs, each no larger than what the
+            // initiator said it can receive in one PDU.  The data segment must end on
+            // a 4-byte boundary (RFC 7143 11.1); sendDataIn pads per PDU, and only the
+            // final PDU of the transfer carries F.
+            for (uint32_t sent = 0; sent < unit; sent += maxChunk) {
+                uint32_t part = (uint32_t)((unit - sent) < maxChunk ? (unit - sent) : maxChunk);
+                bool last = (offset + sent + part >= bytes);
+                auto tSend = std::chrono::steady_clock::now();
+                bool ok = sendDataIn(bhs.itt(), scratch.data() + sent, part, offset + sent,
+                                     dataSn++, last);
+                sendTotalUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - tSend).count();
+                pduCount++;
+                if (!ok) {
+                    return false;
+                }
             }
-            offset += chunk;
+            offset += unit;
+        }
+        if (g_iscsiTime) {
+            long long totalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - tCmd).count();
+            printf("  [iscsi] time READ %llu B: total %lld us, nvme %lld us, datain %lld us, "
+                   "%u PDU(s), other %lld us\n",
+                   (unsigned long long)bytes, totalUs, nvmeTotalUs, sendTotalUs, pduCount,
+                   totalUs - nvmeTotalUs - sendTotalUs);
         }
         return sendScsiRsp(bhs.itt(), SCSI_STATUS_GOOD, nullptr, 0, 0, false);
     }
