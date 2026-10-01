@@ -456,6 +456,18 @@ public:
             // in the first sixty seconds.
             BOOL nodelay = TRUE;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+            // Socket buffers, set and then MEASURED, which is why the comment is
+            // longer than the code.  The per-command split put 84-86% of a read
+            // command's time inside the Data-In write (635 us for a 64 KiB PDU), and
+            // a 64 KiB PDU exactly fills Windows' default ~64 KiB send buffer, so the
+            // obvious hypothesis was that every send waits for the receiver to drain.
+            // It is wrong: with 1 MiB send and receive buffers the same measurement
+            // reads 669 us, i.e. no change.  Kept because a larger buffer is the
+            // right default for a bulk transport and costs nothing, but it is NOT
+            // what limits this path - DESIGN 8.61.
+            int sndbuf = 1 << 20, rcvbuf = 1 << 20;
+            setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&sndbuf, sizeof(sndbuf));
+            setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
             char who[64];
             sprintf_s(who, "%s:%u", inet_ntoa(from.sin_addr), ntohs(from.sin_port));
             printf("\n  [iscsi] session from %s\n", who);
@@ -506,6 +518,37 @@ private:
         }
         return true;
     }
+    // Scatter/gather send: ONE syscall for a PDU that goes out as several pieces.
+    // Every PDU here used to leave as two or three send() calls (BHS, payload, pad),
+    // which is two or three trips into the TCP stack per 64 KiB of data.  Why it
+    // matters is measured rather than assumed - DESIGN 8.61: this target receives a
+    // 64 KiB Data-Out PDU from Windows' initiator in ~306 us, but sends a 64 KiB
+    // Data-In PDU to the same initiator in ~669 us, and the question is whether the
+    // 2.2x is this function's syscall pattern or the initiator's Data-In path.
+    // Partial sends are still possible, so the remainder is advanced buffer by buffer.
+    bool sendAllVectored(const WSABUF* iov, DWORD n) {
+        DWORD total = 0;
+        for (DWORD i = 0; i < n; i++) total += iov[i].len;
+        DWORD done = 0;
+        while (done < total) {
+            DWORD i = 0, off = done;
+            while (i < n && off >= iov[i].len) { off -= iov[i].len; i++; }
+            if (i >= n) break;
+            WSABUF cur[3];
+            DWORD cn = 0;
+            for (DWORD k = i; k < n && cn < 3; k++) {
+                cur[cn].buf = iov[k].buf + (k == i ? off : 0);
+                cur[cn].len = iov[k].len - (k == i ? off : 0);
+                cn++;
+            }
+            DWORD sent = 0;
+            if (WSASend(conn, cur, cn, &sent, 0, nullptr, nullptr) != 0) return false;
+            if (sent == 0) return false;
+            done += sent;
+        }
+        return true;
+    }
+
     bool sendAll(const void* buf, size_t n) {
         const uint8_t* p = (const uint8_t*)buf;
         while (n) {
@@ -686,8 +729,6 @@ private:
         iscsi_wr32(p + 32, maxCmdSn);
         iscsi_wr32(p + 36, dataSn);
         iscsi_wr32(p + 40, offset);
-        if (!sendAll(p, 48)) return false;
-        if (len && !sendAll(data, len)) return false;
         // Pad the data segment to a 4-byte boundary, exactly the rule that broke the
         // RECEIVE path (see readPdu).  It matters on this side just as much: an
         // INQUIRY answer whose VPD list is 7 bytes long, with no padding, puts the
@@ -695,11 +736,20 @@ private:
         // garbage and drops the session - which is what Windows did, once per
         // enumeration attempt, while the target's log showed a perfectly "GOOD"
         // answer to every command.
+        //
+        // BHS + payload + pad now go out in ONE WSASend rather than two or three
+        // send() calls.  DESIGN 8.61 measured this target receiving a 64 KiB
+        // Data-Out PDU from Windows' initiator in ~306 us but needing ~669 us to
+        // send a 64 KiB Data-In PDU back to it, and the question is whether that
+        // 2.2x is this side's syscall pattern or the initiator's Data-In path.
         uint32_t pad = (4 - (len & 3)) & 3;
-        if (pad) {
-            uint8_t zero[3] = {};
-            if (!sendAll(zero, pad)) return false;
-        }
+        static const char zeroPad[4] = {};
+        WSABUF iov[3];
+        DWORD nbuf = 0;
+        iov[nbuf].buf = (char*)p;        iov[nbuf].len = 48;  nbuf++;
+        if (len) { iov[nbuf].buf = (char*)data;    iov[nbuf].len = len; nbuf++; }
+        if (pad) { iov[nbuf].buf = (char*)zeroPad; iov[nbuf].len = pad; nbuf++; }
+        if (!sendAllVectored(iov, nbuf)) return false;
         bytesOut += len;
         curDataOut += len;              // for the automatic residual in sendScsiRsp
         return true;
@@ -1435,6 +1485,14 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
         //  only reach the backend after the rails below have passed.
         // ------------------------------------------------------------------
         uint32_t offset = 0, r2tSn = 0, burstPdus = 0;
+        // Time the RECEIVE side of a 64 KiB burst, for the same reason the Data-In
+        // send is timed: the read path puts 635-670 us inside a 64 KiB Data-In write,
+        // and "this target's send is slow" and "Windows loopback TCP moves 64 KiB in
+        // ~650 us in either direction" are different findings with different (or no)
+        // fixes.  This is the other direction of the same question, on the same
+        // machine.  Declared out here because the report line below is outside the
+        // first-burst block.
+        auto tBurst = std::chrono::steady_clock::now();
         if (unsolicited_ && firstBurst_ && bytes > 0) {
             uint32_t limit = (uint32_t)((bytes < firstBurst_) ? bytes : firstBurst_);
             if (scratch.size() < limit) scratch.resize(limit);
@@ -1506,8 +1564,12 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
             return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, offset, false);
         }
         if (g_iscsiTime && offset) {
-            printf("  [iscsi] time WRITE %llu B: first burst %u B in %u PDU(s), %s\n",
-                   (unsigned long long)bytes, offset, burstPdus,
+            long long burstUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - tBurst).count();
+            printf("  [iscsi] time WRITE %llu B: first burst %u B in %u PDU(s), %lld us "
+                   "(%lld us/PDU), %s\n",
+                   (unsigned long long)bytes, offset, burstPdus, burstUs,
+                   burstPdus ? burstUs / (long long)burstPdus : 0,
                    (offset >= bytes) ? "no R2T needed" : "R2T for the remainder");
         }
 
