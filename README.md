@@ -181,18 +181,31 @@ Windows 缺失的那个角色（客户端 SKU 没有内置 NVMe-oF initiator）�
 
 ## 许可
 
-**PolyForm Noncommercial License 1.0.0**（`LICENSE`）：个人学习/研究/实验/业余项目，以及慈善、
-教育、公共研究、公共安全与健康、环保、政府机构等**非商业用途免费；商业用途需单独授权**
-（怎么算商业、怎么申请，见 `COMMERCIAL.md`）。
+**GNU Affero General Public License v3.0 或更新版本**（`LICENSE`）—— 逐字官方原文，
+34,523 字节，sha256 `8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef`。
 
-三点要讲清楚：
+```
+Copyright (C) 2026 Dingtaiqi
 
-1. **限制商业用途的许可不是开源许可**。OSI 的开源定义不允许歧视使用领域，所以本仓库是
-   **source-available**，不是 open source。如果你的目标其实是"公司可以免费用，但改了必须回馈"，
-   那要选的是 **AGPL-3.0**（网络服务也算分发）或 **GPL-3.0**，不是这个。
-2. **CC BY-NC 那类协议不要用在软件上**：Creative Commons 明确建议不要把自己的协议用于代码，
-   它没有专利授权、不区分源码与二进制、也没说清楚链接算什么。
-3. `ref/` 下两份 Linux 内核头（`linux_nvme.h`、`linux_nvme_rdma.h`）是 **GPL-2.0**，
-   **只作对照阅读、不参与编译**，不受本仓库许可影响；`run_xref.ps1` 只是把常量与它们做比对。
-   把内核代码并进本工程时要另行注意 GPL 的传染性。
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+```
+
+**AGPL 允许商业使用**，它管的是"闭源"：
+
+- 公司内部使用、拿它赚钱、做成服务 —— **都可以，免费**。
+- 代价是回馈：分发本工程或派生作品（**包括通过网络提供服务**）时必须给出完整对应源码。
+  第 13 条（`LICENSE` L540）就是专门管网络服务的那一条，也是 AGPL 与 GPL 的唯一实质区别
+  —— 对付"拿开源代码做闭源云服务"靠的就是它。
+- 确实需要闭源（嵌进闭源产品、做闭源 SaaS）的公司，可以走 `COMMERCIAL.md` 的商业授权（双授权）。
+
+两个兼容性坑：
+
+1. `ref/` 下两份 Linux 内核头（`linux_nvme.h`、`linux_nvme_rdma.h`）是 **GPL-2.0**，
+   **只作对照阅读、不参与编译**。**GPL-2.0-only 与 AGPL-3.0 不兼容**，
+   不要把它们的代码并进本工程；实在要并，本工程得整体改成 GPL-2.0。
+2. 链接厂商的 NetworkDirect 库（`ndutil`/NDSPI）没有影响——它们不是 copyleft 许可。
+
 
