@@ -1,4 +1,6 @@
-﻿#Requires -RunAsAdministrator
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#Requires -RunAsAdministrator
 <#
     Remove the NVMe-oF iSCSI bridge service installed by install.ps1.
 

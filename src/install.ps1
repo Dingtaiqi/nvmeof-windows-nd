@@ -1,4 +1,6 @@
-﻿#Requires -RunAsAdministrator
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#Requires -RunAsAdministrator
 <#
     Install the NVMe-oF iSCSI bridge as a Windows service.
 
