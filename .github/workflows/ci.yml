@@ -60,3 +60,58 @@ jobs:
         run: |
           .\run_wire.ps1
           if ($LASTEXITCODE -ne 0) { throw "run_wire.ps1 failed (rc=$LASTEXITCODE)" }
+
+      # DH-HMAC-CHAP, and it is here because it CAN be: test_auth.cpp includes only
+      # nvmeof_auth.h and nvmeof_dhchap.h, which need bcrypt and wincrypt and no
+      # NetworkDirect SDK.  Before this suite existed the crypto self-test was
+      # reachable only through f5_interop, i.e. only on a machine with the whole
+      # stack installed - including the place that should check it on every push.
+      # run_authselftest.ps1 is then handed the same exe, so the CNG values are also
+      # recomputed with System.Numerics.BigInteger by an implementation that shares
+      # no code with them.
+      - name: DH-HMAC-CHAP self-test, plus the BigInteger cross-check
+        working-directory: src
+        shell: pwsh
+        run: |
+          .\run_auth.ps1
+          if ($LASTEXITCODE -ne 0) { throw "run_auth.ps1 failed (rc=$LASTEXITCODE)" }
+
+      # Three repository-wide checks, each one added because a mistake of exactly
+      # that shape was committed here during development:
+      #   * a new file without an SPDX header
+      #   * a .ps1 rewritten as ASCII, losing its BOM (Windows PowerShell 5.1 then
+      #     reads it as ANSI and every non-ASCII string comparison breaks)
+      #   * a doc re-encoded from BOM-less UTF-8, so Chinese text became mojibake
+      - name: Repository hygiene (SPDX headers, .ps1 BOMs, doc encoding)
+        shell: pwsh
+        run: |
+          $bad = @()
+
+          foreach ($f in (git ls-files)) {
+            if ($f -notmatch '\.(c|cpp|h|ps1|sh|py)$') { continue }
+            $head = (Get-Content -LiteralPath $f -TotalCount 5 -ErrorAction SilentlyContinue) -join "`n"
+            if ($head -notmatch 'SPDX-License-Identifier') { $bad += "SPDX missing: $f" }
+          }
+
+          foreach ($f in (git ls-files '*.ps1')) {
+            $bytes = [System.IO.File]::ReadAllBytes($f)
+            if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
+              $bad += "no UTF-8 BOM: $f"
+            }
+          }
+
+          $mojibake = $false
+          foreach ($f in @('README.md', 'README.zh-CN.md', 'DESIGN.md')) {
+            if (-not (Test-Path $f)) { continue }
+            $text = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8)
+            if ($text -match '[\u00C2-\u00C3][\u0080-\u00BF]' -or
+                $text -match '[\u00E0-\u00EF][\u0080-\u00BF][\u0080-\u00BF]') {
+              $bad += "mojibake (UTF-8 read as ANSI and re-encoded): $f"
+            }
+          }
+
+          if ($bad.Count -gt 0) {
+            $bad | ForEach-Object { Write-Host "  $_" }
+            throw "$($bad.Count) hygiene check(s) failed"
+          }
+          Write-Host "SPDX headers, .ps1 BOMs and doc encoding all check out"

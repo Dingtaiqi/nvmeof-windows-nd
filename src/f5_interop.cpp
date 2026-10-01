@@ -36,6 +36,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <io.h>        // _dup2 / _fileno / _open_osfhandle, for the service log redirect
+#include <fcntl.h>     // _O_APPEND / _O_TEXT
+#include <share.h>     // _SH_DENYNO
 
 #include "nvmeof_wire.h"
 #include "nvmeof_rdma.h"
@@ -214,6 +217,39 @@ static bool g_survey = false;
 // letter without writing a kernel driver.
 static int  g_iscsiPort = 0;
 static bool g_iscsiReadWrite = false;      // default is READ-ONLY; -iscsirw opts in
+
+// ---------------------------------------------------------------------------
+//  Payload state and Windows service state.
+//
+//  These live at file scope because they are written by the argument parser in
+//  main() and read again by the service thread: under the SCM the payload runs
+//  inside ServiceMain, not in the scope that parsed the command line.  Keeping
+//  one parser and one set of values is deliberate - a service that interprets
+//  its arguments differently from the console path is a bug waiting for a
+//  reboot.
+// ---------------------------------------------------------------------------
+struct Payload {
+    const char* subnqn = "nqn.2024-01.local.rdma:windows-nd";
+    const char* hostnqn = "nqn.2014-08.org.nvmexpress:uuid:ndvmeof-f5-0001";
+    int         wantQueues = 1;
+    uint32_t    blocks = 8;
+    bool        discover = false;
+    int         serveControllers = 1;      // 1 keeps every test's behaviour (see main)
+    const char* initiatorAuthKey = nullptr;
+    const char* initiatorCtrlKey = nullptr;
+    bool        authSkip = false;
+};
+static Payload g_pl;
+
+static bool          g_serviceMode = false;
+static std::string   g_svcName = "nvmeofNdBridge";
+static std::string   g_svcLog;
+static int           g_svcArgc = 0;
+static char**        g_svcArgv = nullptr;
+static int           g_svcRc = 0;
+static SERVICE_STATUS_HANDLE g_ssh = nullptr;
+static SERVICE_STATUS        g_ss = {};
+static IscsiTarget*  g_svcBridge = nullptr;
 // Where the iSCSI listener binds, and what SendTargets advertises.  127.0.0.1 is the
 // safe default; a real local address is for the case where the initiator will not
 // complete a session with a target it considers local.  ONE address, never 0.0.0.0:
@@ -1656,7 +1692,15 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
         printf("      New-IscsiTargetPortal -TargetPortalAddress 127.0.0.1\n");
         printf("      $t = Get-IscsiTarget | Where-Object NodeAddress -like '*nvmeof-bridge*'\n");
         printf("      Connect-IscsiTarget -NodeAddress $t.NodeAddress -IsPersistent $false\n");
-        int rc = target.run(backend, scratch);
+        int rc = 0;
+        {
+            // Publish the bridge so the service control handler can stop it.  Without
+            // this a service stop would kill the process instead of ending the accept
+            // loop, and the sessions Windows still holds would see a hard reset.
+            g_svcBridge = &target;
+            rc = target.run(backend, scratch);
+            g_svcBridge = nullptr;
+        }
         for (uint16_t q = 0; q < kMaxIoQueues; q++) io[q].destroy();
         dev.close(nullptr, nullptr, 0);
         printf("\ninitiator failures: %d\n", g_failures + (rc ? 1 : 0));
@@ -3839,7 +3883,130 @@ static int runTarget(const char* ip, uint16_t port, int maxControllers) {
     return g_failures;
 }
 
+// ---------------------------------------------------------------------------
+//  Windows service mode (-service).
+//
+//  Why it is here: the bridge is the one piece of this project that is meant to
+//  be left running on a machine - Windows' iSCSI initiator connects to it and
+//  the disk appears.  A console program that must be started by hand after every
+//  reboot is not deployable, and "run it as a scheduled task" is a way to have a
+//  service without the stop signal, the failure recovery or the event log.
+//
+//  The SCM gives no arguments (they live in the service's ImagePath) and calls
+//  ServiceMain on its own thread, so the payload has to run INSIDE the service
+//  thread rather than before StartServiceCtrlDispatcher returns.  The command
+//  line is parsed as usual and stashed here for that thread to use, which keeps
+//  one argument parser instead of two.
+//
+//  Only the bridge (-iscsi) can be stopped gracefully: the handler closes its
+//  listening socket, accept() fails and run() returns.  A -target service is
+//  accepted too but stops only when the process is killed, and install.ps1 does
+//  not create one.
+// ---------------------------------------------------------------------------
+//  The state these functions use (g_serviceMode, g_svcBridge, ...) lives at the
+//  top of the file, because the bridge run path publishes g_svcBridge long
+//  before this point.
+
+static DWORD WINAPI svcCtrl(DWORD ctrl, DWORD, LPVOID, LPVOID) {
+    switch (ctrl) {
+    case SERVICE_CONTROL_STOP:
+    case SERVICE_CONTROL_SHUTDOWN:
+        g_ss.dwCurrentState = SERVICE_STOP_PENDING;
+        SetServiceStatus(g_ssh, &g_ss);
+        if (g_svcBridge) g_svcBridge->stop();
+        return NO_ERROR;
+    case SERVICE_CONTROL_INTERROGATE:
+        SetServiceStatus(g_ssh, &g_ss);
+        return NO_ERROR;
+    default:
+        return ERROR_CALL_NOT_IMPLEMENTED;
+    }
+}
+
+static int dispatchPayload(int argc, char** argv);   // the normal mode dispatch
+
+static void WINAPI svcMain(DWORD, LPSTR*) {
+    g_ssh = RegisterServiceCtrlHandlerExA(g_svcName.c_str(), svcCtrl, nullptr);
+    if (!g_ssh) return;
+    // A service has no console: an unredirected printf goes nowhere at all, which is
+    // the worst possible failure mode for a data path.  Redirect here - i.e. only
+    // once the SCM has connected, so the console path keeps its console.
+    //
+    // _fsopen with _SH_DENYNO, not freopen: the CRT's default sharing makes the live
+    // log unreadable ("the process cannot access the file because it is being used by
+    // another process"), and a log that cannot be tailed while the service runs is
+    // exactly the log you need when it misbehaves.
+    if (!g_svcLog.empty()) {
+        // Three layers, because a console-less service is hostile to stdio and each
+        // attempt alone failed in a different way:
+        //   freopen_s   -> output works, but the file cannot be read while the
+        //                  service runs ("used by another process"), so the live log
+        //                  is useless exactly when it is needed
+        //   _fsopen + *stdout = *f -> file created, 0 bytes, every printf vanished
+        //                  (_fileno(stdout) is -1 without a console)
+        //   _dup2       -> same silence
+        // So: a shared Win32 handle for the SCM's std handles, the FILE object copied,
+        // and fd 1 pointed at it.  FILE_SHARE_READ keeps `Get-Content -Wait` working.
+        HANDLE h = CreateFileA(g_svcLog.c_str(), FILE_APPEND_DATA,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            SetStdHandle(STD_OUTPUT_HANDLE, h);
+            SetStdHandle(STD_ERROR_HANDLE, h);
+            int fd = _open_osfhandle((intptr_t)h, _O_APPEND | _O_TEXT);
+            if (fd >= 0) _dup2(fd, 1);
+        }
+        FILE* f = _fsopen(g_svcLog.c_str(), "a", _SH_DENYNO);
+        if (f) {
+            *stdout = *f;
+            setvbuf(stdout, nullptr, _IONBF, 0);
+        }
+        FILE* g = _fsopen(g_svcLog.c_str(), "a", _SH_DENYNO);
+        if (g) {
+            *stderr = *g;
+            setvbuf(stderr, nullptr, _IONBF, 0);
+        }
+    }
+    g_ss.dwServiceType      = SERVICE_WIN32_OWN_PROCESS;
+    g_ss.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    g_ss.dwCurrentState     = SERVICE_RUNNING;
+    SetServiceStatus(g_ssh, &g_ss);
+    printf("[service] %s started (pid %lu)\n", g_svcName.c_str(), GetCurrentProcessId());
+    g_svcRc = dispatchPayload(g_svcArgc, g_svcArgv);
+    printf("[service] %s exiting (rc %d)\n", g_svcName.c_str(), g_svcRc);
+    g_ss.dwCurrentState     = SERVICE_STOPPED;
+    g_ss.dwWin32ExitCode    = (DWORD)g_svcRc;
+    SetServiceStatus(g_ssh, &g_ss);
+}
+
 int main(int argc, char** argv) {
+    // Pre-scan for the service log BEFORE anything touches stdout.
+    //
+    // This ordering is the whole fix.  MSVC's stdio latches the OS handle for a
+    // stream the first time it is configured or used, and `setvbuf` below does
+    // exactly that.  For a service started by the SCM there is no console, so the
+    // latched handle is invalid, and three later attempts to redirect (freopen,
+    // _fsopen + *stdout = *f, CreateFile + SetStdHandle + _dup2) all produced a
+    // created-but-empty file.  Redirect first, configure after.
+    for (int i = 1; i + 1 < argc; i++) {
+        if      (strcmp(argv[i], "-service") == 0) g_serviceMode = true;
+        else if (strcmp(argv[i], "-svcname") == 0) g_svcName = argv[i + 1];
+        else if (strcmp(argv[i], "-log")     == 0) g_svcLog  = argv[i + 1];
+    }
+    bool logFailed = false;
+    if (g_serviceMode && !g_svcLog.empty()) {
+        // freopen_s, and the ordering with setvbuf below is the whole fix: MSVC's
+        // stdio latches the OS handle for a stream the first time it is configured,
+        // and for a service started by the SCM there is no console, so redirecting
+        // afterwards leaves a created-but-empty file.  Measured alternatives that do
+        // NOT work in the UCRT, so nobody has to try them again: _fsopen followed by
+        // `*stdout = *f` (file created, 0 bytes) and CreateFile + SetStdHandle +
+        // _open_osfhandle + _dup2 (same).  freopen rebinds the stream properly.
+        FILE* f = nullptr;
+        if (freopen_s(&f, g_svcLog.c_str(), "a", stdout) != 0) logFailed = true;
+        FILE* g = nullptr;
+        if (freopen_s(&g, g_svcLog.c_str(), "a", stderr) != 0) logFailed = true;
+    }
     // Unbuffered stdout, and this is not cosmetic.  When the CRT sees a redirected
     // stdout it switches to 4 KiB block buffering, so the newest diagnostics sit in
     // memory - and a long-running server is killed rather than exited, which throws
@@ -3849,6 +4016,9 @@ int main(int argc, char** argv) {
     // last PDU had long since arrived.  A log that can lie about the LAST event is
     // worse than no log.
     setvbuf(stdout, nullptr, _IONBF, 0);
+    if (g_serviceMode && !g_svcLog.empty()) {
+        printf("[service] log: %s%s\n", g_svcLog.c_str(), logFailed ? " (open FAILED)" : "");
+    }
     // Primitives first, before anything else needs a command line: a wrong hash or a
     // byte-reversed DH secret makes every later failure look like a protocol bug.
     if (argc >= 2 && strcmp(argv[1], "-authselftest") == 0) {
@@ -3941,19 +4111,21 @@ int main(int argc, char** argv) {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    const char* subnqn = "nqn.2024-01.local.rdma:windows-nd";
-    const char* hostnqn = "nqn.2014-08.org.nvmexpress:uuid:ndvmeof-f5-0001";
-    int wantQueues = 1;
-    uint32_t blocks = 8;
-    bool discover = false;
+    // These are REFERENCES into g_pl, not locals: the service thread runs the same
+    // dispatch and has to see the same parsed values (see the Payload struct).
+    const char*& subnqn = g_pl.subnqn;
+    const char*& hostnqn = g_pl.hostnqn;
+    int& wantQueues = g_pl.wantQueues;
+    uint32_t& blocks = g_pl.blocks;
+    bool& discover = g_pl.discover;
     // How many controllers a target run serves.  1 keeps every existing test's
     // behaviour - including F7's "the target exits when its host disappears" - while
     // a real host needs more: `nvme discover` and `nvme connect` are two separate
     // controllers, and the discovery one leaves before the I/O one arrives.
-    int  serveControllers = 1;
-    const char* initiatorAuthKey = nullptr;
-    const char* initiatorCtrlKey = nullptr;
-    bool authSkip = false;
+    int& serveControllers = g_pl.serveControllers;
+    const char*& initiatorAuthKey = g_pl.initiatorAuthKey;
+    const char*& initiatorCtrlKey = g_pl.initiatorCtrlKey;
+    bool& authSkip = g_pl.authSkip;
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "-subnqn") == 0 && i + 1 < argc)  subnqn = argv[++i];
         else if (strcmp(argv[i], "-hostnqn") == 0 && i + 1 < argc) hostnqn = argv[++i];
@@ -4025,6 +4197,18 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "-iscsir2tcfg") == 0 && i + 1 < argc) {
             g_r2tProbePath = argv[++i];
             printf("  iscsir2tcfg: R2T probe file '%s'\n", g_r2tProbePath.c_str());
+        }
+        // Run as a Windows service (started by the SCM, see install.ps1).
+        else if (strcmp(argv[i], "-service") == 0) {
+            g_serviceMode = true;
+        }
+        else if (strcmp(argv[i], "-svcname") == 0 && i + 1 < argc) {
+            g_svcName = argv[++i];
+        }
+        // Where a service's output goes.  A service has no console, so without this
+        // every printf is silently discarded.
+        else if (strcmp(argv[i], "-log") == 0 && i + 1 < argc) {
+            g_svcLog = argv[++i];
         }        else if (strcmp(argv[i], "-iscsimbl") == 0 && i + 1 < argc) {
             long v = atol(argv[++i]);
             if (v >= 512 && v <= 16777215) g_iscsiMaxBurst = (uint32_t)v;
@@ -4066,15 +4250,45 @@ int main(int argc, char** argv) {
                probe.hashId, probe.secretLen, (unsigned)g_targetDhGroup);
     }
 
+    if (g_serviceMode) {
+        g_svcArgc = argc;
+        g_svcArgv = argv;
+        SERVICE_TABLE_ENTRYA table[2] = {};
+        table[0].lpServiceName = (LPSTR)g_svcName.c_str();
+        table[0].lpServiceProc = svcMain;
+        // NOT redirected yet: if this fails because somebody ran -service from a
+        // console, the explanation has to reach that console.  The log redirect
+        // happens in svcMain, i.e. only once the SCM has actually connected.
+        if (!StartServiceCtrlDispatcherA(table)) {
+            DWORD e = GetLastError();
+            if (e == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
+                printf("-service is meant to be started by the service control manager,\n"
+                       "not from a console.  Use install.ps1, or run the same command\n"
+                       "line without -service.\n");
+            } else {
+                printf("StartServiceCtrlDispatcher failed (error %lu)\n", e);
+            }
+            return 3;
+        }
+        return g_svcRc;
+    }
+    return dispatchPayload(argc, argv);
+}
+
+// The payload, factored out so the service thread and the console path run exactly
+// the same code.  Anything that behaves differently as a service is a bug waiting
+// for a reboot.
+static int dispatchPayload(int argc, char** argv) {
     HRESULT hr = NdStartup();
     if (FAILED(hr)) { printf("NdStartup 0x%08X\n", (unsigned)hr); WSACleanup(); return 1; }
 
     int rc = 2;
-    if (strcmp(argv[1], "-target") == 0) rc = runTarget(argv[2], (uint16_t)atoi(argv[3]), serveControllers);
+    if (strcmp(argv[1], "-target") == 0)
+        rc = runTarget(argv[2], (uint16_t)atoi(argv[3]), g_pl.serveControllers);
     else if (strcmp(argv[1], "-initiator") == 0 && argc >= 5)
-        rc = runInitiator(argv[2], (uint16_t)atoi(argv[3]), argv[4], subnqn, hostnqn,
-                          wantQueues, blocks, discover,
-                          initiatorAuthKey, initiatorCtrlKey, authSkip);
+        rc = runInitiator(argv[2], (uint16_t)atoi(argv[3]), argv[4], g_pl.subnqn, g_pl.hostnqn,
+                          g_pl.wantQueues, g_pl.blocks, g_pl.discover,
+                          g_pl.initiatorAuthKey, g_pl.initiatorCtrlKey, g_pl.authSkip);
     else printf("unknown mode %s\n", argv[1]);
 
     NdCleanup();

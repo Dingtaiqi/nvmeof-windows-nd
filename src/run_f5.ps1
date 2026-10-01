@@ -53,7 +53,7 @@ if (Test-Path $mxlInc) { $inc += " /I`"$mxlInc`"" }
 $cmd = "call `"$vsdev`" -arch=x64 -no_logo >nul 2>&1 && cd /d `"$src`" && " +
        "cl /nologo /W4 /std:c++17 /EHsc $inc f5_interop.cpp " +
        "/Fe:f5_interop.exe /Fo:f5_interop.obj " +
-       "/link /LIBPATH:`"$ndLib`" ndutil.lib ws2_32.lib"
+       "/link /LIBPATH:`"$ndLib`" ndutil.lib ws2_32.lib advapi32.lib"
 Write-Host "building f5_interop.exe ..."
 Remove-Item $exe -ErrorAction SilentlyContinue
 $buildOut = & cmd.exe /c $cmd 2>&1

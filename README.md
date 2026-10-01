@@ -43,7 +43,7 @@ their first real run they found **11 defects**, 7 of them cases where our two en
 misreading of the same field, while 8/8 self-tests had been green. **Self-consistency is not
 correctness.**
 
-The whole suite is one command — 10 of 10 suites, ~220 s:
+The whole suite is one command — 11 of 11 suites, ~250 s:
 
 ```powershell
 cd <repo>\src
@@ -150,7 +150,7 @@ random file keeps its checksum across a remount.
 | `src/f7_faults.cpp` | F7 — fault injection (peer vanishes, and the reverse) |
 | `src/wire_selftest.c` | Byte-level golden self-test, compiled as both C and C++ |
 | `src/xref_constants.py` | Cross-checks every constant against the two Linux reference headers (97 pairs, 21 of them DH-HMAC-CHAP) |
-| `src/run_all.ps1` | Runs all 10 suites and prints a verdict table (~220 s) |
+| `src/run_all.ps1` | Runs all 11 suites and prints a verdict table (~250 s) |
 | `src/run_f5_auth.ps1` | The six DH-HMAC-CHAP cases (two local ports, no Linux needed) |
 | `src/interop_link.ps1` | Interop link: bridge + address/route move + MTU lowering, with automatic rollback |
 | `src/f5_session.ps1` | **Whole interop session** in one command: link → peer → direction A → discovery → direction B → report file; `-Auth` adds authentication |
@@ -193,19 +193,65 @@ random file keeps its checksum across a remount.
 
 ## Running
 
-All 10 suites in order, mutually isolated, ~6 minutes:
+All 11 suites in order, mutually isolated, ~6 minutes:
 
 ```powershell
 cd <repo>\src
 .\run_all.ps1
 ```
 
-Individually: `run_xref.ps1`, `run_wire.ps1`, `run_f1.ps1`, `run_f3.ps1`, `run_f4.ps1`,
-`run_f5.ps1`, `run_f5_auth.ps1`, `run_f6.ps1`, `run_f7.ps1`, `run_stag.ps1`.
+Individually: `run_xref.ps1`, `run_wire.ps1`, `run_auth.ps1`, `run_f1.ps1`, `run_f3.ps1`,
+`run_f4.ps1`, `run_f5.ps1`, `run_f5_auth.ps1`, `run_f6.ps1`, `run_f7.ps1`, `run_stag.ps1`.
+
+`run_xref.ps1`, `run_wire.ps1` and `run_auth.ps1` need no NIC and no NetworkDirect SDK, which
+is why CI runs exactly those three (plus three repository-hygiene checks: SPDX headers, UTF-8
+BOMs on every `.ps1`, and no mojibake in the docs). `run_auth.ps1` builds `test_auth.cpp` — the
+DH-HMAC-CHAP primitives and protocol pieces against published vectors — and then hands the same
+exe to `run_authselftest.ps1`, which recomputes the Diffie-Hellman values with
+`System.Numerics.BigInteger` as an independent cross-check. The crypto is therefore verified on
+every push, not only on a machine with the whole stack installed.
 
 Every suite follows the same rule: **delete the old exe → check the compiler's exit code →
 compare source and header timestamps.** A binary that merely *looks* current is never run —
 that rule came from a real incident (DESIGN §8.6).
+
+## Running the bridge as a Windows service
+
+The bridge is the piece meant to stay running: Windows' own iSCSI initiator connects to it and
+the remote disk appears. `install.ps1` copies the exe, registers the service (automatic start,
+restart on failure) and starts it; `uninstall.ps1` stops it, logs the iSCSI session out and
+removes both directories:
+
+```powershell
+cd <repo>\src
+# read-only by default; add -ReadWrite to allow writes (up to 64 KiB writes work today)
+.\install.ps1 -Target 192.168.100.5 -Subnqn nqn.2024-01.local.rdma:linux-nvmet `
+              -RdmaLocal 192.168.100.3 -IscsiPort 3260
+
+iscsicli AddTargetPortal 127.0.0.1 3260
+Connect-IscsiTarget -NodeAddress iqn.2024-01.com.nvmeof:bridge0 -IsPersistent $false
+Get-Disk | Where-Object BusType -eq 'iSCSI'
+
+.\uninstall.ps1
+```
+
+| | |
+|---|---|
+| installed to | `%ProgramFiles%\nvmeof-windows-nd\` (exe + `bridge.conf`, one argument per line) |
+| log | `%ProgramData%\nvmeof-windows-nd\bridge.log` |
+| service name | `nvmeofNdBridge` (`-ServiceName` to change it) |
+| command line | the whole bridge command sits in the service's ImagePath; `sc qc nvmeofNdBridge` shows it |
+
+Two things worth knowing before you deploy it:
+
+- **The log is locked while the service runs** (`Get-Content` reports "used by another
+  process"). Stop the service to read it, or point `-log` at a path you can copy afterwards.
+  This is a recorded limitation, not an oversight — see DESIGN §8.62(2).
+- The service runs the **bridge** only. It still needs an NVMe-oF target to talk to: the Linux
+  box, or a second `-target` run of the same exe (which is how the service was verified
+  end-to-end: install → serve a known pattern → `0 / 65536 bytes differ` → `Stop-Service` →
+  clean `exiting (rc 0)`).
+
 
 ## Which binary to use against a real host
 

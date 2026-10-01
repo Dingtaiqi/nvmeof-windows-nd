@@ -3636,6 +3636,86 @@ socket 写上（单连接约 100 MB/s）。这一轮按计划试两个优化：*
 也就是说：桥的**单命令延迟**里，大半不在我们的代码里；桥的**吞吐**由队列深度决定。
 这与 §8.59 的结论一致，只是现在把责任方定位到了具体一侧，而不是笼统地说"Data-In 写占 84%"。
 
+### 8.62 ✅ 工程化：把桥装成真正的 Windows 服务；一个"改了四次才通"的日志重定向；CI 从 2 个套件扩到 3 个 + 三项卫生检查
+
+**为什么要做**：桥是这个项目里唯一"应该一直跑着"的东西——Windows 的 iSCSI initiator 连上它，
+磁盘就在。一个每次重启都要人工双击的控制台程序不叫可部署；"用计划任务凑"等于要一个服务却没有
+停止信号、没有失败恢复、没有事件日志。
+
+#### (1) 加了什么
+
+- `-service` / `-svcname` / `-log`：`RegisterServiceCtrlHandlerEx` + `StartServiceCtrlDispatcher`，
+  收到 STOP/SHUTDOWN 时调 `IscsiTarget::stop()`（关掉监听 socket → `accept()` 失败 → `run()` 返回），
+  退出码如实回报给 SCM。
+- **把 payload 抽成 `dispatchPayload()`**，让服务线程和控制台路径跑**同一份**代码；为此把命令行解析
+  出来的状态搬进 `Payload g_pl`（服务线程在 `ServiceMain` 里跑，看不到 `main` 的局部变量）。
+  一个"服务模式下参数解释得不一样"的 bug 只等一次重启就会发作，不值得留。
+- `install.ps1` / `uninstall.ps1`：拷 exe 到 `%ProgramFiles%\nvmeof-windows-nd\`、写 `bridge.conf`、
+  注册服务（自动启动 + 失败重启）、日志放 `%ProgramData%\nvmeof-windows-nd\bridge.log`；
+  卸载时**先踢掉 iSCSI 会话再删服务**（顺序反了就会留下一个后端已经没了的磁盘——开发期间真出现过）。
+
+#### (2) 日志重定向改了四次，前三次都是**静默失败**
+
+服务没有控制台，不重定向的 `printf` 等于扔进黑洞。四次尝试：
+
+| # | 做法 | 结果 |
+|---|---|---|
+| 1 | `freopen_s` 到日志（在 `svcMain` 里） | ❌ 文件被创建，**0 字节** |
+| 2 | `_fsopen(_SH_DENYNO)` + `*stdout = *f` | ❌ 同样 0 字节 |
+| 3 | `CreateFile` + `SetStdHandle` + `_open_osfhandle` + `_dup2` | ❌ 同样 0 字节 |
+| 4 | **`freopen_s` 放在 `main` 最前面、`setvbuf` 之前** | ✅ 4106 字节 |
+
+原因是 MSVC 的 stdio 在**第一次配置或使用**某个流时就把 OS 句柄记住了，而 `main` 开头的
+`setvbuf(stdout, nullptr, _IONBF, 0)` 正好就是那一次；服务进程没有控制台，被记住的句柄是无效的，
+之后再怎么重定向都写不出去。**顺序才是那个修复**，不是 API 的选择。
+（顺带一个有价值的负面结论：`*stdout = *f` 这个流传很广的写法在 UCRT 上并不成立——文件建了、
+0 字节。以后不用再试。）
+
+**危险之处在于它们全是静默的**：服务 `Running`、数据也照常供着，只有日志是空的——「服务在跑」
+根本不能证明「日志在写」。抓到它的检查必须是"文件有没有字节"。
+
+残留的小毛病如实记下：**服务运行期间日志文件被占用**，`Get-Content` 会报 "used by another
+process"，要等 `Stop-Service` 之后才能读（`freopen` 的共享模式没得选；`_fsopen` 那条路又写不出东西）。
+
+#### (3) `sc.exe` 的 `binPath=` 在 PowerShell 里会被吃掉引号
+
+第一次安装"成功"到没有任何服务：`sc.exe create X binPath= "C:\...\a.exe" -arg ...` 经 PowerShell
+传参后引号被拆坏，`sc` 只打印了自己的用法说明。**用 `New-Service -BinaryPathName <整条命令行>`**：
+SCM 的 ImagePath 本来就承载整条命令行，cmdlet 接受它作为一个字符串，没有引号问题。
+（失败原因是后来手工重放 `sc.exe` 打印用法才看清的——`| Out-Null` 把它藏了一轮。）
+
+#### (4) 服务模式端到端验证（本机自测：我方 target 当后端）
+
+| 步骤 | 结果 |
+|---|---|
+| `install.ps1` 安装并启动 | `started: Running` ✅ |
+| 服务日志 | 4106 字节 ✅ |
+| Windows iSCSI 连上服务、读 12 MiB 处图案 | **0 / 65536 字节不符** ✅ |
+| `Stop-Service` | 6 秒内 `Stopped` ✅ |
+| 停止时日志 | `initiator failures: 0` + `[service] nvmeofNdBridge exiting (rc 0)` ✅ |
+| `uninstall.ps1` | 服务删除、两个目录删除、会话登出；**用户的 NAS 门户 192.168.1.114 未被触碰** ✅ |
+
+#### (5) CI：2 个套件 → 3 个套件 + 三项卫生检查
+
+新增 `run_auth.ps1` + `test_auth.cpp`：DH-HMAC-CHAP 的**自检和协议件**过去只能通过
+`f5_interop -authselftest` 跑，而 `f5_interop.cpp` 包含 `nvmeof_rdma.h`——需要本仓库**不含**的
+NetworkDirect SDK，于是"每次 push 都该检查的东西"只能在已经装好整套栈的机器上检查。而
+`nvmeof_auth.h` / `nvmeof_dhchap.h` 只需要 bcrypt + wincrypt，所以能编、能跑、能进 CI；
+同一份 exe 再交给 `run_authselftest.ps1`，用 `System.Numerics.BigInteger` 独立重算 DH 值做交叉验证。
+
+再加三项**仓库卫生**检查，每一项都对应这个仓库真实犯过的错：
+
+| 检查 | 对应的真实错误 |
+|---|---|
+| 每个源文件要有 SPDX 头 | 新加文件漏 SPDX |
+| 每个 `.ps1` 要有 UTF-8 BOM | 用 ASCII 重写 `.ps1` 把 BOM 弄丢 → Windows PowerShell 5.1 按 ANSI 读，非 ASCII 字符串比较全错 |
+| 三份文档不得出现 mojibake 模式 | 用 `Get-Content -Raw` 读 BOM-less UTF-8 再写回，把中文写成乱码提交过 |
+
+写这三项检查时就当场抓到两个真问题：`src/run_all.ps1` 和 `src/run_f5.ps1` **没有 BOM**，
+而后者含 14 个非 ASCII 字符。已补。
+
+本地套件数因此从 10 变成 **11**（`run_all.ps1` 已加入 `run_auth.ps1`）。
+
 ## 7. 已知风险
 
 | 风险 | 说明 | 缓解 |

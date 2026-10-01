@@ -227,6 +227,35 @@ Number FriendlyName        PartitionStyle OperationalStatus SizeGB IsReadOnly
 
 全部实测输出（含拆除步骤与踩到的三个坑）见 `EVIDENCE-1TB.md`。
 
+## 装成 Windows 服务
+
+桥是这套东西里唯一"应该一直跑着"的部分：Windows 自带的 iSCSI initiator 连上它，远端盘就出现。
+`install.ps1` 负责拷贝 exe、注册服务（自动启动 + 失败重启）并启动；`uninstall.ps1` 负责停服务、
+登出 iSCSI 会话、删掉两个目录：
+
+```powershell
+cd <repo>\src
+# 默认只读；要允许写就加 -ReadWrite（目前 64 KiB 以内的写可用）
+.\install.ps1 -Target 192.168.100.5 -Subnqn nqn.2024-01.local.rdma:linux-nvmet `
+              -RdmaLocal 192.168.100.3 -IscsiPort 3260
+.\uninstall.ps1
+```
+
+| | |
+|---|---|
+| 安装到 | `%ProgramFiles%\nvmeof-windows-nd\`（exe + `bridge.conf`，一行一个参数） |
+| 日志 | `%ProgramData%\nvmeof-windows-nd\bridge.log` |
+| 服务名 | `nvmeofNdBridge`（可用 `-ServiceName` 改） |
+| 命令行 | 整条桥的命令行放在服务的 ImagePath 里，`sc qc nvmeofNdBridge` 可查 |
+
+两点部署前要知道：
+
+- **服务运行时日志文件是被占用的**（`Get-Content` 会报 "used by another process"）。要读就先
+  `Stop-Service`，或者把 `-log` 指到别处再拷贝。这是已记录的局限，不是疏忽——见 DESIGN §8.62(2)。
+- 服务只跑**桥**，它仍然需要一个 NVMe-oF target：那台 Linux，或者同一个 exe 再开一个 `-target`
+  （服务的端到端验证就是这么做的：安装 → 供一个已知图案 → `0 / 65536 字节不符` → `Stop-Service`
+  → 干净地 `exiting (rc 0)`）。
+
 ## 硬件前提
 
 - 一台 Windows 机器 + 一块支持 RoCE 的网卡（本工程实测：ConnectX-3 Pro，
