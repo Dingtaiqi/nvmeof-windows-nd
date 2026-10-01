@@ -1,0 +1,24 @@
+# ===========================================================================
+#  .gitattributes — 这个仓库同时有 Windows 源码和 Linux 脚本，行尾必须分开管。
+#
+#  为什么必须写：`linux/*.sh` 会被 scp 到 Linux 上直接执行。如果 Git 在检出时
+#  把 LF 换成 CRLF，`#!/bin/sh` 后面会多一个 CR，内核找不到解释器，
+#  脚本以 "bad interpreter" 失败 —— 而文件内容看起来完全正常。
+# ===========================================================================
+
+* text=auto
+
+# Linux 侧：一律 LF（scp 过去要能直接跑）
+*.sh                text eol=lf
+*.py                text eol=lf
+ref/*.h             text eol=lf
+
+# Windows 侧：源码与脚本
+*.cpp               text
+*.h                 text
+*.c                 text
+*.ps1               text
+*.md                text
+*.json              text
+.gitignore          text
+.gitattributes      text

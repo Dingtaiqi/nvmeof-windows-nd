@@ -1,0 +1,82 @@
+# ===========================================================================
+#  .gitignore — NVMe-oF / RDMA (Windows NetworkDirect)
+#
+#  分三类：编译产物、跑测试留下的现场、以及**绝对不能提交的密钥**。
+#  最后一类是重点：本工程的 -genkey 会生成 DH-HMAC-CHAP 密钥文件，
+#  它一旦进了仓库就等于把认证凭据公开了。
+# ===========================================================================
+
+# ---- 编译产物 ----
+*.exe
+*.obj
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.iobj
+*.ipdb
+*.tlog
+*.lastbuildstate
+*.unsuccessfulbuild
+*.res
+*.pgd
+*.pgc
+*.sbr
+x64/
+Debug/
+Release/
+
+# ---- Visual Studio ----
+.vs/
+*.user
+*.suo
+*.vsidx
+DocumentLayout.json
+Browse.VC.db
+AutoPCH/
+
+# ---- 跑测试/互操作留下的现场（都能重新生成） ----
+*.log
+*.err
+f5_session_*.txt
+f5_dirB_target*.txt
+auth_srv*.txt
+auth_cli*.txt
+stag_srv*.txt
+stag_cli*.txt
+f7_*.txt
+disc*.txt
+x_srv.txt
+x_cli.txt
+admin_srv.txt
+mq_srv.txt
+ns_srv.txt
+reset_srv.txt
+manual_srv.txt
+f1_*.txt
+f3_*.txt
+f4_*.txt
+f5_srv.txt
+f5_cli.txt
+f6_*.txt
+rfc7919.txt              # gen_dhgroups.ps1 会按需重新下载
+interop_link_state.json  # 桥接前的网络状态记录，脚本自己会写
+interop_link_state.json.bak-*
+
+# ---- 密钥与凭据（务必不要提交） ----
+*authkey*
+*.key
+*.pem
+*_pubkey*
+id_rsa*
+id_ed25519*
+
+# ---- 本地镜像/卷文件 ----
+*.img
+*.vhd
+*.vhdx
+
+# ---- 工具链 ----
+__pycache__/
+*.pyc
+.claude/
