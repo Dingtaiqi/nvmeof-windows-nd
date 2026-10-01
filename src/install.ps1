@@ -52,6 +52,11 @@ param(
     # Extra arguments for f5_interop, e.g. '-iscsitrace' while debugging.
     [string[]] $ExtraArgs = @(),
 
+    # Keep retrying the NVMe-oF peer instead of exiting while it is unreachable.  A
+    # service whose peer (the Linux box) boots after this machine should come up on its
+    # own rather than restart every 5 s until the timing happens to be right.
+    [int] $BackendRetrySeconds = 15,
+
     [string] $ExeSource = (Join-Path $PSScriptRoot 'f5_interop.exe')
 )
 
@@ -85,6 +90,7 @@ $args = @(
     '-log', $log
 )
 if ($ReadWrite) { $args += '-iscsirw' }
+if ($BackendRetrySeconds -gt 0) { $args += @('-backendretry', "$BackendRetrySeconds") }
 $args += $ExtraArgs
 
 $conf = Join-Path $InstallDir 'bridge.conf'

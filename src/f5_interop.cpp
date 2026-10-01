@@ -250,6 +250,18 @@ static int           g_svcRc = 0;
 static SERVICE_STATUS_HANDLE g_ssh = nullptr;
 static SERVICE_STATUS        g_ss = {};
 static IscsiTarget*  g_svcBridge = nullptr;
+// -backendretry <seconds>: keep trying to reach the NVMe-oF peer instead of exiting.
+//
+// Why: installed as a service, the bridge is supposed to be there when the disk is
+// wanted, and the peer (the Linux box, or a second -target run) may well come up after
+// this machine does.  Without this the process exits rc=1 on a failed connect and the
+// SCM restarts it every 5 s - which works, but logs a failure every 5 s and means the
+// disk appears only by luck of timing.  With it the service stays Running and connects
+// when the peer arrives.
+static uint32_t      g_backendRetryMs = 0;
+// Set by the service control handler so a stop during the retry wait is honoured:
+// there is no IscsiTarget to stop() yet at that point.
+static volatile LONG g_svcStopRequested = 0;
 // Where the iSCSI listener binds, and what SendTargets advertises.  127.0.0.1 is the
 // safe default; a real local address is for the case where the initiator will not
 // complete a session with a target it considers local.  ONE address, never 0.0.0.0:
@@ -861,6 +873,15 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
         if (!up) {
             Report("admin RDMA-CM connection to the target", 0, "connect failed");
             printf("\ninitiator failures: %d\n", g_failures);
+            // Release what this attempt took before returning.  This path used to leak
+            // the device, its queues and the registered region - harmless when the
+            // process exited right after, fatal the moment -backendretry made this
+            // function run again in a loop: every retry would take another device and
+            // another few MiB of registration until the adapter ran out.  No lock is
+            // needed here: this runs before any iSCSI session exists.
+            for (uint16_t q = 0; q < kMaxIoQueues; q++) io[q].destroy();
+            admin.destroy();
+            dev.close(nullptr, nullptr, 0);
             return g_failures;
         }
         Report("admin RDMA-CM connection to the target", 1, nullptr);
@@ -3913,6 +3934,9 @@ static DWORD WINAPI svcCtrl(DWORD ctrl, DWORD, LPVOID, LPVOID) {
     case SERVICE_CONTROL_SHUTDOWN:
         g_ss.dwCurrentState = SERVICE_STOP_PENDING;
         SetServiceStatus(g_ssh, &g_ss);
+        // Both, because they cover different states: the flag stops a retry wait (no
+        // bridge exists yet), and stop() ends the accept loop (bridge is up).
+        InterlockedExchange(&g_svcStopRequested, 1);
         if (g_svcBridge) g_svcBridge->stop();
         return NO_ERROR;
     case SERVICE_CONTROL_INTERROGATE:
@@ -4083,6 +4107,7 @@ int main(int argc, char** argv) {
                "               [-queues <n>] [-blocks <n>] [-discover]\n"
                "               [-authkey <DHHC-1:..>] [-authctrlkey <DHHC-1:..>] [-authskip]\n"
                "               [-iscsi <port> [-iscsiaddr <ip>] [-iscsirw] [-iscsitrace] [-iscsitime] [-iscsimbl <bytes>] [-iscsir2tcfg <file>]]\n"
+               "               [-backendretry <s>]\n"
                "  %s -target    <ip> <port> [-serve <n>] [-authkey <DHHC-1:..>]\n"
                "                          [-authdhgroup 2048|3072|4096] [-reconnectwait <s>]\n"
                "                          (n = 1 by default; 0 = keep serving)\n"
@@ -4202,6 +4227,13 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "-service") == 0) {
             g_serviceMode = true;
         }
+        // -backendretry <seconds>: keep retrying the NVMe-oF peer instead of exiting
+        // (a service that flaps every 5 s when its peer is down is not deployable).
+        else if (strcmp(argv[i], "-backendretry") == 0 && i + 1 < argc) {
+            int s = atoi(argv[++i]);
+            if (s < 1 || s > 3600) { printf("-backendretry %d: 1..3600 seconds\n", s); return 2; }
+            g_backendRetryMs = (uint32_t)s * 1000;
+        }
         else if (strcmp(argv[i], "-svcname") == 0 && i + 1 < argc) {
             g_svcName = argv[++i];
         }
@@ -4285,10 +4317,22 @@ static int dispatchPayload(int argc, char** argv) {
     int rc = 2;
     if (strcmp(argv[1], "-target") == 0)
         rc = runTarget(argv[2], (uint16_t)atoi(argv[3]), g_pl.serveControllers);
-    else if (strcmp(argv[1], "-initiator") == 0 && argc >= 5)
-        rc = runInitiator(argv[2], (uint16_t)atoi(argv[3]), argv[4], g_pl.subnqn, g_pl.hostnqn,
-                          g_pl.wantQueues, g_pl.blocks, g_pl.discover,
-                          g_pl.initiatorAuthKey, g_pl.initiatorCtrlKey, g_pl.authSkip);
+    else if (strcmp(argv[1], "-initiator") == 0 && argc >= 5) {
+        for (;;) {
+            rc = runInitiator(argv[2], (uint16_t)atoi(argv[3]), argv[4], g_pl.subnqn,
+                              g_pl.hostnqn, g_pl.wantQueues, g_pl.blocks, g_pl.discover,
+                              g_pl.initiatorAuthKey, g_pl.initiatorCtrlKey, g_pl.authSkip);
+            if (rc == 0 || g_backendRetryMs == 0) break;
+            if (InterlockedCompareExchange(&g_svcStopRequested, 0, 0)) {
+                printf("  [backendretry] stop requested while the peer was unreachable; "
+                       "not retrying\n");
+                break;
+            }
+            printf("  [backendretry] backend unreachable (rc %d); retrying in %u s "
+                   "(Ctrl+C or Stop-Service to give up)\n", rc, g_backendRetryMs / 1000);
+            Sleep(g_backendRetryMs);
+        }
+    }
     else printf("unknown mode %s\n", argv[1]);
 
     NdCleanup();

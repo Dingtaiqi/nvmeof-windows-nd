@@ -250,6 +250,10 @@ cd <repo>\src
 
 两点部署前要知道：
 
+- **对端不在时服务会重试而不是退出**：`install.ps1` 会带上 `-backendretry 15`，所以 NVMe-oF
+  target 还没起来时服务保持 `Running`，等它出现后自己连上，而不是退出后被 SCM 每 5 秒重启一次。
+  已验证：连续三次失败（每次都会释放它占用的设备、队列与注册内存），随后对端出现，桥**无需重启**
+  就接上了。
 - **服务运行时日志文件是被占用的**（`Get-Content` 会报 "used by another process"）。要读就先
   `Stop-Service`，或者把 `-log` 指到别处再拷贝。这是已记录的局限，不是疏忽——见 DESIGN §8.62(2)。
 - 服务只跑**桥**，它仍然需要一个 NVMe-oF target：那台 Linux，或者同一个 exe 再开一个 `-target`

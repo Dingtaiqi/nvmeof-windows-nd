@@ -244,6 +244,12 @@ Get-Disk | Where-Object BusType -eq 'iSCSI'
 
 Two things worth knowing before you deploy it:
 
+- **The service retries instead of dying when the peer is missing.** `install.ps1` passes
+  `-backendretry 15`, so if the NVMe-oF target is not up yet the service stays `Running` and
+  connects on its own once it appears, rather than exiting and being restarted by the SCM every
+  five seconds. Verified: three failed attempts (each one now also releases the device, queues
+  and registered region it had taken), then the peer appeared and the bridge connected without a
+  restart.
 - **The log is locked while the service runs** (`Get-Content` reports "used by another
   process"). Stop the service to read it, or point `-log` at a path you can copy afterwards.
   This is a recorded limitation, not an oversight — see DESIGN §8.62(2).
