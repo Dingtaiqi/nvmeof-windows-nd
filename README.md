@@ -1,188 +1,301 @@
-# Windows 上的 NVMe-oF over RDMA（自研 NetworkDirect 栈）
+# NVMe-oF over RDMA on Windows — a from-scratch NetworkDirect stack
 
-这个工程用**我们自己的 NetworkDirect/NDSPI 代码**在 Windows 上实现 NVMe-oF/RDMA
-传输：fabrics 命令、64 字节 capsule、keyed SGL/STag、RDMA Read/Write、
-内存注册、每个 I/O 队列独立 queue pair，**initiator 与 target 两端都是我们的代码**，
-没有使用任何第三方 NVMe-oF 实现。
+**English** | [中文](README.zh-CN.md)
 
-先读结论再读代码：**[DESIGN.md](DESIGN.md)** 是设计与实测记录（§8 是逐条踩坑史），
-**[INTEROP_F5.md](INTEROP_F5.md)** 是"如何用一台 Linux 机器做独立对端"的操作手册。
+NVMe-oF/RDMA implemented on Windows against the **NetworkDirect (NDSPI)** API: fabrics
+commands, 64-byte capsules, keyed SGL/STag, RDMA Read/Write, memory registration, and one
+queue pair per I/O queue. **Both ends — initiator and target — are this repository's own
+code.** No third-party NVMe-oF implementation is used anywhere.
+
+Two things this gets you that Windows does not have on its own:
+
+1. **A working NVMe-oF initiator on a client SKU.** Windows Server ships one; client
+   editions do not, and no user-mode process can inject a volume into the storage stack.
+2. **A remote disk as a real drive letter anyway** — via a user-mode **iSCSI target** that
+   bridges Windows' built-in iSCSI initiator into this NVMe-oF stack. Measured end to end
+   by mounting a **real 1 TB Linux NVMe SSD as `E:`** on Windows, read-only, with the
+   drive's own SMART counters proving that not a single write reached it.
+
+Start with the conclusions, not the code: **[DESIGN.md](DESIGN.md)** is the design and
+measurement log (§8 is a section-by-section record of what broke and why), and
+**[INTEROP_F5.md](INTEROP_F5.md)** is the runbook for using a separate Linux machine as an
+independent peer. The deep docs are in Chinese; this file is the English entry point.
 
 ---
 
-## 目录
+## Status
 
-| 路径 | 是什么 |
+| # | Acceptance item | Result |
+|---|---|---|
+| 1 | Wire-format self-test (byte-exact golden vectors) | ✅ `run_wire.ps1` — compiles and passes as both C and C++ |
+| 2 | Both ends agree on Identify | ✅ F1 / F6 |
+| 3 | Write-then-read is byte-identical | ✅ F3 |
+| 4 | Error paths are bounded (peer disappears, both directions) | ✅ F3 / F6 / F7 |
+| 5 | **Our host ↔ Linux `nvmet`** | ✅ `initiator failures: 0` (36 checks): byte-identical WRITE/READ, a 32-deep in-flight pipeline, and **4 I/O queues each running a command concurrently** (DESIGN §8.46, §8.49) |
+| 6 | Throughput vs a raw RDMA baseline | ✅ ~1.17 GB/s ≈ **48%** of a 2.53 GB/s baseline (DESIGN §8.16) |
+| 7 | **Our target ↔ Linux `nvme-cli`** | ✅ `nvme connect` rc=0, `nvme list` shows `NDVMEOF0000000000001`, 128 blocks written → flush → read back, `cmp` byte-identical; the host builds **8 I/O queues** and spreads commands over **6** of them (DESIGN §8.46, §8.49) |
+| 8 | **In-band DH-HMAC-CHAP authentication** | ✅ Both directions against a real Linux peer: a Linux host authenticates to our target with `nvme connect -S <key>` (kernel log `qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048`; one-way and **bidirectional** both move data; a wrong key is refused; `authRefused=0`), and our host authenticates to an **authentication-requiring `nvmet`** (`Success2 sent (the controller's own response verified)`) (DESIGN §8.51, §8.52) |
+| 9 | **A 1 TB real disk on Windows as an active drive** | ✅ Linux `/dev/nvme1n1` (CT1000P3PSSD8, 1953525168 × 512 B = 931.51 GiB) appears as `Get-Disk` #3, **Online**, GPT, NTFS `E:` readable; two byte-exact cross-checks against the Linux side; **zero writes** (DESIGN §8.55, §8.56, [EVIDENCE-1TB.md](EVIDENCE-1TB.md)) |
+
+Items 5 and 7 are the only tests that can catch **both ends being wrong together** — and on
+their first real run they found **11 defects**, 7 of them cases where our two ends shared a
+misreading of the same field, while 8/8 self-tests had been green. **Self-consistency is not
+correctness.**
+
+The whole suite is one command — 10 of 10 suites, ~220 s:
+
+```powershell
+cd <repo>\src
+.\run_all.ps1
+```
+
+## What is implemented
+
+- **Fabrics**: Connect (with the private-data checks Linux performs), Property Get/Set,
+  discovery log, Authentication Send/Receive.
+- **I/O**: 64-byte capsules, keyed SGL/STag, RDMA Read/Write, WRITE, READ, FLUSH, Compare,
+  Write Zeroes, Dataset Management (deallocate), Keep Alive, Async Events, Identify (CNS
+  0/1/2), Get/Set Features (including KATO unit handling), namespace attach.
+- **Backends**: a RAM namespace, a **file-backed namespace** (`-nsfile`), and a real block
+  device when used as `nvmet`'s consumer.
+- **Multi-queue**: the target owns 8 queue pairs, each with its own capsule ring and
+  in-flight table; the initiator creates as many as the peer grants.
+- **Authentication**: DH-HMAC-CHAP (RFC 7919 `ffdhe2048` + `hmac(sha256)`), one-way and
+  bidirectional, both as host and as target. The modular exponentiation is this repo's own
+  fixed-width Montgomery implementation, because Windows CNG **measurably** refuses custom
+  DH groups (`STATUS_NOT_SUPPORTED`) and refuses mismatched private keys
+  (`STATUS_INVALID_PARAMETER`).
+- **iSCSI bridge**: a minimal user-mode iSCSI target (login in three stages, SendTargets,
+  NOP, Logout, Task Management, SCSI INQUIRY/VPD, TEST UNIT READY, REQUEST SENSE, MODE
+  SENSE(6/10), READ CAPACITY(10/16), REPORT LUNS, READ/WRITE(10/16) via R2T, SYNCHRONIZE
+  CACHE), so Windows' built-in initiator can mount a namespace as a disk with no kernel
+  driver at all.
+
+## The drive-letter path
+
+### Option A — iSCSI bridge (live block device, what the 1 TB demo uses)
+
+Our NVMe-oF initiator runs inside a user-mode iSCSI target; Windows' own initiator connects
+to it over loopback.
+
+```powershell
+# 1) our NVMe-oF initiator reaches the Linux nvmet export
+.\f5_interop.exe -initiator 192.168.100.5 4420 192.168.100.2 `
+                 -subnqn nqn.2024-01.local.rdma:linux-nvmet -iscsi 3260
+
+# 2) Windows' built-in initiator logs in (no kernel driver involved)
+iscsicli AddTargetPortal 127.0.0.1 3260
+Connect-IscsiTarget -NodeAddress iqn.2024-01.com.nvmeof:bridge0 -IsPersistent $false
+
+Get-Disk | Where-Object BusType -eq 'iSCSI'     # -> NVMEOF iSCSI-NVMeoF, Online, 931.51 GB, GPT
+Get-ChildItem E:\
+```
+
+Measured on that path (DESIGN §8.56, [EVIDENCE-1TB.md](EVIDENCE-1TB.md)):
+
+- `Get-Disk`: 931.51 GB, GPT, **Online**, `IsReadOnly = True`; partitions read correctly
+  (300 MB ESP + 16 MB MSR + 931.2 GB NTFS); the NTFS volume mounts and lists **60 top-level
+  items** with real timestamps.
+- **Byte-exact content check, twice.** A file read through `E:` (`fsutil file queryextents`
+  → LCN → partition offset → absolute LBA 1073520) and the same LBA read directly on Linux
+  with `nvme read` produce identical SHA-256
+  (`dec615ae97b8b81cd5e395fd4f9b1fd379332c3516a16ab122c1c1a57a5dd397`); the ESP boot sector
+  (LBA 40) matches too (`802b1462…a2452293`).
+- **Zero writes, proven by the drive itself.** SMART `Data Units Written` was
+  **32884752 before and 32884752 after** the whole session, while `Data Units Read` rose
+  (144240893 → 144241018). Of 747 SCSI CDBs, exactly **one** was a write — Windows trying to
+  set the NTFS dirty bit at LBA 651264 — and the bridge refused it: `WRITE … REFUSED
+  (read-only bridge)` → `CHECK CONDITION` with 18 bytes of sense. A shell write attempt is
+  refused by Windows itself: *"The media is write protected."*
+- **Read-only is a rail, not a default you hope for**: `-iscsirw` is off unless asked, MODE
+  SENSE reports the WP bit, and WRITE is refused at the SCSI layer. `nvmet` has no
+  read-only namespace attribute, so the host side is the only place this can be enforced.
+
+A pure-RDMA peer-to-peer path needs the peer on the same L2 as a RoCE port;
+`src/interop_link.ps1 -Action Up` builds that (it bridges one CX3 port into the LAN,
+moves the address and default route onto the bridge, lowers MTU to 1500/1024, verifies the
+LAN still works, and rolls back if it does not). `-Action Down` undoes all of it.
+
+### Option B — mount a namespace as a VHD volume (`mount_nvmeof.ps1`)
+
+Pulls a namespace through our own initiator, wraps it in a fixed VHD and mounts it:
+
+```powershell
+.\mount_nvmeof.ps1                       # 64 MiB namespace from a Linux nvmet -> X:
+.\f5_interop.exe -target 192.168.100.2 4420 -serve 0 -nsfile F:\nvmeof\target-ns.img
+.\mount_nvmeof.ps1 -TargetIp 192.168.100.2 -Subnqn nqn.2024-01.local.rdma:windows-nd
+.\mount_nvmeof.ps1 -Unmount              # write files in X:, push back on unmount
+```
+
+This one **is** a real Windows volume (NTFS, visible in Explorer, read/write) but it is **not
+a live block device** — writes are pushed back at `-Unmount`. The full loop was verified: the
+64 MiB image's SHA-256 read back on Linux matches the local image byte for byte, and a 2 MiB
+random file keeps its checksum across a remount.
+
+## Layout
+
+| Path | What it is |
 |---|---|
-| `src/nvmeof_wire.h` | 线上格式：capsule/CQE/SGL/Identify/状态码，每个布局都有 `NVMEOF_STATIC_ASSERT` 钉住 |
-| `src/nvmeof_rdma.h` | 传输层：`Device` / `Queue` / `acceptChecked()`（按 Linux 的规则校验 Connect 私有数据） |
-| `src/f1_bringup.cpp` | F1 连接与 Identify |
-| `src/f3_io.cpp` | F3 读写正确性 + 错误路径（含 0x4f invalidate 子类型） |
-| `src/f4_pipeline.cpp` | F4 流水线吞吐（8 条在飞） |
-| `src/f5_interop.cpp` | **F5 互操作**：`-initiator` 打任意对端，`-target` 给真实 host 用（32 槽 receive ring，覆盖它宣称的窗口） |
-| `src/f6_lifecycle.cpp` | F6 host 完整序列 + 目标侧生命周期（31 条断言） |
-| `src/f7_faults.cpp` | F7 故障注入（对端消失、反向消失） |
-| `src/nvmeof_auth.h` | DH-HMAC-CHAP 的密码学原语：CNG 的 SHA/HMAC + 自研定长 Montgomery 模幂（`nvmeof_bignum.h`）+ RFC 7919 ffdhe 群（`nvmeof_dhgroups.h`） |
-| `src/nvmeof_dhchap.h` | DH-HMAC-CHAP 协议：密钥解析（DHHC-1 + CRC32）、`Kt` 变换、target 半边、host 半边、环回自检 |
-| `src/wire_selftest.c` | 字节级 golden 自检，C 与 C++ 双份编译 |
-| `src/xref_constants.py` | 常量与两份 Linux 参考头文件**逐值比对**（97 对，含 DH-HMAC-CHAP 的 21 个） |
-| `src/run_all.ps1` | 一次跑完全部 10 套并给结论表（约 220 秒） |
-| `src/interop_link.ps1` | 互操作链路：桥接 + 搬 IP/路由 + 降 MTU，失败自动回滚 |
-| `src/f5_session.ps1` | **互操作整场**：链路 → 对端 → 方向 A → discovery → 方向 B → 一份报告文件；`-Auth` 换成带认证的版本 |
-| `src/run_f5_auth.ps1` | DH-HMAC-CHAP 六个用例（本机两口直连，不需要 Linux） |
-| `ref/linux_nvme.h`、`ref/linux_nvme_rdma.h` | 参考副本，供上面对比与查证 |
-| `linux/` | 对端脚本：`nvmet_setup.sh`（含 rxe 软件 RoCE 与可选 `AUTH_KEY=` 认证）、`f5_linux_up.sh`、`nvmet_teardown.sh`、`f5_dirb_check.sh`（方向 B）、`f5_dirb_auth.sh`（方向 B + 认证）、`f5_dirb_demo.sh`（宽扫描 + 持久化演示）、`f5_nvmet_ref*.sh`（把 nvmet 当规格逐行量参考答案）、`f5_dsm_check.sh`（DSM 的 AD 位到底在哪） |
+| `src/nvmeof_wire.h` | On-the-wire formats: capsule/CQE/SGL/Identify/status codes, each layout pinned by `NVMEOF_STATIC_ASSERT` |
+| `src/nvmeof_rdma.h` | Transport: `Device` / `Queue` / `acceptChecked()` (validates the Connect private data the way Linux does) |
+| `src/nvmeof_auth.h` | DH-HMAC-CHAP crypto primitives: CNG SHA/HMAC + this repo's Montgomery modexp (`nvmeof_bignum.h`) + RFC 7919 ffdhe groups (`nvmeof_dhgroups.h`) |
+| `src/nvmeof_dhchap.h` | DH-HMAC-CHAP protocol: key parsing (`DHHC-1` + CRC32), `Kt` transform, target half, host half, loopback self-test |
+| `src/nvmeof_iscsi.h` | The user-mode iSCSI target (one object and one thread per connection; the backend is serialized behind a mutex because it is a single queue pair) |
+| `src/f1_bringup.cpp` | F1 — connection and Identify |
+| `src/f3_io.cpp` | F3 — read/write correctness and error paths (including the `0x4f` invalidate sub-type) |
+| `src/f4_pipeline.cpp` | F4 — pipelined throughput (8 in flight) |
+| `src/f5_interop.cpp` | **F5 interop**: `-initiator` against any peer, `-target` for real hosts (32-slot receive ring, sized to cover the window it advertises), `-iscsi` for the iSCSI bridge, `-nsfile` / `-serve` / `-genkey` and friends |
+| `src/f6_lifecycle.cpp` | F6 — full host sequence plus target-side lifecycle (31 assertions) |
+| `src/f7_faults.cpp` | F7 — fault injection (peer vanishes, and the reverse) |
+| `src/wire_selftest.c` | Byte-level golden self-test, compiled as both C and C++ |
+| `src/xref_constants.py` | Cross-checks every constant against the two Linux reference headers (97 pairs, 21 of them DH-HMAC-CHAP) |
+| `src/run_all.ps1` | Runs all 10 suites and prints a verdict table (~220 s) |
+| `src/run_f5_auth.ps1` | The six DH-HMAC-CHAP cases (two local ports, no Linux needed) |
+| `src/interop_link.ps1` | Interop link: bridge + address/route move + MTU lowering, with automatic rollback |
+| `src/f5_session.ps1` | **Whole interop session** in one command: link → peer → direction A → discovery → direction B → report file; `-Auth` adds authentication |
+| `src/mount_nvmeof.ps1` | Namespace → fixed VHD → drive letter → push back on unmount |
+| `src/tools_login_probe.ps1` | Replays the real Windows iSCSI login byte for byte at any target (used for the LIO A/B comparison) |
+| `ref/linux_nvme.h`, `ref/linux_nvme_rdma.h` | Reference copies of the Linux headers, for comparison only |
+| `linux/` | Peer-side scripts: `nvmet_setup.sh` (software RoCE `rxe` + optional `AUTH_KEY=`), `nvmet_teardown.sh`, `f5_linux_up.sh`, `f5_dirb_check.sh` (direction B), `f5_dirb_auth.sh` (direction B + auth), `f5_dirb_demo.sh`, `f5_nvmet_ref*.sh` (measure `nvmet` line by line as the specification), `f5_dsm_check.sh`, `lio_proxy.py` (byte tap in front of the LIO reference target) |
 
-## 前置条件（要自己编译的话）
+## Build prerequisites
 
-1. **Visual Studio**（含 C++ 桌面工作负载，用它的 `VsDevCmd.bat` 提供 `cl.exe`）。
-2. **NetworkDirect / NDSPI 的头文件与库**：`ndspi.h`、`ndutil.h`/`ndutil.lib`。**本仓库不含这些**
-   （它们不是本工程的代码，来自 WDK/Windows SDK 的 NetworkDirect 部分，或网卡厂商的
-   ND 提供者安装包；实测环境是 HP/Mellanox ConnectX-3 Pro + WinOF 的 ND 提供者）。
-   编译时还需要厂商的 NDv2 头（Mellanox 的 `…\MLNX_VPI\IB\SDK\inc\ndv2`），有则加入包含路径。
-3. 三个路径通过**环境变量**覆盖，不设就用本机实测的默认值，**不需要改脚本**：
+1. **Visual Studio** with the C++ desktop workload (its `VsDevCmd.bat` provides `cl.exe`).
+2. **NetworkDirect / NDSPI headers and library**: `ndspi.h`, `ndutil.h`/`ndutil.lib`.
+   **These are not in this repository** — they are not this project's code. They come from
+   the NetworkDirect parts of the WDK/Windows SDK or from a NIC vendor's ND provider package.
+   The measured environment is an HP/Mellanox ConnectX-3 Pro with the WinOF ND provider.
+   Vendors' NDv2 headers (e.g. `…\MLNX_VPI\IB\SDK\inc\ndv2`) are added to the include path if
+   present.
+3. Paths are overridden by **environment variables**; the defaults are the measured local
+   paths, so **no script editing is needed**:
 
-   | 环境变量 | 含义 | 不设时的默认值 |
+   | Variable | Meaning | Default when unset |
    |---|---|---|
-   | `ND_VS_DIR` | Visual Studio 安装目录 | `F:\Microsoft Visual Studio\18\Community` |
-   | `ND_NDUTIL_INC` | NetworkDirect 头文件目录 | `D:\rdma\NetworkDirect\src\ndutil` |
-   | `ND_NDUTIL_LIB` | `ndutil.lib` 所在目录 | `D:\rdma\NetworkDirect\src\x64\Release` |
-   | `ND_MLNX_INC` | 厂商 NDv2 头目录（可选） | `C:\Program Files\Mellanox\MLNX_VPI\IB\SDK\inc\ndv2` |
+   | `ND_VS_DIR` | Visual Studio install directory | `F:\Microsoft Visual Studio\18\Community` |
+   | `ND_NDUTIL_INC` | NetworkDirect include directory | `D:\rdma\NetworkDirect\src\ndutil` |
+   | `ND_NDUTIL_LIB` | Directory holding `ndutil.lib` | `D:\rdma\NetworkDirect\src\x64\Release` |
+   | `ND_MLNX_INC` | Vendor NDv2 include directory (optional) | `C:\Program Files\Mellanox\MLNX_VPI\IB\SDK\inc\ndv2` |
 
-   脚本自己所在目录一律用 `$PSScriptRoot` 推导，所以仓库放在哪里都能跑：
+   Every script locates itself through `$PSScriptRoot`, so the repository builds from
+   wherever it is cloned:
 
    ```powershell
    $env:ND_VS_DIR     = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
    $env:ND_NDUTIL_INC = 'C:\ndsdk\src\ndutil'
    $env:ND_NDUTIL_LIB = 'C:\ndsdk\src\x64\Release'
-   cd <仓库>\src ; .\run_wire.ps1        # 先跑这个：不需要网卡
+   cd <repo>\src ; .\run_wire.ps1        # start here: needs no NIC
    ```
 
-4. `ref/` 下两份是 Linux 内核的参考头文件（`linux_nvme.h` / `linux_nvme_rdma.h`，
-   GPL-2.0 的 UAPI/内核头），**只作对照阅读，不参与编译**。
+4. The two files under `ref/` are Linux kernel headers (GPL-2.0) kept **for reading and
+   comparison only — they are not compiled**.
 
-## 跑起来
+## Running
 
-一次跑全部（约 6 分钟，按顺序执行、互相不干扰）：
+All 10 suites in order, mutually isolated, ~6 minutes:
 
 ```powershell
-cd <仓库>\src
+cd <repo>\src
 .\run_all.ps1
 ```
 
-单独跑某一套：`run_xref.ps1`、`run_wire.ps1`、`run_f1.ps1`、`run_f3.ps1`、
-`run_f4.ps1`、`run_f5.ps1`、`run_f5_auth.ps1`、`run_f6.ps1`、`run_f7.ps1`。
+Individually: `run_xref.ps1`, `run_wire.ps1`, `run_f1.ps1`, `run_f3.ps1`, `run_f4.ps1`,
+`run_f5.ps1`, `run_f5_auth.ps1`, `run_f6.ps1`, `run_f7.ps1`, `run_stag.ps1`.
 
-每套的规则都一样：**删掉旧 exe → 看编译退出码 → 比对源码与头文件时间戳**，
-绝不运行"看起来还在"的旧二进制（这条是从一次真实事故里来的，见 DESIGN §8.6）。
+Every suite follows the same rule: **delete the old exe → check the compiler's exit code →
+compare source and header timestamps.** A binary that merely *looks* current is never run —
+that rule came from a real incident (DESIGN §8.6).
 
-## 要接真实 host 时用哪个二进制
+## Which binary to use against a real host
 
-| 场景 | 用什么 |
+| Scenario | Use |
 |---|---|
-| Linux `nvme-cli` / 任何外来 host 打我们 | **`f5_interop.exe -target <ip> <port>`** |
-| 我们的 host 打 Linux `nvmet` 或任何对端 | `f5_interop.exe -initiator <serverIp> <port> <localIp> [-subnqn <nqn>]` |
-| 自测（两端都是我们） | 任意 `run_f*.ps1` |
+| Linux `nvme-cli` (or any foreign host) talks to us | **`f5_interop.exe -target <ip> <port>`** |
+| Our host talks to Linux `nvmet` (or any peer) | `f5_interop.exe -initiator <serverIp> <port> <localIp> [-subnqn <nqn>]` |
+| Self-test (both ends ours) | any `run_f*.ps1` |
 
-**F6 的 target 是生命周期测试替身，不是互操作 target**：它的 host 是严格一问一答，
-所以它只挂一个 Receive，遇到会流水的真实 host 会丢 capsule（DESIGN §8.41）。
-F5 的 target 有 8 槽 receive ring 与延迟完成，能扛住队列深度 32 的 host。
+**F6's target is a lifecycle test double, not an interop target**: its host is strictly
+one-request-one-response, so it posts a single Receive and will drop capsules from a real
+pipelining host (DESIGN §8.41). F5's target has an 8-slot receive ring and delayed
+completions and survives a queue depth of 32.
 
-## 当前状态
-
-| 验收项 | 状态 |
-|---|---|
-| 1 wire 自检 | ✅ `run_wire.ps1` |
-| 2 两端 Identify 一致 | ✅ F1 / F6 |
-| 3 写后读逐字节一致 | ✅ F3 |
-| 4 错误路径有界（含对端消失，双向） | ✅ F3 / F6 / F7 |
-| 5 **我们的 host ↔ Linux `nvmet`** | ✅ **跑通了**：`initiator failures: 0`（36 项检查），含逐字节一致的 WRITE/READ、32 条在飞的流水线，以及 **4 条 I/O 队列各自同时跑一条命令**（DESIGN §8.46、§8.49） |
-| 6 吞吐 vs 裸 RDMA 基线 | ✅ 约 1.17 GB/s ≈ 2.53 GB/s 的 **48%**（DESIGN §8.16） |
-| 7 **我们的 target ↔ Linux `nvme-cli`** | ✅ **跑通了**：`nvme connect` rc=0，`nvme list` 出现 `NDVMEOF0000000000001`，128 块写入→flush→读回 **`cmp` 逐字节相同**；主机建 **8 条 I/O 队列**、命令分散在 **6 条**上（DESIGN §8.46、§8.49） |
-| 8 **DH-HMAC-CHAP 在带内认证** | ✅ **两个方向都跑通了（Linux 对端实测）**：真 Linux 主机用 `nvme connect -S <key>` 认证到我们的 target（内核日志 `qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048`，单向与**双向**都通过并搬运了数据，**错密钥被拒**，`authRefused=0`）；反向也一样——我们的 host 认证到**要求认证的 nvmet**，`Success2 sent (the controller's own response verified)`，即真 ffdhe2048 DH + 双向（DESIGN §8.51、§8.52） |
-
-第 5、7 项是唯一能发现"我们两端一起写错"的测试——第一次真跑，
-它们一共抓出 **11 个缺陷**，其中 7 个是我们两端对同一字段的理解与规范不一致，
-而此前 8/8 自检全绿（DESIGN §8.46）。**自检证明内部一致，不证明正确。**
-
-**这两项现在是一条命令**（实测：双向都过，之后 `run_all.ps1` 9/9、137 秒）：
+## Interop with a real Linux host
 
 ```powershell
-.\f5_session.ps1 -LaptopIp <对端> -LaptopUser <用户>        # 链路 → 对端 → 方向 A → discovery → 方向 B
-.\f5_session.ps1 -Auth -LaptopIp <对端> -LaptopUser <用户>  # 同一条链路，方向 B 带 DH-HMAC-CHAP
-.\f5_session.ps1 -Down                                      # 拆桥 + 回读验证
+.\f5_session.ps1 -LaptopIp <peer> -LaptopUser <user>         # link → peer → direction A → discovery → direction B
+.\f5_session.ps1 -Auth -LaptopIp <peer> -LaptopUser <user>   # same link, direction B with DH-HMAC-CHAP
+.\f5_session.ps1 -Down                                       # tear the bridge down, verified
 ```
 
-原始输出落在 `src/f5_session_<时间戳>.txt`。把手工步骤固化成脚本的过程里
-**又抓出 4 个缺陷**（方向 A 漏传本地 IP、探测对端地址的时机反了、
-远程命令串穿过 PowerShell→ssh→bash 会丢引号、方向 B 脚本自己的三个坑），
-见 DESIGN §8.47 —— 其中"引号会丢"那一条曾在序列中间崩掉并在对端留下活控制器。
+Raw output lands in `src/f5_session_<timestamp>.txt`. Turning the manual steps into a script
+found **4 more defects** — a missing local IP in direction A, probing the peer address at the
+wrong moment, quotes being lost as a command string crosses PowerShell → ssh → bash (that
+one aborted mid-sequence and left a live controller on the peer), and three in the direction-B
+script itself (DESIGN §8.47).
 
-**多 I/O 队列（§8.49）**：target 真的拥有 8 个 queue pair（每条队列独立 capsule ring 与
-in-flight 表），initiator 按对端授予数建队列。对端证据：方向 A 是 4/4 条队列各自建连并
-同时各跑一条命令；方向 B 是 Linux 主机建 8 条、命令分散在 6 条上。自检 F5 默认就用 4 条队列。
+**Multi-queue (§8.49)**: the target really owns 8 queue pairs, each with its own capsule ring
+and in-flight table; the initiator creates as many as the peer grants. Peer-measured:
+direction A connects 4/4 queues and runs one command on each simultaneously; direction B has
+the Linux host create 8 and spread commands over 6. Self-test F5 uses 4 queues by default.
 
-**discovery（§8.50）**：`nvme discover` 能列出我们（对端实测 `DISC: the discovery log names
-nqn.2024-01.local.rdma:windows-nd`，本机 target `discLogReads=3`、`controllers=2`），
-我们自己的 host 也能用 `-discover` 读 Linux nvmet 的发现日志。discovery 与 I/O 是**两个
-控制器**，所以 target 用 `-serve N` 连续服务（默认 1，保持 F7 的"主机消失即退出"断言）。
+**Discovery (§8.50)**: `nvme discover` lists us (peer-measured `DISC: the discovery log names
+nqn.2024-01.local.rdma:windows-nd`; local target counters `discLogReads=3`, `controllers=2`),
+and our own host can read Linux nvmet's discovery log with `-discover`. Discovery and I/O are
+**two controllers**, so the target serves continuously with `-serve N` (default 1, preserving
+F7's "exit when the host disappears" assertion).
 
-**DH-HMAC-CHAP（§8.51）**：`-authkey <DHHC-1:..>` 让 target 要求认证（Connect 结果置 ATR bit 17），
-认证之前除 fabrics 之外的命令一律回 `0x4191`；host 侧看到 ATR 就自动完成
-Negotiate→Challenge→Reply→Success1（有控制器密钥时再加 Success2）。
-密码学是自研的 Montgomery 模幂——Windows 的 CNG **实测**拒绝自定义 DH 群
-（`STATUS_NOT_SUPPORTED`），也拒绝导入不匹配的私钥（`STATUS_INVALID_PARAMETER`），
-而 ffdhe 群参数是从 RFC 7919 原文抓取并逐条验证的。`.\f5_interop.exe -genkey` 生成密钥，
-`.\run_f5_auth.ps1` 跑六个用例（含"错密钥必须被拒"和"无视 ATR 必须被 gate 拒"）。
+**DH-HMAC-CHAP (§8.51)**: `-authkey <DHHC-1:..>` makes the target require authentication
+(Connect result sets ATR bit 17); before authentication every non-fabrics command is answered
+`0x4191`. Seeing ATR, our host runs Negotiate → Challenge → Reply → Success1 automatically
+(plus Success2 when a controller key is configured). `.\f5_interop.exe -genkey` generates
+keys; `.\run_f5_auth.ps1` runs the six cases, including "a wrong key must be refused" and
+"ignoring ATR must be gated".
 
-**一个真能用的卷（§8.53）**：`-nsfile F:\x.img` 把 namespace 变成那个文件（几何 = 文件大小，
-FLUSH 才回写），于是一台 Linux 主机写进来的字节可以直接在 Windows 侧看到：
+**A namespace you can actually look at (§8.53)**: `-nsfile F:\x.img` turns the namespace into
+that file (geometry = file size, write-back on FLUSH), so bytes a Linux host writes are
+directly visible on the Windows side:
+
 ```powershell
-# Windows：target 用文件当 namespace（-serve 0 = 不限控制器数）
+# Windows: the target uses a file as its namespace (-serve 0 = unlimited controllers)
 .\f5_interop.exe -target 192.168.100.2 4420 -serve 0 -nsfile F:\nvmeof-ns.img
-# 对端（桥接窗口里）：
+# Peer (inside the bridge window):
 ~/f5_dirb_demo.sh 192.168.100.2 4420 nqn.2024-01.local.rdma:windows-nd
-# 然后在 Windows 上直接读那个文件：偏移 4096 处是主机写进来的文本，
-# LBA 3000 / 3100 处是 write-zeroes 与 dsm deallocate 清出来的零。
+# Then read that file on Windows: the text the host wrote is at offset 4096, and
+# LBAs 3000 / 3100 are the zeros produced by write-zeroes and dsm deallocate.
 ```
 
-同一轮里 `linux/f5_nvmet_ref*.sh` 把 nvmet 当规格，逐行量出参考答案（日志页 LID 策略、
-带数据缓冲的 Get Features 一律 `SGL_INVALID_DATA`、Set VWC 必须拒、DSM 的 AD 位在 CDW11），
-并据此修掉了三个"我们两端自测永远一致"的差异 —— 其中包括一条**会把控制器挂死**的：
-`nvme persistent-event-log` 触发的 0 字节 RDMA Write 永不完成，把 admin 队列停死，
-主机 7.6 秒后 Keep Alive 超时并拆链。
+In the same round `linux/f5_nvmet_ref*.sh` treated `nvmet` as the specification and measured
+reference answers line by line (discovery-log LID policy, Get Features with a data buffer
+always `SGL_INVALID_DATA`, Set VWC must be refused, DSM's AD bit in CDW11), which fixed three
+differences our own two-ended self-tests could never show — including one that **hangs the
+controller**: the zero-length RDMA Write triggered by `nvme persistent-event-log` never
+completes, stalling the admin queue until the host's Keep Alive times out 7.6 s later and
+drops the link.
 
-互操作的操作步骤、链路脚本与回滚见 `INTEROP_F5.md`；结论与缺陷清单见 DESIGN §8.46、§8.47、§8.49、§8.50、§8.51、§8.53、§8.54。
+## Documentation
 
-**Windows 上的 NVMe-oF 盘符（§8.54）**：`mount_nvmeof.ps1` 让我们自己的 initiator 扮演
-Windows 缺失的那个角色（客户端 SKU 没有内置 NVMe-oF initiator）：
+| File | Contents |
+|---|---|
+| [DESIGN.md](DESIGN.md) | Design and measurement log; §8 is the defect-by-defect history |
+| [INTEROP_F5.md](INTEROP_F5.md) | How to use a separate Linux machine as an independent peer (link script, steps, rollback) |
+| [EVIDENCE-1TB.md](EVIDENCE-1TB.md) | Raw evidence for the 1 TB disk on Windows, including the teardown record |
+| [COMMERCIAL.md](COMMERCIAL.md) | Commercial licensing (AGPL dual licensing) and license-compatibility notes |
 
-```powershell
-# 从 Linux nvmet 取回 64 MiB 命名空间 -> 包成 fixed VHD -> 挂成 X:
-.\mount_nvmeof.ps1
-# 不想要 Linux 时，用我们自己的 target 当源：
-.\f5_interop.exe -target 192.168.100.2 4420 -serve 0 -nsfile F:\nvmeof\target-ns.img
-.\mount_nvmeof.ps1 -TargetIp 192.168.100.2 -Subnqn nqn.2024-01.local.rdma:windows-nd
-# 在 X: 里写文件，然后回推（bytes 走 NVMe-oF/RDMA 回到对端命名空间并 FLUSH）：
-.\mount_nvmeof.ps1 -Unmount
-```
+These are written in Chinese; `README.md` (this file) is the English entry point.
 
-它是**真的 Windows 卷**（NTFS、资源管理器可见、可读写），但**不是活动块设备**：
-写入要等 `-Unmount` 才回推。实测一整圈对得上 —— Linux 读回 64 MiB 的 sha256 与本机镜像
-逐字节相同，重新挂载后文件仍在、2 MiB 随机文件校验和不变。
+## Hardware
 
-## 硬件前提
+- A Windows machine with a RoCE-capable NIC. Measured here: ConnectX-3 Pro (HP 544+FLR-QSFP,
+  firmware 2.40.5000) with the WinOF ND provider.
+- Self-testing needs only that card's two ports cabled to each other.
+- Interop needs a **local** Linux peer — an ordinary machine with software RoCE (`rxe`) is
+  enough. A cloud server will not work: RoCE does not cross routers (see `INTEROP_F5.md`).
 
-- 一台 Windows 机器 + 一块支持 RoCE 的网卡（本工程实测：ConnectX-3 Pro，
-  HP 544+FLR-QSFP，固件 2.40.5000，WinOF 的 ND 提供者）。
-- 自测只要一块双口卡把两口直连即可。
-- 互操作需要一个**本地** Linux 对端（普通机器 + 软件 RoCE `rxe` 就够；
-  云服务器不行——RoCE 不过路由，见 `INTEROP_F5.md`）。
+## License
 
-## 许可
-
-**GNU Affero General Public License v3.0 或更新版本**（`LICENSE`）—— 逐字官方原文，
-34,523 字节，sha256 `8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef`。
+**GNU Affero General Public License v3.0 or later** ([LICENSE](LICENSE)) — the verbatim
+official text, 34,523 bytes, sha256
+`8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef`.
 
 ```
 Copyright (C) 2026 Dingtaiqi
@@ -193,19 +306,22 @@ the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 ```
 
-**AGPL 允许商业使用**，它管的是"闭源"：
+**AGPL permits commercial use**; what it regulates is *closed source*:
 
-- 公司内部使用、拿它赚钱、做成服务 —— **都可以，免费**。
-- 代价是回馈：分发本工程或派生作品（**包括通过网络提供服务**）时必须给出完整对应源码。
-  第 13 条（`LICENSE` L540）就是专门管网络服务的那一条，也是 AGPL 与 GPL 的唯一实质区别
-  —— 对付"拿开源代码做闭源云服务"靠的就是它。
-- 确实需要闭源（嵌进闭源产品、做闭源 SaaS）的公司，可以走 `COMMERCIAL.md` 的商业授权（双授权）。
+- Using it inside a company, making money with it, running it as a service — all allowed,
+  free of charge.
+- The price is giving back: if you distribute this project or a derivative work — **including
+  offering it over a network** — you must provide the complete corresponding source.
+  Section 13 (`LICENSE` L540) is the network clause, and it is the one substantive difference
+  from the GPL: it is what stops "take open code, run a closed cloud service".
+- A company that genuinely needs to stay closed (embedding it in a proprietary product, or a
+  closed-source SaaS) can take a commercial license instead — see [COMMERCIAL.md](COMMERCIAL.md).
 
-两个兼容性坑：
+Two compatibility traps:
 
-1. `ref/` 下两份 Linux 内核头（`linux_nvme.h`、`linux_nvme_rdma.h`）是 **GPL-2.0**，
-   **只作对照阅读、不参与编译**。**GPL-2.0-only 与 AGPL-3.0 不兼容**，
-   不要把它们的代码并进本工程；实在要并，本工程得整体改成 GPL-2.0。
-2. 链接厂商的 NetworkDirect 库（`ndutil`/NDSPI）没有影响——它们不是 copyleft 许可。
-
-
+1. The two Linux kernel headers under `ref/` are **GPL-2.0** and are read for comparison
+   only; they are never compiled. **GPL-2.0-only and AGPL-3.0 are incompatible** — do not
+   merge their code into this project. If you truly must, the whole project would have to
+   become GPL-2.0.
+2. Linking the vendor NetworkDirect library (`ndutil`/NDSPI) changes nothing: it is not a
+   copyleft license.
