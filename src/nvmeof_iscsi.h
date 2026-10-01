@@ -1196,9 +1196,48 @@ inline bool IscsiTarget::sendInquiry(const IscsiBhs& bhs, IscsiBackend& be, Iscs
         memcpy(out + 32, "1.0 ", 4);
         n = 36;
     } else if (page == 0x00) {
-        out[0] = 0x00; out[1] = 0x00; out[2] = 0x00; out[3] = 3; out[4] = 0x00;
-        out[5] = 0x80; out[6] = 0x83;
-        n = 7;
+        out[0] = 0x00; out[1] = 0x00; out[2] = 0x00; out[3] = 4; out[4] = 0x00;
+        out[5] = 0x80; out[6] = 0x83; out[7] = 0xB0;
+        n = 8;
+    } else if (page == 0xB0) {
+        // Block Limits (SBC-3 section 6.6.3).  Two fields matter here:
+        //
+        //   MAXIMUM TRANSFER LENGTH (bytes 8..11) - the largest single transfer a
+        //   command may ask for.  A WRITE larger than the first burst cannot be sent
+        //   unsolicited, so the target must R2T the remainder - and Windows rejects
+        //   every R2T this bridge sends (DESIGN 8.58/8.60).  Answering this field with
+        //   the first-burst size was an attempt to keep every WRITE inside one burst.
+        //
+        //   MEASURED: Windows DOES request this page (INQUIRY with EVPD=1, page 0xB0,
+        //   twice per enumeration) and then ignores the cap - it still issued
+        //   262144-byte WRITE CDBs.  So this is not a lever either (that is the
+        //   thirteenth falsified hypothesis for the write path).  The page is kept
+        //   because a conformant block device reports it and it states this device's
+        //   real maximum, not because it changes the initiator's behaviour.
+        //
+        //   OPTIMAL TRANSFER LENGTH (bytes 12..13, in blocks) - answered with the
+        //   same size, with the same caveat.
+        //
+        // Without this page Windows asks for page 0x08 (caching) and nothing else,
+        // and the 256 KiB CDBs it chooses are above what an unsolicited burst can
+        // carry.
+        uint32_t maxXfer = g_iscsiMaxBurst;                 // bytes, 64 KiB by default
+        if (maxXfer < 512) maxXfer = 512;
+        out[0] = 0x00; out[1] = 0xB0;
+        out[2] = 0x00; out[3] = 0x3C;                      // page length = 60
+        out[4] = 0x00;                                     // wsnz=0
+        out[5] = 0xFF; out[6] = 0xFF;                      // maximum compare and write
+        out[7] = 0x00;                                     // maximum unmap LBA count
+        iscsi_wr32(out + 8,  maxXfer);                     // maximum transfer length
+        iscsi_wr32(out + 12, 0xFFFFFFFFu);                 // maximum unmap block descriptor
+        iscsi_wr32(out + 16, 1u << 28);                    // optimal unmap granularity
+        iscsi_wr32(out + 20, 1u << 28);                    // unmap granularity alignment
+        iscsi_wr32(out + 24, 0xFFFFFFFFu);                 // max write same length
+        iscsi_wr32(out + 28, 1u << 28);                    // max write same with unmap
+        uint16_t optBlocks = (uint16_t)(maxXfer / (be.blockSize() ? be.blockSize() : 512));
+        out[32] = (uint8_t)(optBlocks >> 8); out[33] = (uint8_t)(optBlocks & 0xFF);
+        // Atomic and prefetch fields stay 0: this bridge makes no atomicity promise.
+        n = 4 + 60;
     } else if (page == 0x80) {
         const char* sn = be.serial();
         size_t l = strlen(sn); if (l > 32) l = 32;

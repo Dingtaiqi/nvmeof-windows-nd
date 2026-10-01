@@ -3551,8 +3551,16 @@ Windows 用 **262144 字节**的 WRITE CDB（1 MiB 的写 = 4 条 256 KiB 命令
 | **重启 `MSiSCSI` 服务**（让它重读参数）后新建会话 | ❌ 仍是 262144 |
 | **PnP 重启 iSCSI 设备**（`Disable-PnpDevice`/`Enable-PnpDevice` 于 `ROOT\ISCSIPRT\0000`，即驱动重新初始化）后新建会话 | ❌ 仍是 262144 |
 
-所以 `MaxTransferLength` **不是**决定 CDB 大小的东西（值恰好都是 262144 只是巧合），
-也没有找到任何宿主侧旋钮能把写命令压到 64 KiB 以内。**结论：>64 KiB 的写只有修 R2T 这一条路。**
+所以 `MaxTransferLength` **不是**决定 CDB 大小的东西（值恰好都是 262144 只是巧合）。
+
+之后又试了**目标侧的标准做法**：实现 SCSI **Block Limits VPD（0xB0）**，把
+`MAXIMUM TRANSFER LENGTH` 报成第一段的大小（64 KiB），指望 initiator 自己把写命令压进一段里。
+结果：**Windows 确实会来读这个页**（枚举期间两次 `INQUIRY EVPD page 0xB0`），**但照样发
+262144 的 WRITE CDB**——它不拿这个字段决定 CDB 大小。该页保留（合规的块设备本来就该报，
+且它如实说明了本设备的最大值），但它在 Windows 上不是杠杆。
+
+**结论：>64 KiB 的写只有修 R2T 这一条路**，而 R2T 需要一份 Windows 接受的样本做字节级 A/B
+（LIO 参考实现，见 §8.58 与 §8.60(5)）。到此为止，这条路径上被证伪的假设是 **13 个**。
 测试后注册表已还原为原值 262144，会话/进程/设备节点都已清干净。
 
 #### (5) R2T 本身：字段全对，语义/上下文不对；11 个假设全部证伪
@@ -3587,6 +3595,7 @@ exp_cmdsn/max_cmdsn/r2tsn/data_offset/data_length）对齐，**位置与取值�
 | 10 | 先协商 `InitialR2T=Yes`（无第一段）再 R2T | ❌ 仍被拒（即 §8.58 的情形） |
 | 11 | 靠 `MaxBurstLength` 压小 CDB 以避开 R2T | ❌ CDB 不看这个键 |
 | 12 | 靠宿主注册表 `MaxTransferLength=65536` 压小 CDB（重连 / 重启 MSiSCSI / PnP 重启驱动，三级都试） | ❌ 三级都仍是 edtl=262144 |
+| 13 | 用 **SCSI Block Limits VPD（0xB0）** 的 `MAXIMUM TRANSFER LENGTH` 让 Windows 自己把 CDB 压小 | ❌ **Windows 确实来读这个页**（枚举时两次 `CDB 12 01 B0`），但仍旧发 262144 的 WRITE CDB |
 
 **结论**：这不是"R2T 某个字段写错了"，而是语义/上下文层面的东西，**必须拿到一份 Windows 接受的
 R2T 做字节级 A/B**——也就是 §8.58 里那条路（LIO 参考实现），而那台笔记本现在关着机。
