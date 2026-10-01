@@ -3475,6 +3475,126 @@ README 第 10 行此前写的是"73–102 MB/s"。那些数字全部来自**单�
   可试合并 BHS+数据的单次 `send`、加大 `SO_SNDBUF`）与**同一连接内多命令在飞**（Data-In 必须
   按任务串行，所以这条要小心）；裸栈 1.2 GB/s 仍是上界参考。
 
+### 8.60 ⚠️ 写路径：64 KiB 以下真的能写了（逐字节验证）；更大的写卡在 R2T 上，11 个假设已证伪
+
+**为什么要做**：§8.58 留下的结论是"R2T 被 Windows 判为非法 PDU，未修复"，并且写路径整体不可用。
+这一轮换了思路：**不去修 R2T，而是让它不发生**——结果先把 64 KiB 以下的写打通并逐字节验证了。
+
+#### (1) 关键发现：`InitialR2T` 是 **OR** 协商，而我在硬性回答 `Yes`
+
+从 Linux 的参考实现里读出来的规则（`iscsi_target_parameters.c`，`iscsi_check_acceptor_state()`）：
+
+```c
+if (!strcmp(param->name, INITIALR2T))   → TYPERANGE_BOOL_OR
+if (!strcmp(param->name, IMMEDIATEDATA))→ TYPERANGE_BOOL_AND
+...
+IS_TYPE_BOOL_OR:  if (acceptor || proposer) value = YES;     // 任一方要 Yes 就是 Yes
+IS_TYPE_BOOL_AND: if (acceptor && proposer) value = YES; else value = NO;  // 必须双方 Yes
+```
+
+而 Windows 在 login 里**实际 offered 的**（`-iscsitrace` 抓的原文）：
+
+```
+HeaderDigest=None,CRC32C; DataDigest=None,CRC32C; ErrorRecoveryLevel=2; InitialR2T=No;
+ImmediateData=Yes; MaxRecvDataSegmentLength=65536; MaxBurstLength=262144;
+FirstBurstLength=65536; MaxConnections=32; DataPDUInOrder=Yes; DataSequenceInOrder=Yes;
+DefaultTime2Wait=0; DefaultTime2Retain=60; MaxOutstandingR2T=16;
+```
+
+**Windows 一直在说 `InitialR2T=No`**，也就是"我愿意自己先把第一段数据推进来"。本桥此前一律回答
+`Yes`（"every write is R2T-driven"），于是 Windows 老老实实等 R2T——然后拒绝我们发的那个 R2T，
+把连接掐掉。**是我把它推上了那条坏路。** 按 OR 规则，双方都 No 才可能得到 No；Windows 提 No，
+我答 No 是合法的（只在对方提 Yes 时我才必须答 Yes，这一点已按此实现）。
+
+#### (2) 改法：接受未经请求的第一段（first burst），R2T 根本不出现
+
+`ImmediateData` 是 AND，所以答 No 合法，并且能把第一段数据**排除在 SCSI Command PDU 之外**、
+只走独立的 Data-Out PDU（一种形状比两种好接）。于是：
+
+- login 改成 `InitialR2T=No` + `FirstBurstLength=65536`（= Windows 自己的 offer，问号键只能往低答）；
+- WRITE 路径开头先收"第一段"：Data-Out PDU，`TTT=0xFFFFFFFF`、DataSN 从 0 起、按 F 位或
+  `FirstBurstLength` 结束（RFC 7143 §6.2.1、§11.7.1、§4.2.2.4）；
+- 剩下的字节才走原来的 R2T 路径。
+
+**实测（Windows 写 64 KiB）**：`first burst 65536 B in 1 PDU(s), no R2T needed`——整条写就是这一段，
+**R2T 一次都没发**，写成功、读回 **0 / 65536 字节不符**。这是这个桥第一次真的写进去数据。
+
+#### (3) 顺手发现并修掉的自己造的坑：拒绝写入时数据流会被撕开
+
+第一段数据是**不等回答就推过来**的。所以"先拒绝、后读数据"的旧顺序会把 Data-Out 的载荷留在
+socket 里，下一次 `readPdu()` 就会把数据当 BHS 解析、会话直接死掉——而**默认配置恰恰是只读**，
+这正是 1 TB 演示用的配置。现在把"排空第一段"提到了所有判断之前：拒绝时数据已经读掉了（`got`
+字节留在 scratch，过不了只读/越界检查就永远不落到后端）。
+
+**实测（只读桥）**：写 64 KiB 被拒（sense=DATA PROTECT，日志写明 `first burst of 65536 byte(s)
+drained`），**紧随其后的三次读全部返回完整的 65536 字节**——数据流没有被撕开。
+
+#### (4) 还没打通的部分：超过 64 KiB 的写仍然需要 R2T
+
+Windows 用 **262144 字节**的 WRITE CDB（1 MiB 的写 = 4 条 256 KiB 命令），而第一段受
+`FirstBurstLength`=65536 限制（对方 offer 的上限，应答方只能降不能升），所以每条 256 KiB 写里
+有 192 KiB 必须靠 R2T 要 → 又回到被拒的那个 PDU ✗。
+
+顺便证伪了一个我以为能绕开的办法：**Windows 的 CDB 大小不看我广告的 `MaxBurstLength`**。
+把 `MaxBurstLength` 从 262144 降到 65536 之后，Windows 仍然发 262144 的 CDB。
+它来自 **initiator 自己的注册表参数**
+（`HKLM\SYSTEM\CurrentControlSet\Control\Class\{4D36E97B-...}\0009\Parameters`：
+`MaxTransferLength=262144`、`MaxBurstLength=262144`、`FirstBurstLength=65536`、`InitialR2T=0`、
+`ImmediateData=1`、`ErrorRecoveryLevel=2`——login 里 offered 的那些值也是从这里来的）。
+改 `MaxTransferLength=65536` 后 CDB 仍是 262144（该值在适配器初始化时读入，重连不重读），
+注册表已还原为原值 262144。
+
+#### (5) R2T 本身：字段全对，语义/上下文不对；11 个假设全部证伪
+
+Windows 拒绝时会把自己的账本摊开——iScsiPrt 事件 23 的 dump 里就是那 48 字节：
+
+```
+31 00 00 00 00 00 00 00 | LUN 0×8 | ITT=2 | TTT=1 | StatSN=D6C840C0
+ExpCmdSN=3 | MaxCmdSN=0x42 | R2TSN=0 | Buffer Offset=0x00010000 | Len=0x00010000
+```
+
+逐字段与内核 `struct iscsi_r2t_hdr`（opcode/flags/rsvd/hlength/dlength/lun/itt/ttt/statsn/
+exp_cmdsn/max_cmdsn/r2tsn/data_offset/data_length）对齐，**位置与取值都对**，事件状态是
+`0xC0000017 STATUS_NO_MEMORY`，而且 Windows **不回任何 PDU**（没有 Reject、没有 Logout），直接断链。
+
+为了不再靠猜，加了一个**运行时 A/B 探针** `-iscsir2tcfg <file>`：target 在**每次 R2T 之前**和
+**每次 login** 重读该文件，因此一个进程就能扫完所有变体（Windows 掉线后 `DelayBetweenReconnect=5 s`
+自动重连，每次重连就是一次免费的迭代）。探针确实生效过（日志里的 R2T 字节随变体改变，例如
+`len=65536` 与默认整 burst 的 `0x30000` 不同）。
+
+| # | 假设 | 结果 |
+|---|---|---|
+| 1 | R2T 应消耗一个 StatSN（`statSn++`） | ❌ 仍被拒 |
+| 2 | 请求太长（64 KiB / 196608） | ❌ 都试过，仍被拒 |
+| 3 | 不该回答 `FirstBurstLength` | ❌（改动保留：不回答更干净） |
+| 4 | 是 §8.55 的 B-1 键回答改动引起的 | ⚠️ 未定论（当时二分开关写错） |
+| 5 | `MaxOutstandingR2T` 必须 >1（答 16） | ❌ 仍被拒 |
+| 6 | Buffer Offset 只能为 0 | ❌ 仍被拒 |
+| 7 | TTT 取值敏感（试 2） | ❌ 仍被拒 |
+| 8 | 需要 `ErrorRecoveryLevel=2`（跟 Windows 一致） | ❌ 仍被拒 |
+| 9 | 每 64 KiB 一个 R2T vs 每 burst 一个 R2T | ❌ 两种形状都被拒 |
+| 10 | 先协商 `InitialR2T=Yes`（无第一段）再 R2T | ❌ 仍被拒（即 §8.58 的情形） |
+| 11 | 靠 `MaxBurstLength` 压小 CDB 以避开 R2T | ❌ CDB 不看这个键 |
+
+**结论**：这不是"R2T 某个字段写错了"，而是语义/上下文层面的东西，**必须拿到一份 Windows 接受的
+R2T 做字节级 A/B**——也就是 §8.58 里那条路（LIO 参考实现），而那台笔记本现在关着机。
+`-iscsir2tcfg` 与 §8.55 用的登录逐字节 A/B 是同一套方法，探针已经就位，对端一开机就能跑。
+
+#### (6) 这一轮的净产出
+
+- **写路径：≤ FirstBurstLength（Windows 下 64 KiB）可写，逐字节验证通过**；更大的写仍不可用。
+- 只读默认配置下拒绝写入不再破坏数据流（先排空第一段）。
+- `-iscsir2tcfg` 运行时 R2T 探针（无该开关时完全惰性）。
+- 证伪 11 个假设并留证；把"Windows 的 CDB 大小来自它自己的注册表"这条写进文档，省下下次再试。
+
+### 8.58 附录：本条的两处修正
+
+1. 文中把 R2T 记作 "RFC 7143 §11.9" 是**错的**：§11.8 才是 Ready To Transfer，§11.9 是
+   Asynchronous Message。布局核对本身没问题（见 §8.60(5)），但引用号要按 §11.8 读。
+2. 文中"桥发出的 R2T 被 Windows 判为非法 PDU、会话断开"仍然成立；但**根因方向要改**：不是
+   R2T 长得不对，而是本桥用 `InitialR2T=Yes` 主动把每条写都推上了 R2T 这条路。改成 `No` 之后
+   64 KiB 以下的写根本不需要 R2T（§8.60）。
+
 ## 7. 已知风险
 
 | 风险 | 说明 | 缓解 |

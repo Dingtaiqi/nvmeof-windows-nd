@@ -3912,7 +3912,7 @@ int main(int argc, char** argv) {
                "  %s -initiator <serverIp> <port> <localIp> [-subnqn <nqn>] [-hostnqn <nqn>]\n"
                "               [-queues <n>] [-blocks <n>] [-discover]\n"
                "               [-authkey <DHHC-1:..>] [-authctrlkey <DHHC-1:..>] [-authskip]\n"
-               "               [-iscsi <port> [-iscsiaddr <ip>] [-iscsirw] [-iscsitrace] [-iscsitime]]\n"
+               "               [-iscsi <port> [-iscsiaddr <ip>] [-iscsirw] [-iscsitrace] [-iscsitime] [-iscsimbl <bytes>] [-iscsir2tcfg <file>]]\n"
                "  %s -target    <ip> <port> [-serve <n>] [-authkey <DHHC-1:..>]\n"
                "                          [-authdhgroup 2048|3072|4096] [-reconnectwait <s>]\n"
                "                          (n = 1 by default; 0 = keep serving)\n"
@@ -4015,6 +4015,20 @@ int main(int argc, char** argv) {
         // One line per SCSI READ, so it can stay on during a throughput run.
         else if (strcmp(argv[i], "-iscsitime") == 0) {
             g_iscsiTime = true;
+        }
+        // MaxBurstLength to advertise.  Default 65536, which is what makes writes
+        // work: Windows picks its CDB size from this, and a CDB larger than the
+        // first burst forces an R2T it then rejects.  262144 makes Windows choose
+        // 256 KiB CDBs - faster for a lone reader, fatal for writes over 64 KiB.
+        // R2T A/B probe: a file the target re-reads before every R2T and at every
+        // login.  Diagnostic only; see the comment on g_r2tProbePath.
+        else if (strcmp(argv[i], "-iscsir2tcfg") == 0 && i + 1 < argc) {
+            g_r2tProbePath = argv[++i];
+            printf("  iscsir2tcfg: R2T probe file '%s'\n", g_r2tProbePath.c_str());
+        }        else if (strcmp(argv[i], "-iscsimbl") == 0 && i + 1 < argc) {
+            long v = atol(argv[++i]);
+            if (v >= 512 && v <= 16777215) g_iscsiMaxBurst = (uint32_t)v;
+            else printf("  -iscsimbl: %ld is outside 512..16777215, ignored\n", v);
         }
         else if (strcmp(argv[i], "-iscsirw") == 0) {
             g_iscsiReadWrite = true;

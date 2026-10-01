@@ -69,6 +69,82 @@ static bool g_iscsiTrace = false;
 //  initiator's receive path.  One line per SCSI command, three numbers, answers
 //  it: total, NVMe-staging, and Data-In-send.  Cheap enough to leave on.
 static bool g_iscsiTime = false;
+//  MaxBurstLength this bridge advertises, in bytes (-iscsimbl to change it).
+//
+//  MEASURED: this does NOT steer the initiator's CDB size, which an earlier
+//  reading assumed.  With MaxBurstLength answered as 65536, Windows still sent
+//  262144-byte write CDBs; the size comes from the initiator's own
+//  MaxTransferLength, found in its registry at
+//  HKLM\SYSTEM\CurrentControlSet\Control\Class\{4D36E97B-...}\<instance>\
+//  Parameters (MaxTransferLength=262144, MaxBurstLength=262144,
+//  FirstBurstLength=65536, InitialR2T=0, ImmediateData=1,
+//  ErrorRecoveryLevel=2 - which is also where its offered login values come
+//  from).  So lowering this key buys nothing and only shrinks the burst an R2T
+//  may ask for; it stays at 262144, which is also what Windows offers.
+static uint32_t g_iscsiMaxBurst = 262144;
+
+// ---------------------------------------------------------------------------
+//  R2T PROBE (-iscsir2tcfg <file>): a runtime A/B harness for the one PDU
+//  Windows refuses.
+//
+//  Why this exists: DESIGN 8.58 recorded that Windows answers every R2T this
+//  bridge sends with event 23 ("Target sent an invalid iSCSI PDU",
+//  STATUS_NO_MEMORY) and then drops the connection, and that four earlier
+//  hypotheses died.  The bytes decode field-for-field against the layout in the
+//  kernel's struct iscsi_r2t_hdr - opcode 0x31, DataSegmentLength 0, LUN 0, ITT
+//  echoed, TTT, StatSN, ExpCmdSN, MaxCmdSN, R2TSN 0, Buffer Offset, Desired
+//  Data Transfer Length - so the rejection is semantic or contextual, and
+//  guessing which has already cost more than measuring it.
+//
+//  The file is re-read before every R2T and at every login, so a sweep can run
+//  against ONE bridge process: Windows reconnects on its own after each drop
+//  (event 34, DelayBetweenReconnect = 5 s), which makes every reconnect a free
+//  A/B iteration.  Keys, all optional:
+//
+//    len=<bytes>    request this many bytes instead of a whole burst
+//    offset=<n>     force the Buffer Offset (0 is the interesting one)
+//    ttt=<n>        force the Target Transfer Tag
+//    statsn=1       consume a StatSN for the R2T instead of reusing the next one
+//    maxout=<n>     answer MaxOutstandingR2T with this instead of 1
+//    erl=<n>        answer ErrorRecoveryLevel with this instead of 0
+//    immed=<0|1>    answer ImmediateData with this instead of No
+//
+//  Diagnostic only: with no -iscsir2tcfg the probe is inert and the shipped
+//  behaviour is exactly what the constants say.
+static std::string g_r2tProbePath;
+struct R2tProbe {
+    uint32_t len = 0;      // 0 = no override
+    int ttt = -1, statsn = -1, offset = -1;
+    int maxout = -1, erl = -1, immed = -1;
+};
+static R2tProbe g_r2tProbe;
+
+static void r2tProbeLoad() {
+    if (g_r2tProbePath.empty()) return;
+    FILE* f = nullptr;
+    if (fopen_s(&f, g_r2tProbePath.c_str(), "r") != 0 || !f) return;
+    R2tProbe p;
+    char line[160];
+    while (fgets(line, sizeof(line), f)) {
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char* k = line;
+        while (*k == ' ' || *k == '\t') k++;
+        char* e = k + strlen(k);
+        while (e > k && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = '\0';
+        int iv = atoi(eq + 1);
+        if      (!strcmp(k, "len"))    p.len    = (uint32_t)iv;
+        else if (!strcmp(k, "ttt"))    p.ttt    = iv;
+        else if (!strcmp(k, "statsn")) p.statsn = iv;
+        else if (!strcmp(k, "offset")) p.offset = iv;
+        else if (!strcmp(k, "maxout")) p.maxout = iv;
+        else if (!strcmp(k, "erl"))    p.erl    = iv;
+        else if (!strcmp(k, "immed"))  p.immed  = iv;
+    }
+    fclose(f);
+    g_r2tProbe = p;
+}
 #include <thread>
 
 // ---------------------------------------------------------------------------
@@ -404,6 +480,13 @@ private:
     std::string peer = "?";          // "ip:port" of the initiator on this connection
     std::string bindAddr = "127.0.0.1";
     uint32_t maxChunk = 65536;
+    // Unsolicited write data (InitialR2T=No, negotiated per connection in login).
+    // `unsolicited_` says the initiator may push the first burst on its own, and
+    // `firstBurst_` is the negotiated cap on that burst in bytes.  Both default to
+    // "no unsolicited data", i.e. the R2T-driven shape, which is what an initiator
+    // that offers InitialR2T=Yes must get.
+    bool     unsolicited_ = false;
+    uint32_t firstBurst_ = 0;
     uint16_t listenPort = 3260;      // advertised in SendTargets; where Windows reconnects
     uint32_t statSn, expCmdSn, maxCmdSn, nextTtt, nextTsih;
     uint32_t curEdtl = 0;            // ExpectedDataTransferLength of the command in flight
@@ -623,6 +706,12 @@ private:
     }
 
     bool sendR2T(uint32_t itt, uint32_t ttt, uint32_t r2tSn, uint32_t offset, uint32_t len) {
+        // Runtime A/B overrides (inert without -iscsir2tcfg, see the probe above).
+        r2tProbeLoad();
+        if (g_r2tProbe.ttt > 0)     ttt = (uint32_t)g_r2tProbe.ttt;
+        if (g_r2tProbe.offset >= 0) offset = (uint32_t)g_r2tProbe.offset;
+        if (g_r2tProbe.len > 0)     len = g_r2tProbe.len;
+        if (g_r2tProbe.statsn == 1) statSn++;
         uint8_t p[48] = {};
         p[0] = ISCSI_OP_R2T;
         iscsi_wr32(p + 16, itt);
@@ -796,6 +885,7 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
                 //   MaxRecvDataSegmentLength=65536; DefaultTime2Wait=0;
                 //   DefaultTime2Retain=60
                 IscsiText p;
+                r2tProbeLoad();          // -iscsir2tcfg: login-side overrides, if any
                 std::string recvLen;
                 {
                     char v[32];
@@ -845,17 +935,92 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
                 // Parallelism here comes from the initiator's own queue depth, per the
                 // concurrency numbers recorded with the READ path below.
                 offer("MaxConnections", "4");
-                offer("InitialR2T", "Yes");               // every write is R2T-driven
-                offer("ImmediateData", "No");             // ... which requires this
+                // ------------------------------------------------------------------
+                //  InitialR2T IS OR-NEGOTIATED, and that is what fixes writes.
+                //
+                //  LIO implements this key as TYPERANGE_BOOL_OR
+                //  (iscsi_target_parameters.c: iscsi_check_acceptor_state(), "if
+                //  (acceptor_boolean_value || proposer_boolean_value)" -> Yes): the
+                //  result is Yes if EITHER side wants it, so the answer is not ours to
+                //  pick - it has to follow the offer.  A responder that answers No to
+                //  an initiator that offered Yes has changed a negotiation it does not
+                //  own.  This bridge used to answer a flat "Yes" ("every write is
+                //  R2T-driven"), which was legal against any initiator, and wrong here.
+                //
+                //  What Windows actually offers on a normal session (measured off the
+                //  wire, and this is the whole fix):
+                //
+                //    HeaderDigest=None,CRC32C  DataDigest=None,CRC32C
+                //    ErrorRecoveryLevel=2      InitialR2T=No
+                //    ImmediateData=Yes         MaxRecvDataSegmentLength=65536
+                //    MaxBurstLength=262144     FirstBurstLength=65536
+                //    MaxConnections=32         MaxOutstandingR2T=16
+                //
+                //  InitialR2T=No means the initiator sends the first burst ITSELF,
+                //  before any R2T: up to FirstBurstLength bytes as Data-Out PDUs.
+                //  DESIGN 8.58 recorded that Windows rejects our R2T as an invalid PDU
+                //  (event 23, 0xC0000017) however it is built, and that it never sent a
+                //  single Data-Out PDU while we answered Yes - it sat there waiting for
+                //  an R2T and then killed the connection over the one it got.  Saying
+                //  No removes R2T from the path entirely for a write that fits in one
+                //  first burst, and Windows' write CDBs are 64 KiB (edtl=65536,
+                //  measured) = exactly its own FirstBurstLength offer.
+                //
+                //  ImmediateData is AND-negotiated (TYPERANGE_BOOL_AND, same function:
+                //  Yes only if BOTH say Yes).  Answering No is therefore legal, and it
+                //  keeps the first burst out of the SCSI Command PDU's data segment and
+                //  in separate Data-Out PDUs - one shape to receive instead of two.
+                // ------------------------------------------------------------------
+                const std::string peerIr2t = t.get("InitialR2T");
+                const std::string peerFbl  = t.get("FirstBurstLength");
+                if (!peerIr2t.empty()) offer("InitialR2T", peerIr2t == "No" ? "No" : "Yes");
+                offer("ImmediateData", "No");
+                if (peerIr2t == "No") {
+                    // Negotiated FirstBurstLength is the smaller of the two values
+                    // (iscsi_check_acceptor_state(), number case: proposer > acceptor
+                    // means the acceptor's value wins).  A number key may only be
+                    // lowered by the responder, so answer the smaller one.
+                    uint32_t fbl = peerFbl.empty() ? 65536u : (uint32_t)atoi(peerFbl.c_str());
+                    if (fbl < 512u) fbl = 512u;              // RFC 7143 s13.14 range
+                    if (fbl > 65536u) fbl = 65536u;          // one Data-Out PDU's worth
+                    if (fbl > g_iscsiMaxBurst) fbl = g_iscsiMaxBurst;
+                    if (!peerFbl.empty()) {
+                        char v[16];
+                        sprintf_s(v, "%u", fbl);
+                        offer("FirstBurstLength", v);
+                    }
+                    // These are the SESSION's members, not the key list's: `t` above is
+                    // only this login exchange's keys.
+                    unsolicited_ = true;
+                    firstBurst_ = fbl;
+                }
                 offer("MaxRecvDataSegmentLength", recvLen);
-                // FirstBurstLength is not answered.  With InitialR2T=Yes it only sizes
-                // the unsolicited burst, which by definition does not happen, and RFC
-                // 7143 s12.14 makes an unanswered key keep the initiator's own value -
-                // which is what we want.  (It was dropped while hunting the R2T
-                // rejection; that hunt failed for other reasons, but leaving it out is
-                // still the more defensible negotiation.)
-                offer("MaxBurstLength", "262144");
-                offer("MaxOutstandingR2T", "1");
+                {
+                    // MaxBurstLength caps one burst AND, measured, the CDB size Windows
+                    // chooses - see the comment on g_iscsiMaxBurst.  It must not be
+                    // smaller than FirstBurstLength (iscsi_enforce_integrity_rules()
+                    // resets FirstBurstLength down to MaxBurstLength otherwise).
+                    uint32_t mbl = g_iscsiMaxBurst;
+                    if (firstBurst_ && mbl < firstBurst_) mbl = firstBurst_;
+                    if (mbl < 512u) mbl = 512u;
+                    char v[16];
+                    sprintf_s(v, "%u", mbl);
+                    offer("MaxBurstLength", v);
+                }
+                {
+                    // -iscsir2tcfg can override the three login values whose
+                    // negotiation was itself a suspect in the R2T hunt.
+                    char v[16];
+                    sprintf_s(v, "%d", (g_r2tProbe.maxout > 0) ? g_r2tProbe.maxout : 1);
+                    offer("MaxOutstandingR2T", v);
+                    if (g_r2tProbe.erl >= 0) {
+                        sprintf_s(v, "%d", g_r2tProbe.erl);
+                        offer("ErrorRecoveryLevel", v);
+                    }
+                    if (g_r2tProbe.immed >= 0) {
+                        offer("ImmediateData", g_r2tProbe.immed ? "Yes" : "No");
+                    }
+                }
                 offer("DataPDUInOrder", "Yes");
                 offer("DataSequenceInOrder", "Yes");
                 offer("ErrorRecoveryLevel", "0");         // no connection reinstatement
@@ -1251,26 +1416,112 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
         else            { lba = iscsi_rd64(cdb + 2); count = iscsi_rd32(cdb + 10); }
         uint64_t bytes = (uint64_t)count * bs;
 
+        // ------------------------------------------------------------------
+        //  DRAIN THE FIRST BURST BEFORE ANY DECISION, including a refusal.
+        //
+        //  With InitialR2T=No the initiator pushes the first burst the moment it
+        //  has sent the command - it does not wait to hear whether the target
+        //  likes it.  So by the time this code runs, up to FirstBurstLength bytes
+        //  of Data-Out PDUs are already in flight, and a refusal that answers
+        //  without reading them leaves those bytes in the socket: the next
+        //  readPdu() would take a Data-Out payload for a BHS and the session
+        //  would die of apparent garbage.  That matters most in the DEFAULT
+        //  configuration, where the bridge is read-only and every WRITE is
+        //  refused - and where a filesystem on the far side may well try one.
+        //
+        //  Refusing first and draining later is exactly the bug this ordering
+        //  exists to prevent, so the burst is read first and judged afterwards.
+        //  The data goes nowhere on a refusal: `got` bytes sit in scratch and
+        //  only reach the backend after the rails below have passed.
+        // ------------------------------------------------------------------
+        uint32_t offset = 0, r2tSn = 0, burstPdus = 0;
+        if (unsolicited_ && firstBurst_ && bytes > 0) {
+            uint32_t limit = (uint32_t)((bytes < firstBurst_) ? bytes : firstBurst_);
+            if (scratch.size() < limit) scratch.resize(limit);
+            uint32_t got = 0, burstSn = 0;
+            while (got < limit) {
+                IscsiBhs d;
+                std::vector<uint8_t> payload;
+                if (!readPdu(d, payload)) return false;
+                if (d.opcode() != ISCSI_OP_DATA_OUT) {
+                    printf("  [iscsi] first burst: expected Data-Out, got opcode 0x%02X\n",
+                           d.opcode());
+                    return false;
+                }
+                if (d.itt() != bhs.itt() || d.dataSn() != burstSn) {
+                    printf("  [iscsi] first burst mismatch: itt 0x%08X (want 0x%08X), "
+                           "DataSN %u (want %u)\n", d.itt(), bhs.itt(), d.dataSn(), burstSn);
+                    return false;
+                }
+                if (d.bufferOff() != got || payload.size() > limit - got) {
+                    printf("  [iscsi] first burst Data-Out offset %u (want %u), %u bytes "
+                           "(room %u)\n", d.bufferOff(), got, (unsigned)payload.size(),
+                           limit - got);
+                    return false;
+                }
+                if (g_iscsiTrace) {
+                    printf("    [iscsi] first burst Data-Out: ttt=0x%08X DataSN=%u off=%u "
+                           "len=%u%s\n", d.ttt(), d.dataSn(), d.bufferOff(),
+                           (unsigned)payload.size(), d.fBit() ? " F" : "");
+                }
+                memcpy(scratch.data() + got, payload.data(), payload.size());
+                got += (uint32_t)payload.size();
+                bytesIn += payload.size();
+                burstSn++;
+                if (d.fBit()) break;                     // end of the unsolicited burst
+            }
+            offset = got;
+            burstPdus = burstSn;
+            if (got % bs) {
+                printf("  [iscsi] first burst of %u bytes is not a whole number of "
+                       "%u-byte blocks\n", got, bs);
+                uint8_t s[18];
+                uint32_t sl = buildSense(s, 0x05, 0x1A, 0);   // invalid field in parameter list
+                return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, offset, false);
+            }
+        }
+
         // READ-ONLY IS THE DEFAULT, and it is refused here rather than at the NVMe
         // layer: nvmet cannot mark a namespace read-only, so the only place this
         // promise can be kept is before the command is issued.
         if (!be.writable()) {
-            printf("  [iscsi] WRITE lba=%llu blocks=%u REFUSED (read-only bridge)\n",
-                   (unsigned long long)lba, count);
+            printf("  [iscsi] WRITE lba=%llu blocks=%u REFUSED (read-only bridge, "
+                   "first burst of %u byte(s) drained)\n",
+                   (unsigned long long)lba, count, offset);
             uint8_t s[18];
             uint32_t sl = buildSense(s, SCSI_SENSE_DATA_PROTECT, SCSI_ASC_WRITE_PROTECTED, 0);
-            return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
+            return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, offset, false);
         }
         if (count == 0 || lba + count > nblocks || bytes > edtl) {
             uint8_t s[18];
             uint32_t sl = buildSense(s, SCSI_SENSE_ILLEGAL_REQUEST,
                                      SCSI_ASC_LBA_OUT_OF_RANGE, 0);
-            return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
+            return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, offset, false);
+        }
+        if (offset && !be.write(lba, offset / bs, scratch.data())) {
+            printf("  [iscsi] WRITE (first burst) lba=%llu blocks=%u failed on the NVMe side\n",
+                   (unsigned long long)lba, offset / bs);
+            uint8_t s[18];
+            uint32_t sl = buildSense(s, 0x03 /*MEDIUM ERROR*/, 0x0C /*write error*/, 0);
+            return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, offset, false);
+        }
+        if (g_iscsiTime && offset) {
+            printf("  [iscsi] time WRITE %llu B: first burst %u B in %u PDU(s), %s\n",
+                   (unsigned long long)bytes, offset, burstPdus,
+                   (offset >= bytes) ? "no R2T needed" : "R2T for the remainder");
         }
 
-                uint32_t offset = 0, r2tSn = 0;
         while (offset < bytes) {
-            uint32_t chunk = (uint32_t)((bytes - offset) < maxChunk ? (bytes - offset) : maxChunk);
+            // ONE R2T PER BURST, not per Data-In-sized chunk.  MaxBurstLength is
+            // 262144 and MaxRecvDataSegmentLength is 65536, so a burst is up to four
+            // Data-Out PDUs; asking for the whole burst at once is the shape the
+            // reference target produces, and the per-chunk shape it replaced asked
+            // for 65536 at a time.  Whether Windows cares is unknown - both are
+            // legal under RFC 7143 s11.8.4, which only bounds the length by
+            // MaxBurstLength - but the whole-burst form is the one to compare first.
+            uint32_t burstMax = g_iscsiMaxBurst;
+            if (burstMax < maxChunk) burstMax = maxChunk;
+            uint32_t chunk = (uint32_t)((bytes - offset) < burstMax ? (bytes - offset) : burstMax);
             if (chunk % bs) chunk -= chunk % bs;
             if (chunk == 0) break;
             uint32_t ttt = nextTtt++;
