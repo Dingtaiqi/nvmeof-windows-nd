@@ -3278,6 +3278,99 @@ sha256(512) 两侧: dec615ae97b8b81cd5e395fd4f9b1fd379332c3516a16ab122c1c1a57a5d
 收工后要 `interop_link.ps1 -Action Down` + `-Action RestoreMtu` 把 LAN/CX3 的协议绑定
 还给系统。
 
+### 8.57 ✅ 串流压测：把"能用"和"能持续用"分开；以及一个 50 倍的自我伤害
+
+**为什么要做**：到 §8.56 为止，桥只被小命令验证过（枚举、读扇区、几百条 READ）。"能不能持续
+串流"是另一个问题，而它一压就露出了三件事。
+
+**方法**：两个方向各压一遍。
+1. **裸栈**（`f4_pipeline`，本机 40G 两口直连，另一套 target 实现）：20 轮 × 512 MiB/相位。
+2. **整条 Windows 路径**（Windows 自带 iSCSI initiator → 桥 → NVMe-oF/RDMA → 48 MiB namespace），
+   顺序读/写、按块大小扫描。
+
+**裸栈结果**（20 轮全部有效，178 秒，共约 20 GiB 流量）：
+
+```
+write: 平均 1230 MiB/s   最小 883   最大 1852
+read : 平均 1179 MiB/s   最小 664   最大 1610
+```
+
+`-rounds 512`（1 GiB/相位）失败在 `Register 0xC0000017`，即这台 7.9 GB 的机器**内存不够**
+——F4 把整个工作量放在内存里，这是工具的限制，不是协议问题。
+
+**Windows 路径结果（同一块 48 MiB namespace，64 KiB 块，6 秒一档）**：
+
+| 块大小 | 带日志 | 关掉日志 |
+|---|---|---|
+| 64 KiB | 1.23 MB/s（19.6 次/秒） | **60.2 MB/s（963 次/秒，1.04 ms/命令）** |
+| 256 KiB | 2.60 MB/s | **85.7 MB/s（343 次/秒）** |
+| 1 MiB | 2.58 MB/s | **91.5 MB/s（91.5 次/秒，10.9 ms/命令）** |
+
+#### (1) 第一个发现：日志把吞吐压掉了 50 倍
+
+F5 的 target 每条命令都打印 trace（`[wire]` 那几行是十六进制转储），桥也打。把两侧 stdout
+都丢进 `NUL` 之后，64 KiB 块从 1.23 MB/s 变成 60.2 MB/s。**控制台 I/O 就是那个瓶颈**，
+而它在此前所有"小命令"测试里完全无害——因为那些测试一秒只发几条命令。
+
+于是有了这条方法学：**任何吞吐数字，必须注明被测进程的 stdout 指向哪里**；否则测的是日志。
+
+#### (2) 第二个发现：延迟受限，不是带宽受限
+
+关掉日志后仍然能看出形状：64 KiB 时每条命令 1.04 ms，1 MiB 时 10.9 ms（≈16 × 64 KiB 的顺序
+往返）。桥是**严格串行**的：一条 SCSI 命令、内部 N 次 `submitCommand` 逐块等待，所以
+吞吐 = 块大小 / 往返延迟，而不是链路带宽。要真正快，需要让同一个命令的多个块**并行提交**，
+或者让多条 SCSI 命令同时在飞（`MaxCmdSN` 已经开了 64 的窗口，但桥一次只处理一条）。
+
+#### (3) 三个我自己踩的坑，都是"测量工具本身"
+
+1. **用 `GetTickCount64` 量微秒级的东西**：它的粒度是 15.6 ms，于是所有测量值都"恰好"是
+   15/31/47 ms 的整数倍。我据此错判了两次（先怪 Nagle、再怪 target 的 Sleep），
+   直到换成 `std::chrono::steady_clock` 才看到真相。
+2. **先按猜测动手**：我加了 `TCP_NODELAY`（iSCSI 确实该加，见 §8.55 的代码注释）——但它
+   **不是**瓶颈，加了以后数字一模一样。改动本身保留（对交互式协议是对的），但当时的结论是错的。
+3. **写测试的访问模式写错**：`[System.IO.File]::Open(drive,'Open','Read','ReadWrite')`
+   第三个参数是访问模式，我传了 `'Read'`，于是 57 秒里全是 "Stream does not support writing"
+   异常——**测量脚本自己的 bug 被当成了被测对象的失败**。
+
+### 8.58 ❌ 写路径是坏的：R2T 被 Windows 判为非法 PDU（未修复，附完整证据）
+
+这是本轮压测最重要的产出，而且是个**坏消息**，所以放在这里而不是埋在正文里。
+
+`-iscsirw` 打开后再写盘，Windows 报 `The request could not be performed because of an I/O
+device error`。桥侧完整的时序（每次重试都一样）：
+
+```
+[iscsi] <- SCSI CDB 2A 00 00 00 40 00  lun=0 itt=0x00000002 edtl=65536 cmdsn=2
+[iscsi] R2T itt=0x00000002 ttt=1 sn=0 offset=0 len=65536 -> sent
+[iscsi] session ended ... connection closed: 2 command(s), 0 bytes in, 36 bytes out
+```
+
+也就是说：CDB 到了 ✓、**R2T 发出去了** ✓、然后 **Windows 一个字节的 Data-Out 都没回，直接关连接**。
+Windows 侧对应的事件把原因写得很清楚（Provider `iScsiPrt`，8 分钟内 99 次）：
+
+```
+Id=23  Target sent an invalid iSCSI PDU. Dump data contains the entire iSCSI header.
+dump: 00 00 30 00 01 00 00 00 00 00 00 00 17 00 00 C0 ... 31 00 00 00 ...
+                                                         ^^ opcode 0x31 = R2T（我的 PDU）
+```
+
+`0xC0000017` 是 `STATUS_NO_MEMORY`，出现在 iScsiPrt 处理这个 R2T 的路径上；被拒的 PDU 就是
+R2T。**结论：这条写路径从来没有跑通过**——§8.55 那次 1 TB 演示全程只读，写路径一直没被触发
+（B-3 早就把它列为"从未端到端验证"，现在知道了：它不只是没验过，它是不通的）。
+
+**和 §8.55 那个 B-1 改动的关系**：B-1 把 `InitialR2T`/`ImmediateData` 从"不回答（于是沿用
+initiator 的 `InitialR2T=No, ImmediateData=Yes`）"改成显式回答 `InitialR2T=Yes, ImmediateData=No`。
+现在的行为是"initiator 等 R2T、我们发 R2T、initiator 判非法"——所以**很可能是 B-1 让这条本来就
+有问题的路径从"靠侥幸"变成了"必然失败"**：旧协商下 Windows 会先发未经请求的数据，桥的
+`readPdu` 循环也许正好把它吃掉。两种可能都还没证实，**这就是下一步要做的第一件事**。
+
+**为什么这不算"把功能搞坏了"**：出厂的默认是**只读桥**（`-iscsirw` 不开），1 TB 真盘那条
+演示路径不受影响（SMART 证明零写入）。但要恢复写能力，必须修 R2T：
+按 RFC 7143 §11.9 逐字段核对（opcode 0x31 / F / DataSegmentLength / **LUN 8 字节** /
+ITT / TTT / StatSN / ExpCmdSN / MaxCmdSN / R2TSN / Buffer Offset / Desired Data Transfer Length），
+并与 LIO 的 R2T 做一次字节级 A/B（`tools_login_probe.ps1` 那套方法可以直接复用：
+让 LIO 接受一次写，把它发的 R2T 抓下来当参考）。
+
 ## 7. 已知风险
 
 | 风险 | 说明 | 缓解 |

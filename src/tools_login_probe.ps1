@@ -1,3 +1,5 @@
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # ===========================================================================
 #  tools_login_probe.ps1 - send a REAL login request at a target and dump the
 #  reply, byte for byte.

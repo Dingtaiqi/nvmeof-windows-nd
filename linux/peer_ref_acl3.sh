@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # ===========================================================================
 #  peer_ref_acl3.sh - finish the LIO reference: a LUN the ACL can actually use.
 #

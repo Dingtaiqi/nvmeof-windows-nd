@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # ===========================================================================
 #  peer_lio_up.sh - bring up Linux's own iSCSI target (LIO, in-kernel) as a
 #  REFERENCE implementation to copy the login bytes from.

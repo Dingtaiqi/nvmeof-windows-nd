@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // f7_faults.cpp - F7: what happens when the other end stops existing.
 //
 // Section 6 of the design lists this as acceptance item 4: "the peer disappears

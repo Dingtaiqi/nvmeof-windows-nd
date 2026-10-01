@@ -1,4 +1,6 @@
-﻿# Build and run the wire-format self-test.
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Build and run the wire-format self-test.
 #
 # It is built TWICE on purpose - once as C and once as C++ - because the file is
 # included from both a .c and a .cpp translation unit in this project, and the

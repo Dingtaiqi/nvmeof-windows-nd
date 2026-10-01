@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ===========================================================================
 //  nvmeof_dhchap.h - DH-HMAC-CHAP authentication (the target half).
 //

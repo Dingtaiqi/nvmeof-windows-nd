@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # ===========================================================================
 #  f5_dsm_check.sh - which DSM form actually deallocates?
 #

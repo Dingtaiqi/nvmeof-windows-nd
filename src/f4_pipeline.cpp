@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // f4_pipeline.cpp - F4/F5 milestone: many commands in flight, and a throughput
 // number for the whole NVMe-oF path.
 //

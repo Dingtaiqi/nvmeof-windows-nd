@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ===========================================================================
 //  nvmeof_bignum.h - fixed-size big-endian modular exponentiation, and nothing else.
 //

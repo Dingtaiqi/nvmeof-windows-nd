@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # ===========================================================================
 #  f5_nvmet_ref3.sh - part three: Set Features, the data-buffer Get Features
 #  hypothesis, and the I/O commands.  Every command is wrapped in `timeout`:

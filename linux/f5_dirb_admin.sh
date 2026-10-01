@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # ===========================================================================
 #  f5_dirb_admin.sh - direction B, wider: what does a real Linux host ask of a
 #  target, and does ours answer all of it?

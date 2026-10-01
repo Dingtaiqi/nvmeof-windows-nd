@@ -1,0 +1,62 @@
+# ===========================================================================
+#  CI for the two suites that need no hardware.
+#
+#  WHAT IS COVERED, AND WHAT IS DELIBERATELY NOT
+#  Of the ten suites in src/, only these two can run on a hosted runner:
+#
+#    run_xref.ps1  - cross-checks our constants against the two Linux reference
+#                    headers in ref/.  Needs Python and the repository. Nothing else.
+#    run_wire.ps1  - the byte-level wire-format self-test, compiled as both C and
+#                    C++ with /W4 /WX.  Needs cl.exe and the repository.
+#
+#  The other eight (f1/f3/f4/f5/f5_auth/f6/f7/stag) need a real RoCE adapter and
+#  the NetworkDirect SDK, which is not part of this repository (it comes from the
+#  WDK/Windows SDK or a NIC vendor's ND provider - see README).  Pretending to run
+#  them here would produce a green check that means nothing, so this file does not
+#  try.  A red X here means the wire format, a protocol constant or a compile broke
+#  - which is exactly the class of defect a hosted runner CAN catch.
+# ===========================================================================
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  wire-and-constants:
+    runs-on: windows-2022          # pinned: /W4 /WX is only meaningful against a known compiler
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # The build scripts take the Visual Studio location from ND_VS_DIR (README
+      # "Build prerequisites"), so nothing has to be edited per machine.
+      - name: Locate Visual Studio
+        shell: pwsh
+        run: |
+          $root = 'C:\Program Files\Microsoft Visual Studio\2022'
+          $vs = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path (Join-Path $_.FullName 'Common7\Tools\VsDevCmd.bat') } |
+                Select-Object -First 1
+          if (-not $vs) { throw "no Visual Studio with VsDevCmd.bat under $root" }
+          "ND_VS_DIR=$($vs.FullName)" >> $env:GITHUB_ENV
+          Write-Host "using Visual Studio at $($vs.FullName)"
+
+      - name: Cross-check constants against the Linux reference headers
+        working-directory: src
+        shell: pwsh
+        run: |
+          .\run_xref.ps1
+          if ($LASTEXITCODE -ne 0) { throw "run_xref.ps1 failed (rc=$LASTEXITCODE)" }
+
+      - name: Wire-format self-test, as both C and C++
+        working-directory: src
+        shell: pwsh
+        run: |
+          .\run_wire.ps1
+          if ($LASTEXITCODE -ne 0) { throw "run_wire.ps1 failed (rc=$LASTEXITCODE)" }

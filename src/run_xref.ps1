@@ -1,4 +1,6 @@
-﻿# Cross-check our NVMe wire constants against the reference header.
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Cross-check our NVMe wire constants against the reference header.
 #
 # This is the cheap one: no adapter, no processes, no timing.  It exists because
 # four separate bugs in this project were all "a constant written from memory that

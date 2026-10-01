@@ -1,54 +1,64 @@
-# 商业授权（AGPL 双授权）
+# Commercial Licensing
 
-本仓库采用 **GNU Affero General Public License v3.0 或更新版本**（`LICENSE`）。
+This repository is licensed under the **GNU Affero General Public License v3.0 or later**
+(see [LICENSE](LICENSE)).
 
-**AGPL 不禁止商业使用** —— 公司内部用、拿它赚钱、做成服务，都可以，**免费**。
-它要求的是**回馈**：你分发本工程或它的派生作品（包括通过网络提供服务）时，
-必须把完整的对应源码按同样的许可给出去（第 13 条专门管网络服务）。
+**AGPL does not prohibit commercial use.** Using it inside a company, making money with it,
+running it as a service — all allowed, free of charge. What it requires is *giving back*: if
+you distribute this project or a derivative work — **including offering it over a network** —
+you must make the complete corresponding source available under the same license
+(section 13 is the network clause).
 
-所以只有一种情况需要联系作者：
+So there is exactly one situation that needs the author:
 
-> **你需要闭源。** 想把它嵌进闭源产品、或者基于它做闭源的服务而不公开你的修改。
+> **You need to stay closed source.** Embedding it in a proprietary product, or building a
+> closed-source service on top of it without publishing your changes.
 
-这时可以走商业授权（本文档），拿到一份不受 AGPL 约束的许可。
+In that case, a commercial license — free of the AGPL's obligations — is available.
 
-## 什么时候需要商业授权
+## When a commercial license is needed
 
-| 你的用法 | 需要买吗 |
+| How you use it | Do you need to buy one? |
 |---|---|
-| 个人学习、研究、实验、业余项目 | 不需要 |
-| 公司内部使用（不改，或改了但只在内部用、不对外提供服务） | 不需要 |
-| 拿它做产品/服务，并**愿意**把你的修改按 AGPL 开源 | 不需要 |
-| 嵌进闭源产品分发、或做闭源 SaaS **而不愿**公开修改 | **需要** |
-| 想把代码并入另一个不兼容 AGPL 的许可的项目（见下） | **需要** |
+| Personal study, research, experiments, hobby projects | No |
+| Internal company use (unmodified, or modified but used only internally and not offered to third parties) | No |
+| Shipping it in a product or service **and** publishing your modifications under the AGPL | No |
+| Embedding it in a closed-source product, or running a closed-source SaaS **without** publishing your changes | **Yes** |
+| Merging the code into a project whose license is incompatible with the AGPL (see below) | **Yes** |
 
-"内部试用评估"不必先买；真要闭源交付之前再来谈就行。
+An internal evaluation does not need a license up front — come and talk before you ship
+something closed.
 
-## 怎么申请
+## How to get one
 
-在本仓库开一个 issue，标题写 `Commercial license`，说明：
+Open an issue titled `Commercial license` and describe:
 
-- 使用方（公司/组织）
-- 用途（内部工具 / 产品组件 / 对外服务 / 交付项目）
-- 规模（部署套数、用户数、是否随产品分发）
-- 是否要修改源码、是否确实需要闭源
+- who the licensee is (company/organisation)
+- what for (internal tool / product component / external service / customer delivery)
+- scale (deployments, users, whether it ships with a product)
+- whether you need to modify the source, and whether you really need to keep it closed
 
-授权可以按项目一次性，也可以按年；派生作品的归属、是否要求回馈上游都能谈。
+Terms can be per-project or annual; attribution of derivative works and whether upstream
+contributions are required are both negotiable.
 
-## 许可证兼容性（两个坑）
+## License compatibility (two traps)
 
-1. **`ref/` 下的 Linux 内核头是 GPL-2.0**（`linux_nvme.h`、`linux_nvme_rdma.h`），
-   只作对照阅读、**不参与编译**。`run_xref.ps1` 只是拿它们的常量做比对。
-   **GPL-2.0-only 与 AGPL-3.0 不兼容**：不要把这两份文件里的代码并进本工程；
-   如果确实需要，本工程得整体改成 GPL-2.0（那也是开源，只是放弃了 AGPL 第 13 条的网络条款）。
-2. **链接厂商的 NetworkDirect 库没有问题**：`ndutil`/NDSPI 不是 copyleft 许可，
-   动态或静态链接它都不影响你对本工程的选择。
+1. **The Linux kernel headers under `ref/` are GPL-2.0** (`linux_nvme.h`, `linux_nvme_rdma.h`).
+   They are read for comparison only and are **never compiled**; `run_xref.ps1` merely
+   compares their constants with ours. **GPL-2.0-only and AGPL-3.0 are incompatible** — do not
+   merge code from those files into this project. If you genuinely need to, the whole project
+   would have to become GPL-2.0 instead (still open source, but it gives up AGPL section 13).
+2. **Linking the vendor NetworkDirect library is fine.** `ndutil`/NDSPI is not a copyleft
+   license, and neither static nor dynamic linking to it affects your choice for this project.
 
-## 为什么这么做
+## Why it is set up this way
 
-这个工程是可以直接变成产品的：它已经能在 Windows 上把远端 1 TB 真盘挂成活动的网络盘
-（GPT/NTFS 可读、只读保护、SMART 证明零写入），能跟 Linux 的 `nvmet` / `nvme-cli`
-**双向**互操作，带内 DH-HMAC-CHAP 认证（ffdhe2048 + hmac(sha256)，双向）也实测跑通了。
+This project can become a product more or less as it stands: on Windows it already mounts a
+remote 1 TB disk as a live network drive (GPT/NTFS readable, write-protected, with the
+drive's own SMART counters proving zero writes), interoperates **both ways** with Linux's
+`nvmet` / `nvme-cli`, and implements in-band DH-HMAC-CHAP authentication
+(ffdhe2048 + hmac(sha256), both directions, measured against a real Linux peer).
 
-作者不反对商用，反对的是"拿走 → 闭源改一改 → 当成自己的卖"。
-AGPL 正好卡住这件事：要么开源回馈，要么买授权，两条路都通。
+The author is not against commercial use; the objection is to "take it, close it, tweak it,
+sell it as your own". The AGPL blocks exactly that: either give back, or buy a license.
+Both routes are open.

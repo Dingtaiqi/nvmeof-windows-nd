@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // stag_smoketest.cpp - de-risk the NDSPI primitives that NVMe-oF/RDMA needs and
 // that this codebase has never exercised.
 //

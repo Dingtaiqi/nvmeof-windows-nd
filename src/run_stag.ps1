@@ -1,4 +1,6 @@
-﻿param(
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
+param(
     [string]$readLimits = "0,64",
     [int]$timeoutSec = 90,
     [string]$serverIp = "192.168.100.2",

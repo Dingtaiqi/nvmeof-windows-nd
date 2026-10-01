@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // nvmeof_wire.h - NVMe over Fabrics wire structures, for a from-scratch
 // Windows implementation on top of NetworkDirect (NDSPI).
 //

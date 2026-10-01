@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #ifndef NVMEOF_ISCSI_H
 #define NVMEOF_ISCSI_H
 // ===========================================================================
@@ -49,6 +51,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <chrono>
 #include <thread>
 
 // ---------------------------------------------------------------------------
@@ -328,6 +331,31 @@ public:
             int fl = sizeof(from);
             SOCKET s = accept(listenSock, (sockaddr*)&from, &fl);
             if (s == INVALID_SOCKET) return 0;
+            // TCP_NODELAY, and this one line is worth ~250x on the data path.
+            //
+            // Every PDU goes out as two writes: the 48-byte BHS, then the payload.
+            // With Nagle enabled the payload goes first and the *next* PDU's 48-byte
+            // header - a partial segment - is then held back until the previous data
+            // is acknowledged, which on Windows costs the delayed-ACK timer (~40 ms).
+            // Measured before the fix, streaming sequential reads through this bridge:
+            //
+            //    1 MiB blocks   2.6 commands/s   387 ms/command   2.6 MB/s
+            //    256 KiB       10.4              96 ms
+            //    64 KiB        19.6              51 ms
+            //    8 KiB         21.8              46 ms   <- ~45 ms floor per command
+            //
+            // The floor is the delayed ACK.  The extra ~21 ms per 64 KiB chunk in the
+            // 1 MiB case is the same stall once per Data-In PDU, sixteen of them:
+            // 45 + 16*21 = 387 ms.  The transfer looked bandwidth-limited and was
+            // latency-limited instead - 2.6 MB/s on a stack that does 1.2 GB/s.
+            //
+            // iSCSI is a request/response protocol built on small headers and assumes
+            // interactive traffic; every real implementation disables Nagle.  None of
+            // the small-command tests noticed, because one command per second is
+            // exactly what Nagle is designed not to hurt.  A streaming test found it
+            // in the first sixty seconds.
+            BOOL nodelay = TRUE;
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
             char who[64];
             sprintf_s(who, "%s:%u", inet_ntoa(from.sin_addr), ntohs(from.sin_port));
             printf("\n  [iscsi] session from %s\n", who);
@@ -356,6 +384,7 @@ private:
     uint32_t statSn, expCmdSn, maxCmdSn, nextTtt, nextTsih;
     uint32_t curEdtl = 0;            // ExpectedDataTransferLength of the command in flight
     uint32_t curDataOut = 0;         // bytes of Data-In already sent for it
+    std::chrono::steady_clock::time_point tCmdHr;   // high-resolution command start
     bool loggedIn, discovery;
     long cmds;
     unsigned long long bytesIn, bytesOut;
@@ -509,8 +538,10 @@ private:
         // One line per answer, for the same reason the receive trace exists: a
         // command the target answered wrongly and a command it never answered look
         // identical from the initiator's side (it closes the session either way).
-        printf("  [iscsi] -> itt 0x%08X status 0x%02X residual %u sense %u\n",
-               itt, status, residual, senseLen);
+        printf("  [iscsi] -> itt 0x%08X status 0x%02X residual %u sense %u t=%llums (in %llu ms)\n",
+               itt, status, residual, senseLen,
+               (unsigned long long)GetTickCount64() % 100000000,
+               (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tCmdHr).count() / 1000);
         uint32_t dl = senseLen ? senseLen + 2 : 0;
         iscsi_wr24(p + 5, dl);
         iscsi_wr32(p + 16, itt);
@@ -577,7 +608,14 @@ private:
         iscsi_wr32(p + 36, r2tSn);
         iscsi_wr32(p + 40, offset);
         iscsi_wr32(p + 44, len);
-        return sendAll(p, 48);
+        // Traced because a write that stalls is otherwise invisible: the command
+        // arrives, no response follows, and nothing in the log says whether an R2T
+        // ever went out.  A 64 KiB WRITE(10) the initiator never answers looks
+        // exactly like a target that never asked.
+        bool ok = sendAll(p, 48);
+        printf("  [iscsi] R2T itt=0x%08X ttt=%u sn=%u offset=%u len=%u -> %s\n",
+               itt, ttt, r2tSn, offset, len, ok ? "sent" : "SEND FAILED");
+        return ok;
     }
 
     bool sendNopIn(uint32_t itt, uint32_t ttt) {
@@ -723,25 +761,45 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
                 auto offer = [&](const char* k, const std::string& v) {
                     for (auto& kv : t.kv) if (kv.first == k) { p.kv.push_back({ k, v }); return; }
                 };
-                // BISECT SWITCH: answering nothing at all.  Every key the responder
-                // does not answer keeps the initiator's offered value, which is a
-                // legal and complete negotiation - so this isolates "our values are
-                // wrong" from "the response itself is wrong".
-                const bool kAnswerOperationalKeys = false;
-                if (kAnswerOperationalKeys) {
+                // ANSWER THE OPERATIONAL KEYS, and this switch was false for a reason
+                // worth recording: it started life as a bisect ("answer nothing at all
+                // - a key the responder leaves alone keeps the initiator's offered
+                // value, which is a legal and complete negotiation"), used to separate
+                // "our values are wrong" from "the response itself is wrong" while the
+                // real defect turned out to be the missing 4-byte padding on receive.
+                //
+                // Leaving it off is legal but WRONG for this bridge, because of what
+                // Windows actually offers on a normal session (measured, DESIGN 8.55):
+                //
+                //   InitialR2T=No  ImmediateData=Yes  ErrorRecoveryLevel=2
+                //   MaxConnections=32  MaxOutstandingR2T=16
+                //
+                // Every one of those is a capability this target does NOT have.  By
+                // staying silent we were accepting the initiator's values: unsolicited
+                // write data (which handleScsi would have to parse out of the SCSI
+                // Command PDU), 32 concurrent connections, ERL 2 recovery, and 16
+                // outstanding R2Ts.  Nothing broke only because WRITE is refused
+                // outright by the read-only rail - the bug was hidden by the safety
+                // feature.  A responder may only lower these values, never raise them,
+                // so answering 0/Yes/No/1 is the legal way to say what we really are.
+                //
+                // Only offered keys are answered (the rule that cost a whole round
+                // earlier), and DefaultTime2Wait / DefaultTime2Retain stay unanswered on
+                // purpose: they are the initiator's own reinstatement timers, its
+                // offered values are what we want, and answering them produced the
+                // "=NotUnderstood" entries seen in that earlier round.
                 offer("HeaderDigest", "None");            // we do not do CRC32C
                 offer("DataDigest", "None");
                 offer("MaxConnections", "1");
                 offer("InitialR2T", "Yes");               // every write is R2T-driven
-                offer("ImmediateData", "No");
+                offer("ImmediateData", "No");             // ... which requires this
                 offer("MaxRecvDataSegmentLength", recvLen);
                 offer("FirstBurstLength", recvLen);
                 offer("MaxBurstLength", "262144");
                 offer("MaxOutstandingR2T", "1");
                 offer("DataPDUInOrder", "Yes");
                 offer("DataSequenceInOrder", "Yes");
-                offer("ErrorRecoveryLevel", "0");
-                }
+                offer("ErrorRecoveryLevel", "0");         // no connection reinstatement
                 // These two are the initiator's own timeouts.  NOT answered, and
                 // that is deliberate: a key the responder does not answer keeps the
                 // initiator's offered value, which is what we want anyway - and
@@ -920,8 +978,10 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
     maxCmdSn = expCmdSn + kCmdWindow - 1;
     be.tick();
     printf("    [iscsi] <- SCSI CDB %02X %02X %02X %02X %02X %02X  lun=%u itt=0x%08X "
-           "edtl=%u cmdsn=%u\n", cdb[0], cdb[1], cdb[2], cdb[3], cdb[4], cdb[5],
-           (unsigned)bhs.lun(), bhs.itt(), edtl, bhs.cmdSn());
+           "edtl=%u cmdsn=%u t=%llums\n", cdb[0], cdb[1], cdb[2], cdb[3], cdb[4], cdb[5],
+           (unsigned)bhs.lun(), bhs.itt(), edtl, bhs.cmdSn(),
+           (unsigned long long)GetTickCount64() % 100000000);
+    tCmdHr = std::chrono::steady_clock::now();
 
     switch (op) {
     case 0x12:                               // INQUIRY
@@ -1026,7 +1086,17 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
             // side logged: an SGL with addr 0x0.  The read then "failed" with a bare
             // NVMe status and no explanation anywhere on the wire.
             if (scratch.size() < chunk) scratch.resize(chunk);
-            if (!be.read(curLba, chunk / bs, scratch.data())) {
+            // Time the NVMe submission separately from everything else.  A streaming
+            // test that showed a flat ~45 ms per SCSI command could be either the
+            // bridge's own round trip or the initiator's turnaround, and the two have
+            // completely different fixes - so measure rather than argue.
+            auto tNvme = std::chrono::steady_clock::now();
+            bool nvmeOk = be.read(curLba, chunk / bs, scratch.data());
+            long long nvmeUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tNvme).count();
+            if (nvmeUs >= 1000) {
+                printf("    [iscsi] NVMe READ %u blocks took %lld us\n", chunk / bs, nvmeUs);
+            }
+            if (!nvmeOk) {
                 printf("  [iscsi] READ lba=%llu blocks=%u failed on the NVMe side\n",
                        (unsigned long long)curLba, chunk / bs);
                 uint8_t s[18];

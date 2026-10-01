@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // ===========================================================================
 //  nvmeof_auth.h - the crypto primitives DH-HMAC-CHAP needs, and nothing else.
 //

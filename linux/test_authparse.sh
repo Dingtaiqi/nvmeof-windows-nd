@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # Exercise the key-file reading block of nvmet_setup.sh as an ORDINARY user.
 #
 # The whole script cannot run without root (it mounts configfs and modprobes), and

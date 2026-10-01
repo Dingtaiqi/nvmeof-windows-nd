@@ -1,3 +1,5 @@
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
 param(
     [string]$Out   = 'F:\nvmeof\gpt-ns.img',
     [int]   $SizeMB = 64,

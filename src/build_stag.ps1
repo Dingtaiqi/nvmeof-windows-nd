@@ -1,4 +1,6 @@
-﻿$ErrorActionPreference = "Continue"
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
+$ErrorActionPreference = "Continue"
 # Build the NVMe-oF STag smoke test against the same NDSPI stack rdmaio uses.
 $vs    = if ($env:ND_VS_DIR) { $env:ND_VS_DIR } else { "F:\Microsoft Visual Studio\18\Community" }
 $vsdev = "$vs\Common7\Tools\VsDevCmd.bat"

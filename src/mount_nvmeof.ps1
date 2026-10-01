@@ -1,3 +1,5 @@
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: AGPL-3.0-or-later
 param(
     [string]$TargetIp  = '192.168.100.5',
     [int]   $Port      = 4420,
