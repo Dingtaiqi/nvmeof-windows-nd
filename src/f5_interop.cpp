@@ -1415,7 +1415,7 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
     //   * 0x07 and 0x0f -> SUCCESS (Number of Queues and Keep Alive Timeout)
     //
     // ON A DISCOVERY CONTROLLER THE EXPECTATION FLIPS, and getting that wrong is a
-    // mistake this project has now made three times (搂8.50(4), then the log pages,
+    // mistake this project has now made three times (鎼?.50(4), then the log pages,
     // then here): a discovery controller has no write cache, no namespaces and no
     // event mask, so nvmet refuses all four.  The discovery session against Linux
     // reported three FAILs on a perfectly good peer because of it - the checks below
@@ -3910,6 +3910,7 @@ int main(int argc, char** argv) {
                "  %s -initiator <serverIp> <port> <localIp> [-subnqn <nqn>] [-hostnqn <nqn>]\n"
                "               [-queues <n>] [-blocks <n>] [-discover]\n"
                "               [-authkey <DHHC-1:..>] [-authctrlkey <DHHC-1:..>] [-authskip]\n"
+               "               [-iscsi <port> [-iscsiaddr <ip>] [-iscsirw] [-iscsitrace]]\n"
                "  %s -target    <ip> <port> [-serve <n>] [-authkey <DHHC-1:..>]\n"
                "                          [-authdhgroup 2048|3072|4096] [-reconnectwait <s>]\n"
                "                          (n = 1 by default; 0 = keep serving)\n"
@@ -4005,6 +4006,9 @@ int main(int argc, char** argv) {
         }
         // Opt IN to writes: the default is read-only, because the namespace behind
         // this bridge may be somebody's real disk and nvmet cannot mark it read-only.
+        else if (strcmp(argv[i], "-iscsitrace") == 0) {
+            g_iscsiTrace = true;
+        }
         else if (strcmp(argv[i], "-iscsirw") == 0) {
             g_iscsiReadWrite = true;
         }

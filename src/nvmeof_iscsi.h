@@ -52,6 +52,16 @@
 #include <vector>
 #include <mutex>
 #include <chrono>
+
+// ---------------------------------------------------------------------------
+//  Data-path diagnostics are OFF unless asked for, and that default is measured,
+//  not a matter of taste.  With these traces enabled (and unbuffered stdout, see
+//  main), a 256 KiB sequential read through this bridge costs 45.9 ms per command
+//  = 5.4 MB/s.  With them off, the same read runs at 85.7 MB/s.  The traces are
+//  what makes a stuck handshake debuggable, and they are worth 16x on a data path
+//  only when something is broken - so: off by default, -iscsitrace to turn them on.
+// ---------------------------------------------------------------------------
+static bool g_iscsiTrace = false;
 #include <thread>
 
 // ---------------------------------------------------------------------------
@@ -448,6 +458,7 @@ private:
     // rejected handshake: the initiator answers a bad Login Response by closing the
     // connection, with no error message anywhere.
     static void dumpPdu(const char* dir, const uint8_t* p, uint32_t len) {
+        if (!g_iscsiTrace) return;
         // Wall-clock on every login PDU: the difference between "the initiator
         // rejected our answer" (immediate retry) and "the initiator never saw our
         // answer" (a retry after its 15 s login timeout) is the whole diagnosis, and
@@ -491,7 +502,7 @@ private:
         if (!sendAll(p, 48)) return false;
         if (!keys.wire.empty() && !sendAll(keys.wire.data(), keys.wire.size())) return false;
         dumpPdu("login RSP:", p, 48);
-        printf("  [iscsi] login rsp: T=%d CSG=%u NSG=%u class=%u detail=%u, %u byte(s) of keys\n",
+        if (g_iscsiTrace) printf("  [iscsi] login rsp: T=%d CSG=%u NSG=%u class=%u detail=%u, %u byte(s) of keys\n",
                (p[1] & 0x80) ? 1 : 0, (p[1] >> 2) & 3, p[1] & 3, cls, detail,
                (unsigned)keys.wire.size());
         return true;
@@ -538,7 +549,7 @@ private:
         // One line per answer, for the same reason the receive trace exists: a
         // command the target answered wrongly and a command it never answered look
         // identical from the initiator's side (it closes the session either way).
-        printf("  [iscsi] -> itt 0x%08X status 0x%02X residual %u sense %u t=%llums (in %llu ms)\n",
+        if (g_iscsiTrace) printf("  [iscsi] -> itt 0x%08X status 0x%02X residual %u sense %u t=%llums (in %llu ms)\n",
                itt, status, residual, senseLen,
                (unsigned long long)GetTickCount64() % 100000000,
                (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tCmdHr).count() / 1000);
@@ -602,6 +613,21 @@ private:
         p[0] = ISCSI_OP_R2T;
         iscsi_wr32(p + 16, itt);
         iscsi_wr32(p + 20, ttt);
+        // StatSN is NOT incremented here, and that was tested rather than assumed.
+        //
+        // The R2T this target sends is rejected by Windows as "an invalid iSCSI PDU"
+        // (iScsiPrt event 23, with the header dumped), and the dump and this code
+        // were compared byte for byte: opcode 0x31, flags 0, DataSegmentLength 0,
+        // LUN 0, ITT echoed, TTT 1, StatSN, ExpCmdSN, MaxCmdSN, R2TSN 0, Buffer
+        // Offset 0, Desired Data Transfer Length 65536 - every field of RFC 7143
+        // section 11.9 in the right place with a sane value.  Layout is therefore
+        // not the problem.
+        //
+        // The first hypothesis was the sequence number: Windows accepted every PDU
+        // from this target that had consumed a StatSN and rejected the one that had
+        // not, so the R2T was changed to statSn++.  Windows rejected it exactly the
+        // same way, so that hypothesis is dead and the RFC reading (an R2T carries
+        // the current StatSN) is what this code does.
         iscsi_wr32(p + 24, statSn);
         iscsi_wr32(p + 28, expCmdSn);
         iscsi_wr32(p + 32, maxCmdSn);
@@ -613,8 +639,12 @@ private:
         // ever went out.  A 64 KiB WRITE(10) the initiator never answers looks
         // exactly like a target that never asked.
         bool ok = sendAll(p, 48);
-        printf("  [iscsi] R2T itt=0x%08X ttt=%u sn=%u offset=%u len=%u -> %s\n",
+        if (g_iscsiTrace) printf("  [iscsi] R2T itt=0x%08X ttt=%u sn=%u offset=%u len=%u -> %s\n",
                itt, ttt, r2tSn, offset, len, ok ? "sent" : "SEND FAILED");
+        // The bytes, next to the initiator's own dump of what it rejected: the
+        // Windows event carries "the entire iSCSI header", so the two can be laid
+        // side by side instead of argued about.
+        dumpPdu("R2T sent:", p, 48);
         return ok;
     }
 
@@ -699,7 +729,7 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
         // two ways a login can die - "the initiator sent nothing more" and "we never
         // read what it sent" - look identical.  That ambiguity cost a full debugging
         // round here.
-        printf("    [iscsi] <- %s opcode 0x%02X flags 0x%02X datalen %u\n", peer.c_str(),
+        if (g_iscsiTrace) printf("    [iscsi] <- %s opcode 0x%02X flags 0x%02X datalen %u\n", peer.c_str(),
                bhs.raw[0], bhs.raw[1], (unsigned)bhs.dataLen());
 
         switch (bhs.opcode()) {
@@ -713,7 +743,7 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
             // key the initiator never offered makes it reject the whole negotiation
             // and re-send the same Login Request, which is exactly what it did.
             if (!t.kv.empty()) {
-                printf("      offered:");
+                if (g_iscsiTrace) printf("      offered:");
                 for (auto& kv : t.kv) printf(" %s=%s;", kv.first.c_str(), kv.second.c_str());
                 printf("\n");
             }
@@ -794,7 +824,12 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
                 offer("InitialR2T", "Yes");               // every write is R2T-driven
                 offer("ImmediateData", "No");             // ... which requires this
                 offer("MaxRecvDataSegmentLength", recvLen);
-                offer("FirstBurstLength", recvLen);
+                // FirstBurstLength is not answered.  With InitialR2T=Yes it only sizes
+                // the unsolicited burst, which by definition does not happen, and RFC
+                // 7143 s12.14 makes an unanswered key keep the initiator's own value -
+                // which is what we want.  (It was dropped while hunting the R2T
+                // rejection; that hunt failed for other reasons, but leaving it out is
+                // still the more defensible negotiation.)
                 offer("MaxBurstLength", "262144");
                 offer("MaxOutstandingR2T", "1");
                 offer("DataPDUInOrder", "Yes");
@@ -809,6 +844,14 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
                 // offer("DefaultTime2Wait", t.get("DefaultTime2Wait", "0"));
                 // offer("DefaultTime2Retain", t.get("DefaultTime2Retain", "0"));
                 keys = IscsiText::makeText(p.build());
+                {
+                    // The answer, verbatim: MaxRecvDataSegmentLength here is what the initiator
+                    // may put in ONE Data-Out PDU, so it is also the largest R2T this target may
+                    // ask for.  Printing it turns 'the R2T was rejected' into a value to check.
+                    std::string shown;
+                    for (auto& kv : p.kv) { shown += kv.first; shown += '='; shown += kv.second; shown += ' '; }
+                    if (g_iscsiTrace) printf("  [iscsi] answering:%s\n", shown.c_str());
+                }
             }
             // The initiator's MaxRecvDataSegmentLength is what WE may put in one
             // Data-In PDU: the key declares what the sender can receive, so their
@@ -977,7 +1020,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
     // READ CAPACITY(10) answered GOOD, then silence forever.
     maxCmdSn = expCmdSn + kCmdWindow - 1;
     be.tick();
-    printf("    [iscsi] <- SCSI CDB %02X %02X %02X %02X %02X %02X  lun=%u itt=0x%08X "
+    if (g_iscsiTrace) printf("    [iscsi] <- SCSI CDB %02X %02X %02X %02X %02X %02X  lun=%u itt=0x%08X "
            "edtl=%u cmdsn=%u t=%llums\n", cdb[0], cdb[1], cdb[2], cdb[3], cdb[4], cdb[5],
            (unsigned)bhs.lun(), bhs.itt(), edtl, bhs.cmdSn(),
            (unsigned long long)GetTickCount64() % 100000000);
@@ -1094,7 +1137,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
             bool nvmeOk = be.read(curLba, chunk / bs, scratch.data());
             long long nvmeUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tNvme).count();
             if (nvmeUs >= 1000) {
-                printf("    [iscsi] NVMe READ %u blocks took %lld us\n", chunk / bs, nvmeUs);
+                if (g_iscsiTrace) printf("    [iscsi] NVMe READ %u blocks took %lld us\n", chunk / bs, nvmeUs);
             }
             if (!nvmeOk) {
                 printf("  [iscsi] READ lba=%llu blocks=%u failed on the NVMe side\n",
@@ -1147,7 +1190,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
             return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
         }
 
-        uint32_t offset = 0, r2tSn = 0;
+                uint32_t offset = 0, r2tSn = 0;
         while (offset < bytes) {
             uint32_t chunk = (uint32_t)((bytes - offset) < maxChunk ? (bytes - offset) : maxChunk);
             if (chunk % bs) chunk -= chunk % bs;

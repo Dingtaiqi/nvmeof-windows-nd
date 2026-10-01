@@ -1,23 +1,23 @@
-# NVMe-oF over RDMA on Windows — a from-scratch NetworkDirect stack
+﻿# NVMe-oF over RDMA on Windows 鈥?a from-scratch NetworkDirect stack
 
-**English** | [中文](README.zh-CN.md)
+**English** | [涓枃](README.zh-CN.md)
 
 NVMe-oF/RDMA implemented on Windows against the **NetworkDirect (NDSPI)** API: fabrics
 commands, 64-byte capsules, keyed SGL/STag, RDMA Read/Write, memory registration, and one
-queue pair per I/O queue. **Both ends — initiator and target — are this repository's own
+queue pair per I/O queue. **Both ends 鈥?initiator and target 鈥?are this repository's own
 code.** No third-party NVMe-oF implementation is used anywhere.
 
 Two things this gets you that Windows does not have on its own:
 
 1. **A working NVMe-oF initiator on a client SKU.** Windows Server ships one; client
    editions do not, and no user-mode process can inject a volume into the storage stack.
-2. **A remote disk as a real drive letter anyway** — via a user-mode **iSCSI target** that
+2. **A remote disk as a real drive letter anyway** 鈥?via a user-mode **iSCSI target** that
    bridges Windows' built-in iSCSI initiator into this NVMe-oF stack. Measured end to end
    by mounting a **real 1 TB Linux NVMe SSD as `E:`** on Windows, read-only, with the
    drive's own SMART counters proving that not a single write reached it.
 
 Start with the conclusions, not the code: **[DESIGN.md](DESIGN.md)** is the design and
-measurement log (§8 is a section-by-section record of what broke and why), and
+measurement log (搂8 is a section-by-section record of what broke and why), and
 **[INTEROP_F5.md](INTEROP_F5.md)** is the runbook for using a separate Linux machine as an
 independent peer. The deep docs are in Chinese; this file is the English entry point.
 
@@ -27,23 +27,23 @@ independent peer. The deep docs are in Chinese; this file is the English entry p
 
 | # | Acceptance item | Result |
 |---|---|---|
-| 1 | Wire-format self-test (byte-exact golden vectors) | ✅ `run_wire.ps1` — compiles and passes as both C and C++ |
-| 2 | Both ends agree on Identify | ✅ F1 / F6 |
-| 3 | Write-then-read is byte-identical | ✅ F3 |
-| 4 | Error paths are bounded (peer disappears, both directions) | ✅ F3 / F6 / F7 |
-| 5 | **Our host ↔ Linux `nvmet`** | ✅ `initiator failures: 0` (36 checks): byte-identical WRITE/READ, a 32-deep in-flight pipeline, and **4 I/O queues each running a command concurrently** (DESIGN §8.46, §8.49) |
-| 6 | Throughput vs a raw RDMA baseline | ✅ ~1.17 GB/s ≈ **48%** of a 2.53 GB/s baseline (DESIGN §8.16) |
-| 7 | **Our target ↔ Linux `nvme-cli`** | ✅ `nvme connect` rc=0, `nvme list` shows `NDVMEOF0000000000001`, 128 blocks written → flush → read back, `cmp` byte-identical; the host builds **8 I/O queues** and spreads commands over **6** of them (DESIGN §8.46, §8.49) |
-| 8 | **In-band DH-HMAC-CHAP authentication** | ✅ Both directions against a real Linux peer: a Linux host authenticates to our target with `nvme connect -S <key>` (kernel log `qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048`; one-way and **bidirectional** both move data; a wrong key is refused; `authRefused=0`), and our host authenticates to an **authentication-requiring `nvmet`** (`Success2 sent (the controller's own response verified)`) (DESIGN §8.51, §8.52) |
-| 9 | **A 1 TB real disk on Windows as an active drive** | ✅ Linux `/dev/nvme1n1` (CT1000P3PSSD8, 1953525168 × 512 B = 931.51 GiB) appears as `Get-Disk` #3, **Online**, GPT, NTFS `E:` readable; two byte-exact cross-checks against the Linux side; **zero writes** (DESIGN §8.55, §8.56, [EVIDENCE-1TB.md](EVIDENCE-1TB.md)) |
-| 10 | **Sustained streaming** | ⚠️ Reads: **60–91 MB/s** through the whole Windows path (64 KiB–1 MiB blocks, 963 commands/s sustained, zero errors) and **1230 / 1179 MiB/s** on the bare stack (write/read, 20 rounds). **Writes through the bridge do not work yet**: the R2T this bridge sends is rejected by Windows as an invalid PDU and the session drops (DESIGN §8.57, §8.58). The bridge is read-only by default, so the 1 TB result above is unaffected |
+| 1 | Wire-format self-test (byte-exact golden vectors) | 鉁?`run_wire.ps1` 鈥?compiles and passes as both C and C++ |
+| 2 | Both ends agree on Identify | 鉁?F1 / F6 |
+| 3 | Write-then-read is byte-identical | 鉁?F3 |
+| 4 | Error paths are bounded (peer disappears, both directions) | 鉁?F3 / F6 / F7 |
+| 5 | **Our host 鈫?Linux `nvmet`** | 鉁?`initiator failures: 0` (36 checks): byte-identical WRITE/READ, a 32-deep in-flight pipeline, and **4 I/O queues each running a command concurrently** (DESIGN 搂8.46, 搂8.49) |
+| 6 | Throughput vs a raw RDMA baseline | 鉁?~1.17 GB/s 鈮?**48%** of a 2.53 GB/s baseline (DESIGN 搂8.16) |
+| 7 | **Our target 鈫?Linux `nvme-cli`** | 鉁?`nvme connect` rc=0, `nvme list` shows `NDVMEOF0000000000001`, 128 blocks written 鈫?flush 鈫?read back, `cmp` byte-identical; the host builds **8 I/O queues** and spreads commands over **6** of them (DESIGN 搂8.46, 搂8.49) |
+| 8 | **In-band DH-HMAC-CHAP authentication** | 鉁?Both directions against a real Linux peer: a Linux host authenticates to our target with `nvme connect -S <key>` (kernel log `qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048`; one-way and **bidirectional** both move data; a wrong key is refused; `authRefused=0`), and our host authenticates to an **authentication-requiring `nvmet`** (`Success2 sent (the controller's own response verified)`) (DESIGN 搂8.51, 搂8.52) |
+| 9 | **A 1 TB real disk on Windows as an active drive** | 鉁?Linux `/dev/nvme1n1` (CT1000P3PSSD8, 1953525168 脳 512 B = 931.51 GiB) appears as `Get-Disk` #3, **Online**, GPT, NTFS `E:` readable; two byte-exact cross-checks against the Linux side; **zero writes** (DESIGN 搂8.55, 搂8.56, [EVIDENCE-1TB.md](EVIDENCE-1TB.md)) |
+| 10 | **Sustained streaming** | 鈿狅笍 Reads: **60鈥?1 MB/s** through the whole Windows path (64 KiB鈥? MiB blocks, 963 commands/s sustained, zero errors) and **1230 / 1179 MiB/s** on the bare stack (write/read, 20 rounds). **Writes through the bridge do not work yet**: the R2T this bridge sends is rejected by Windows as an invalid PDU and the session drops (DESIGN 搂8.57, 搂8.58). The bridge is read-only by default, so the 1 TB result above is unaffected |
 
-Items 5 and 7 are the only tests that can catch **both ends being wrong together** — and on
+Items 5 and 7 are the only tests that can catch **both ends being wrong together** 鈥?and on
 their first real run they found **11 defects**, 7 of them cases where our two ends shared a
 misreading of the same field, while 8/8 self-tests had been green. **Self-consistency is not
 correctness.**
 
-The whole suite is one command — 10 of 10 suites, ~220 s:
+The whole suite is one command 鈥?10 of 10 suites, ~220 s:
 
 ```powershell
 cd <repo>\src
@@ -74,7 +74,7 @@ cd <repo>\src
 
 ## The drive-letter path
 
-### Option A — iSCSI bridge (live block device, what the 1 TB demo uses)
+### Option A 鈥?iSCSI bridge (live block device, what the 1 TB demo uses)
 
 Our NVMe-oF initiator runs inside a user-mode iSCSI target; Windows' own initiator connects
 to it over loopback.
@@ -92,21 +92,21 @@ Get-Disk | Where-Object BusType -eq 'iSCSI'     # -> NVMEOF iSCSI-NVMeoF, Online
 Get-ChildItem E:\
 ```
 
-Measured on that path (DESIGN §8.56, [EVIDENCE-1TB.md](EVIDENCE-1TB.md)):
+Measured on that path (DESIGN 搂8.56, [EVIDENCE-1TB.md](EVIDENCE-1TB.md)):
 
 - `Get-Disk`: 931.51 GB, GPT, **Online**, `IsReadOnly = True`; partitions read correctly
   (300 MB ESP + 16 MB MSR + 931.2 GB NTFS); the NTFS volume mounts and lists **60 top-level
   items** with real timestamps.
 - **Byte-exact content check, twice.** A file read through `E:` (`fsutil file queryextents`
-  → LCN → partition offset → absolute LBA 1073520) and the same LBA read directly on Linux
+  鈫?LCN 鈫?partition offset 鈫?absolute LBA 1073520) and the same LBA read directly on Linux
   with `nvme read` produce identical SHA-256
   (`dec615ae97b8b81cd5e395fd4f9b1fd379332c3516a16ab122c1c1a57a5dd397`); the ESP boot sector
-  (LBA 40) matches too (`802b1462…a2452293`).
+  (LBA 40) matches too (`802b1462鈥2452293`).
 - **Zero writes, proven by the drive itself.** SMART `Data Units Written` was
   **32884752 before and 32884752 after** the whole session, while `Data Units Read` rose
-  (144240893 → 144241018). Of 747 SCSI CDBs, exactly **one** was a write — Windows trying to
-  set the NTFS dirty bit at LBA 651264 — and the bridge refused it: `WRITE … REFUSED
-  (read-only bridge)` → `CHECK CONDITION` with 18 bytes of sense. A shell write attempt is
+  (144240893 鈫?144241018). Of 747 SCSI CDBs, exactly **one** was a write 鈥?Windows trying to
+  set the NTFS dirty bit at LBA 651264 鈥?and the bridge refused it: `WRITE 鈥?REFUSED
+  (read-only bridge)` 鈫?`CHECK CONDITION` with 18 bytes of sense. A shell write attempt is
   refused by Windows itself: *"The media is write protected."*
 - **Read-only is a rail, not a default you hope for**: `-iscsirw` is off unless asked, MODE
   SENSE reports the WP bit, and WRITE is refused at the SCSI layer. `nvmet` has no
@@ -117,7 +117,7 @@ A pure-RDMA peer-to-peer path needs the peer on the same L2 as a RoCE port;
 moves the address and default route onto the bridge, lowers MTU to 1500/1024, verifies the
 LAN still works, and rolls back if it does not). `-Action Down` undoes all of it.
 
-### Option B — mount a namespace as a VHD volume (`mount_nvmeof.ps1`)
+### Option B 鈥?mount a namespace as a VHD volume (`mount_nvmeof.ps1`)
 
 Pulls a namespace through our own initiator, wraps it in a fixed VHD and mounts it:
 
@@ -129,7 +129,7 @@ Pulls a namespace through our own initiator, wraps it in a fixed VHD and mounts 
 ```
 
 This one **is** a real Windows volume (NTFS, visible in Explorer, read/write) but it is **not
-a live block device** — writes are pushed back at `-Unmount`. The full loop was verified: the
+a live block device** 鈥?writes are pushed back at `-Unmount`. The full loop was verified: the
 64 MiB image's SHA-256 read back on Linux matches the local image byte for byte, and a 2 MiB
 random file keeps its checksum across a remount.
 
@@ -142,19 +142,19 @@ random file keeps its checksum across a remount.
 | `src/nvmeof_auth.h` | DH-HMAC-CHAP crypto primitives: CNG SHA/HMAC + this repo's Montgomery modexp (`nvmeof_bignum.h`) + RFC 7919 ffdhe groups (`nvmeof_dhgroups.h`) |
 | `src/nvmeof_dhchap.h` | DH-HMAC-CHAP protocol: key parsing (`DHHC-1` + CRC32), `Kt` transform, target half, host half, loopback self-test |
 | `src/nvmeof_iscsi.h` | The user-mode iSCSI target (one object and one thread per connection; the backend is serialized behind a mutex because it is a single queue pair) |
-| `src/f1_bringup.cpp` | F1 — connection and Identify |
-| `src/f3_io.cpp` | F3 — read/write correctness and error paths (including the `0x4f` invalidate sub-type) |
-| `src/f4_pipeline.cpp` | F4 — pipelined throughput (8 in flight) |
+| `src/f1_bringup.cpp` | F1 鈥?connection and Identify |
+| `src/f3_io.cpp` | F3 鈥?read/write correctness and error paths (including the `0x4f` invalidate sub-type) |
+| `src/f4_pipeline.cpp` | F4 鈥?pipelined throughput (8 in flight) |
 | `src/f5_interop.cpp` | **F5 interop**: `-initiator` against any peer, `-target` for real hosts (32-slot receive ring, sized to cover the window it advertises), `-iscsi` for the iSCSI bridge, `-nsfile` / `-serve` / `-genkey` and friends |
-| `src/f6_lifecycle.cpp` | F6 — full host sequence plus target-side lifecycle (31 assertions) |
-| `src/f7_faults.cpp` | F7 — fault injection (peer vanishes, and the reverse) |
+| `src/f6_lifecycle.cpp` | F6 鈥?full host sequence plus target-side lifecycle (31 assertions) |
+| `src/f7_faults.cpp` | F7 鈥?fault injection (peer vanishes, and the reverse) |
 | `src/wire_selftest.c` | Byte-level golden self-test, compiled as both C and C++ |
 | `src/xref_constants.py` | Cross-checks every constant against the two Linux reference headers (97 pairs, 21 of them DH-HMAC-CHAP) |
 | `src/run_all.ps1` | Runs all 10 suites and prints a verdict table (~220 s) |
 | `src/run_f5_auth.ps1` | The six DH-HMAC-CHAP cases (two local ports, no Linux needed) |
 | `src/interop_link.ps1` | Interop link: bridge + address/route move + MTU lowering, with automatic rollback |
-| `src/f5_session.ps1` | **Whole interop session** in one command: link → peer → direction A → discovery → direction B → report file; `-Auth` adds authentication |
-| `src/mount_nvmeof.ps1` | Namespace → fixed VHD → drive letter → push back on unmount |
+| `src/f5_session.ps1` | **Whole interop session** in one command: link 鈫?peer 鈫?direction A 鈫?discovery 鈫?direction B 鈫?report file; `-Auth` adds authentication |
+| `src/mount_nvmeof.ps1` | Namespace 鈫?fixed VHD 鈫?drive letter 鈫?push back on unmount |
 | `src/tools_login_probe.ps1` | Replays the real Windows iSCSI login byte for byte at any target (used for the LIO A/B comparison) |
 | `ref/linux_nvme.h`, `ref/linux_nvme_rdma.h` | Reference copies of the Linux headers, for comparison only |
 | `linux/` | Peer-side scripts: `nvmet_setup.sh` (software RoCE `rxe` + optional `AUTH_KEY=`), `nvmet_teardown.sh`, `f5_linux_up.sh`, `f5_dirb_check.sh` (direction B), `f5_dirb_auth.sh` (direction B + auth), `f5_dirb_demo.sh`, `f5_nvmet_ref*.sh` (measure `nvmet` line by line as the specification), `f5_dsm_check.sh`, `lio_proxy.py` (byte tap in front of the LIO reference target) |
@@ -163,10 +163,10 @@ random file keeps its checksum across a remount.
 
 1. **Visual Studio** with the C++ desktop workload (its `VsDevCmd.bat` provides `cl.exe`).
 2. **NetworkDirect / NDSPI headers and library**: `ndspi.h`, `ndutil.h`/`ndutil.lib`.
-   **These are not in this repository** — they are not this project's code. They come from
+   **These are not in this repository** 鈥?they are not this project's code. They come from
    the NetworkDirect parts of the WDK/Windows SDK or from a NIC vendor's ND provider package.
    The measured environment is an HP/Mellanox ConnectX-3 Pro with the WinOF ND provider.
-   Vendors' NDv2 headers (e.g. `…\MLNX_VPI\IB\SDK\inc\ndv2`) are added to the include path if
+   Vendors' NDv2 headers (e.g. `鈥MLNX_VPI\IB\SDK\inc\ndv2`) are added to the include path if
    present.
 3. Paths are overridden by **environment variables**; the defaults are the measured local
    paths, so **no script editing is needed**:
@@ -189,7 +189,7 @@ random file keeps its checksum across a remount.
    ```
 
 4. The two files under `ref/` are Linux kernel headers (GPL-2.0) kept **for reading and
-   comparison only — they are not compiled**.
+   comparison only 鈥?they are not compiled**.
 
 ## Running
 
@@ -203,9 +203,7 @@ cd <repo>\src
 Individually: `run_xref.ps1`, `run_wire.ps1`, `run_f1.ps1`, `run_f3.ps1`, `run_f4.ps1`,
 `run_f5.ps1`, `run_f5_auth.ps1`, `run_f6.ps1`, `run_f7.ps1`, `run_stag.ps1`.
 
-Every suite follows the same rule: **delete the old exe → check the compiler's exit code →
-compare source and header timestamps.** A binary that merely *looks* current is never run —
-that rule came from a real incident (DESIGN §8.6).
+Every suite follows the same rule: **delete the old exe 鈫?check the compiler's exit code 鈫?compare source and header timestamps.** A binary that merely *looks* current is never run 鈥?that rule came from a real incident (DESIGN 搂8.6).
 
 ## Which binary to use against a real host
 
@@ -217,42 +215,42 @@ that rule came from a real incident (DESIGN §8.6).
 
 **F6's target is a lifecycle test double, not an interop target**: its host is strictly
 one-request-one-response, so it posts a single Receive and will drop capsules from a real
-pipelining host (DESIGN §8.41). F5's target has an 8-slot receive ring and delayed
+pipelining host (DESIGN 搂8.41). F5's target has an 8-slot receive ring and delayed
 completions and survives a queue depth of 32.
 
 ## Interop with a real Linux host
 
 ```powershell
-.\f5_session.ps1 -LaptopIp <peer> -LaptopUser <user>         # link → peer → direction A → discovery → direction B
+.\f5_session.ps1 -LaptopIp <peer> -LaptopUser <user>         # link 鈫?peer 鈫?direction A 鈫?discovery 鈫?direction B
 .\f5_session.ps1 -Auth -LaptopIp <peer> -LaptopUser <user>   # same link, direction B with DH-HMAC-CHAP
 .\f5_session.ps1 -Down                                       # tear the bridge down, verified
 ```
 
 Raw output lands in `src/f5_session_<timestamp>.txt`. Turning the manual steps into a script
-found **4 more defects** — a missing local IP in direction A, probing the peer address at the
-wrong moment, quotes being lost as a command string crosses PowerShell → ssh → bash (that
+found **4 more defects** 鈥?a missing local IP in direction A, probing the peer address at the
+wrong moment, quotes being lost as a command string crosses PowerShell 鈫?ssh 鈫?bash (that
 one aborted mid-sequence and left a live controller on the peer), and three in the direction-B
-script itself (DESIGN §8.47).
+script itself (DESIGN 搂8.47).
 
-**Multi-queue (§8.49)**: the target really owns 8 queue pairs, each with its own capsule ring
+**Multi-queue (搂8.49)**: the target really owns 8 queue pairs, each with its own capsule ring
 and in-flight table; the initiator creates as many as the peer grants. Peer-measured:
 direction A connects 4/4 queues and runs one command on each simultaneously; direction B has
 the Linux host create 8 and spread commands over 6. Self-test F5 uses 4 queues by default.
 
-**Discovery (§8.50)**: `nvme discover` lists us (peer-measured `DISC: the discovery log names
+**Discovery (搂8.50)**: `nvme discover` lists us (peer-measured `DISC: the discovery log names
 nqn.2024-01.local.rdma:windows-nd`; local target counters `discLogReads=3`, `controllers=2`),
 and our own host can read Linux nvmet's discovery log with `-discover`. Discovery and I/O are
 **two controllers**, so the target serves continuously with `-serve N` (default 1, preserving
 F7's "exit when the host disappears" assertion).
 
-**DH-HMAC-CHAP (§8.51)**: `-authkey <DHHC-1:..>` makes the target require authentication
+**DH-HMAC-CHAP (搂8.51)**: `-authkey <DHHC-1:..>` makes the target require authentication
 (Connect result sets ATR bit 17); before authentication every non-fabrics command is answered
-`0x4191`. Seeing ATR, our host runs Negotiate → Challenge → Reply → Success1 automatically
+`0x4191`. Seeing ATR, our host runs Negotiate 鈫?Challenge 鈫?Reply 鈫?Success1 automatically
 (plus Success2 when a controller key is configured). `.\f5_interop.exe -genkey` generates
 keys; `.\run_f5_auth.ps1` runs the six cases, including "a wrong key must be refused" and
 "ignoring ATR must be gated".
 
-**A namespace you can actually look at (§8.53)**: `-nsfile F:\x.img` turns the namespace into
+**A namespace you can actually look at (搂8.53)**: `-nsfile F:\x.img` turns the namespace into
 that file (geometry = file size, write-back on FLUSH), so bytes a Linux host writes are
 directly visible on the Windows side:
 
@@ -268,7 +266,7 @@ directly visible on the Windows side:
 In the same round `linux/f5_nvmet_ref*.sh` treated `nvmet` as the specification and measured
 reference answers line by line (discovery-log LID policy, Get Features with a data buffer
 always `SGL_INVALID_DATA`, Set VWC must be refused, DSM's AD bit in CDW11), which fixed three
-differences our own two-ended self-tests could never show — including one that **hangs the
+differences our own two-ended self-tests could never show 鈥?including one that **hangs the
 controller**: the zero-length RDMA Write triggered by `nvme persistent-event-log` never
 completes, stalling the admin queue until the host's Keep Alive times out 7.6 s later and
 drops the link.
@@ -277,7 +275,7 @@ drops the link.
 
 | File | Contents |
 |---|---|
-| [DESIGN.md](DESIGN.md) | Design and measurement log; §8 is the defect-by-defect history |
+| [DESIGN.md](DESIGN.md) | Design and measurement log; 搂8 is the defect-by-defect history |
 | [INTEROP_F5.md](INTEROP_F5.md) | How to use a separate Linux machine as an independent peer (link script, steps, rollback) |
 | [EVIDENCE-1TB.md](EVIDENCE-1TB.md) | Raw evidence for the 1 TB disk on Windows, including the teardown record |
 | [COMMERCIAL.md](COMMERCIAL.md) | Commercial licensing (AGPL dual licensing) and license-compatibility notes |
@@ -289,12 +287,12 @@ These are written in Chinese; `README.md` (this file) is the English entry point
 - A Windows machine with a RoCE-capable NIC. Measured here: ConnectX-3 Pro (HP 544+FLR-QSFP,
   firmware 2.40.5000) with the WinOF ND provider.
 - Self-testing needs only that card's two ports cabled to each other.
-- Interop needs a **local** Linux peer — an ordinary machine with software RoCE (`rxe`) is
+- Interop needs a **local** Linux peer 鈥?an ordinary machine with software RoCE (`rxe`) is
   enough. A cloud server will not work: RoCE does not cross routers (see `INTEROP_F5.md`).
 
 ## License
 
-**GNU Affero General Public License v3.0 or later** ([LICENSE](LICENSE)) — the verbatim
+**GNU Affero General Public License v3.0 or later** ([LICENSE](LICENSE)) 鈥?the verbatim
 official text, 34,523 bytes, sha256
 `8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef`.
 
@@ -309,19 +307,19 @@ the Free Software Foundation, either version 3 of the License, or
 
 **AGPL permits commercial use**; what it regulates is *closed source*:
 
-- Using it inside a company, making money with it, running it as a service — all allowed,
+- Using it inside a company, making money with it, running it as a service 鈥?all allowed,
   free of charge.
-- The price is giving back: if you distribute this project or a derivative work — **including
-  offering it over a network** — you must provide the complete corresponding source.
+- The price is giving back: if you distribute this project or a derivative work 鈥?**including
+  offering it over a network** 鈥?you must provide the complete corresponding source.
   Section 13 (`LICENSE` L540) is the network clause, and it is the one substantive difference
   from the GPL: it is what stops "take open code, run a closed cloud service".
 - A company that genuinely needs to stay closed (embedding it in a proprietary product, or a
-  closed-source SaaS) can take a commercial license instead — see [COMMERCIAL.md](COMMERCIAL.md).
+  closed-source SaaS) can take a commercial license instead 鈥?see [COMMERCIAL.md](COMMERCIAL.md).
 
 Two compatibility traps:
 
 1. The two Linux kernel headers under `ref/` are **GPL-2.0** and are read for comparison
-   only; they are never compiled. **GPL-2.0-only and AGPL-3.0 are incompatible** — do not
+   only; they are never compiled. **GPL-2.0-only and AGPL-3.0 are incompatible** 鈥?do not
    merge their code into this project. If you truly must, the whole project would have to
    become GPL-2.0.
 2. Linking the vendor NetworkDirect library (`ndutil`/NDSPI) changes nothing: it is not a
