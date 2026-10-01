@@ -1,171 +1,245 @@
-﻿# Windows 涓婄殑 NVMe-oF over RDMA锛堣嚜鐮?NetworkDirect 鏍堬級
+# Windows 上的 NVMe-oF over RDMA（自研 NetworkDirect 栈）
 
-**涓枃** | [English](README.md)
+**中文** | [English](README.md)
 
-杩欎釜宸ョ▼鐢?*鎴戜滑鑷繁鐨?NetworkDirect/NDSPI 浠ｇ爜**鍦?Windows 涓婂疄鐜?NVMe-oF/RDMA
-浼犺緭锛歠abrics 鍛戒护銆?4 瀛楄妭 capsule銆乲eyed SGL/STag銆丷DMA Read/Write銆?鍐呭瓨娉ㄥ唽銆佹瘡涓?I/O 闃熷垪鐙珛 queue pair锛?*initiator 涓?target 涓ょ閮芥槸鎴戜滑鐨勪唬鐮?*锛?娌℃湁浣跨敤浠讳綍绗笁鏂?NVMe-oF 瀹炵幇銆?
-鍏堣缁撹鍐嶈浠ｇ爜锛?*[DESIGN.md](DESIGN.md)** 鏄璁′笌瀹炴祴璁板綍锛埪? 鏄€愭潯韪╁潙鍙诧級锛?**[INTEROP_F5.md](INTEROP_F5.md)** 鏄?濡備綍鐢ㄤ竴鍙?Linux 鏈哄櫒鍋氱嫭绔嬪绔?鐨勬搷浣滄墜鍐屻€?
+这个工程用**我们自己的 NetworkDirect/NDSPI 代码**在 Windows 上实现 NVMe-oF/RDMA
+传输：fabrics 命令、64 字节 capsule、keyed SGL/STag、RDMA Read/Write、
+内存注册、每个 I/O 队列独立 queue pair，**initiator 与 target 两端都是我们的代码**，
+没有使用任何第三方 NVMe-oF 实现。
+
+先读结论再读代码：**[DESIGN.md](DESIGN.md)** 是设计与实测记录（§8 是逐条踩坑史），
+**[INTEROP_F5.md](INTEROP_F5.md)** 是"如何用一台 Linux 机器做独立对端"的操作手册。
+
 ---
 
-## 鐩綍
+## 目录
 
-| 璺緞 | 鏄粈涔?|
+| 路径 | 是什么 |
 |---|---|
-| `src/nvmeof_wire.h` | 绾夸笂鏍煎紡锛歝apsule/CQE/SGL/Identify/鐘舵€佺爜锛屾瘡涓竷灞€閮芥湁 `NVMEOF_STATIC_ASSERT` 閽変綇 |
-| `src/nvmeof_rdma.h` | 浼犺緭灞傦細`Device` / `Queue` / `acceptChecked()`锛堟寜 Linux 鐨勮鍒欐牎楠?Connect 绉佹湁鏁版嵁锛?|
-| `src/f1_bringup.cpp` | F1 杩炴帴涓?Identify |
-| `src/f3_io.cpp` | F3 璇诲啓姝ｇ‘鎬?+ 閿欒璺緞锛堝惈 0x4f invalidate 瀛愮被鍨嬶級 |
-| `src/f4_pipeline.cpp` | F4 娴佹按绾垮悶鍚愶紙8 鏉″湪椋烇級 |
-| `src/f5_interop.cpp` | **F5 浜掓搷浣?*锛歚-initiator` 鎵撲换鎰忓绔紝`-target` 缁欑湡瀹?host 鐢紙32 妲?receive ring锛岃鐩栧畠瀹ｇО鐨勭獥鍙ｏ級 |
-| `src/f6_lifecycle.cpp` | F6 host 瀹屾暣搴忓垪 + 鐩爣渚х敓鍛藉懆鏈燂紙31 鏉℃柇瑷€锛?|
-| `src/f7_faults.cpp` | F7 鏁呴殰娉ㄥ叆锛堝绔秷澶便€佸弽鍚戞秷澶憋級 |
-| `src/nvmeof_auth.h` | DH-HMAC-CHAP 鐨勫瘑鐮佸鍘熻锛欳NG 鐨?SHA/HMAC + 鑷爺瀹氶暱 Montgomery 妯″箓锛坄nvmeof_bignum.h`锛? RFC 7919 ffdhe 缇わ紙`nvmeof_dhgroups.h`锛?|
-| `src/nvmeof_dhchap.h` | DH-HMAC-CHAP 鍗忚锛氬瘑閽ヨВ鏋愶紙DHHC-1 + CRC32锛夈€乣Kt` 鍙樻崲銆乼arget 鍗婅竟銆乭ost 鍗婅竟銆佺幆鍥炶嚜妫€ |
-| `src/wire_selftest.c` | 瀛楄妭绾?golden 鑷锛孋 涓?C++ 鍙屼唤缂栬瘧 |
-| `src/xref_constants.py` | 甯搁噺涓庝袱浠?Linux 鍙傝€冨ご鏂囦欢**閫愬€兼瘮瀵?*锛?7 瀵癸紝鍚?DH-HMAC-CHAP 鐨?21 涓級 |
-| `src/run_all.ps1` | 涓€娆¤窇瀹屽叏閮?10 濂楀苟缁欑粨璁鸿〃锛堢害 220 绉掞級 |
-| `src/interop_link.ps1` | 浜掓搷浣滈摼璺細妗ユ帴 + 鎼?IP/璺敱 + 闄?MTU锛屽け璐ヨ嚜鍔ㄥ洖婊?|
-| `src/f5_session.ps1` | **浜掓搷浣滄暣鍦?*锛氶摼璺?鈫?瀵圭 鈫?鏂瑰悜 A 鈫?discovery 鈫?鏂瑰悜 B 鈫?涓€浠芥姤鍛婃枃浠讹紱`-Auth` 鎹㈡垚甯﹁璇佺殑鐗堟湰 |
-| `src/run_f5_auth.ps1` | DH-HMAC-CHAP 鍏釜鐢ㄤ緥锛堟湰鏈轰袱鍙ｇ洿杩烇紝涓嶉渶瑕?Linux锛?|
-| `src/nvmeof_iscsi.h` | **鐢ㄦ埛鎬?iSCSI target**锛氫笁娈靛紡 login銆丼endTargets銆丯OP/Logout/TaskMgmt銆丼CSI 鍛戒护闆嗭紙INQUIRY/VPD銆丮ODE SENSE銆丷EAD CAPACITY銆丷EPORT LUNS銆丷EAD/WRITE(10/16) 璧?R2T銆丼YNCHRONIZE CACHE锛夈€傛瘡杩炴帴涓€涓璞′竴涓嚎绋嬶紝backend锛堜竴鏉￠槦鍒楀锛夌敤浜掓枼閲忎覆琛?|
-| `src/tools_login_probe.ps1` | 鎶?Windows 鐪熷疄鍙戝嚭鐨?iSCSI login **閫愬瓧鑺傞噸鏀?*缁欎换鎰?target锛堝仛 LIO 鍙傝€冨疄鐜扮殑 A/B 瀵规瘮鐢級 |
-| `src/mount_nvmeof.ps1` | 鍛藉悕绌洪棿 鈫?fixed VHD 鈫?鐩樼锛屽嵏杞芥椂鍥炴帹 |
-| `EVIDENCE-1TB.md` | 1 TB 鐪熺洏鎸傚埌 Windows 鐨勫叏閮ㄥ疄娴嬭緭鍑猴紙鍚媶闄よ褰曪級 |
-| `ref/linux_nvme.h`銆乣ref/linux_nvme_rdma.h` | 鍙傝€冨壇鏈紝渚涗笂闈㈠姣斾笌鏌ヨ瘉 |
-| `linux/` | 瀵圭鑴氭湰锛歚nvmet_setup.sh`锛堝惈 rxe 杞欢 RoCE 涓庡彲閫?`AUTH_KEY=` 璁よ瘉锛夈€乣f5_linux_up.sh`銆乣nvmet_teardown.sh`銆乣f5_dirb_check.sh`锛堟柟鍚?B锛夈€乣f5_dirb_auth.sh`锛堟柟鍚?B + 璁よ瘉锛夈€乣f5_dirb_demo.sh`锛堝鎵弿 + 鎸佷箙鍖栨紨绀猴級銆乣f5_nvmet_ref*.sh`锛堟妸 nvmet 褰撹鏍奸€愯閲忓弬鑰冪瓟妗堬級銆乣f5_dsm_check.sh`锛圖SM 鐨?AD 浣嶅埌搴曞湪鍝級 |
+| `src/nvmeof_wire.h` | 线上格式：capsule/CQE/SGL/Identify/状态码，每个布局都有 `NVMEOF_STATIC_ASSERT` 钉住 |
+| `src/nvmeof_rdma.h` | 传输层：`Device` / `Queue` / `acceptChecked()`（按 Linux 的规则校验 Connect 私有数据） |
+| `src/f1_bringup.cpp` | F1 连接与 Identify |
+| `src/f3_io.cpp` | F3 读写正确性 + 错误路径（含 0x4f invalidate 子类型） |
+| `src/f4_pipeline.cpp` | F4 流水线吞吐（8 条在飞） |
+| `src/f5_interop.cpp` | **F5 互操作**：`-initiator` 打任意对端，`-target` 给真实 host 用（32 槽 receive ring，覆盖它宣称的窗口） |
+| `src/f6_lifecycle.cpp` | F6 host 完整序列 + 目标侧生命周期（31 条断言） |
+| `src/f7_faults.cpp` | F7 故障注入（对端消失、反向消失） |
+| `src/nvmeof_auth.h` | DH-HMAC-CHAP 的密码学原语：CNG 的 SHA/HMAC + 自研定长 Montgomery 模幂（`nvmeof_bignum.h`）+ RFC 7919 ffdhe 群（`nvmeof_dhgroups.h`） |
+| `src/nvmeof_dhchap.h` | DH-HMAC-CHAP 协议：密钥解析（DHHC-1 + CRC32）、`Kt` 变换、target 半边、host 半边、环回自检 |
+| `src/wire_selftest.c` | 字节级 golden 自检，C 与 C++ 双份编译 |
+| `src/xref_constants.py` | 常量与两份 Linux 参考头文件**逐值比对**（97 对，含 DH-HMAC-CHAP 的 21 个） |
+| `src/run_all.ps1` | 一次跑完全部 10 套并给结论表（约 220 秒） |
+| `src/interop_link.ps1` | 互操作链路：桥接 + 搬 IP/路由 + 降 MTU，失败自动回滚 |
+| `src/f5_session.ps1` | **互操作整场**：链路 → 对端 → 方向 A → discovery → 方向 B → 一份报告文件；`-Auth` 换成带认证的版本 |
+| `src/run_f5_auth.ps1` | DH-HMAC-CHAP 六个用例（本机两口直连，不需要 Linux） |
+| `src/nvmeof_iscsi.h` | **用户态 iSCSI target**：三段式 login、SendTargets、NOP/Logout/TaskMgmt、SCSI 命令集（INQUIRY/VPD、MODE SENSE、READ CAPACITY、REPORT LUNS、READ/WRITE(10/16) 走 R2T、SYNCHRONIZE CACHE）。每连接一个对象一个线程，backend（一条队列对）用互斥量串行 |
+| `src/tools_login_probe.ps1` | 把 Windows 真实发出的 iSCSI login **逐字节重放**给任意 target（做 LIO 参考实现的 A/B 对比用） |
+| `src/mount_nvmeof.ps1` | 命名空间 → fixed VHD → 盘符，卸载时回推 |
+| `EVIDENCE-1TB.md` | 1 TB 真盘挂到 Windows 的全部实测输出（含拆除记录） |
+| `ref/linux_nvme.h`、`ref/linux_nvme_rdma.h` | 参考副本，供上面对比与查证 |
+| `linux/` | 对端脚本：`nvmet_setup.sh`（含 rxe 软件 RoCE 与可选 `AUTH_KEY=` 认证）、`f5_linux_up.sh`、`nvmet_teardown.sh`、`f5_dirb_check.sh`（方向 B）、`f5_dirb_auth.sh`（方向 B + 认证）、`f5_dirb_demo.sh`（宽扫描 + 持久化演示）、`f5_nvmet_ref*.sh`（把 nvmet 当规格逐行量参考答案）、`f5_dsm_check.sh`（DSM 的 AD 位到底在哪） |
 
-## 鍓嶇疆鏉′欢锛堣鑷繁缂栬瘧鐨勮瘽锛?
-1. **Visual Studio**锛堝惈 C++ 妗岄潰宸ヤ綔璐熻浇锛岀敤瀹冪殑 `VsDevCmd.bat` 鎻愪緵 `cl.exe`锛夈€?2. **NetworkDirect / NDSPI 鐨勫ご鏂囦欢涓庡簱**锛歚ndspi.h`銆乣ndutil.h`/`ndutil.lib`銆?*鏈粨搴撲笉鍚繖浜?*
-   锛堝畠浠笉鏄湰宸ョ▼鐨勪唬鐮侊紝鏉ヨ嚜 WDK/Windows SDK 鐨?NetworkDirect 閮ㄥ垎锛屾垨缃戝崱鍘傚晢鐨?   ND 鎻愪緵鑰呭畨瑁呭寘锛涘疄娴嬬幆澧冩槸 HP/Mellanox ConnectX-3 Pro + WinOF 鐨?ND 鎻愪緵鑰咃級銆?   缂栬瘧鏃惰繕闇€瑕佸巶鍟嗙殑 NDv2 澶达紙Mellanox 鐨?`鈥MLNX_VPI\IB\SDK\inc\ndv2`锛夛紝鏈夊垯鍔犲叆鍖呭惈璺緞銆?3. 涓変釜璺緞閫氳繃**鐜鍙橀噺**瑕嗙洊锛屼笉璁惧氨鐢ㄦ湰鏈哄疄娴嬬殑榛樿鍊硷紝**涓嶉渶瑕佹敼鑴氭湰**锛?
-   | 鐜鍙橀噺 | 鍚箟 | 涓嶈鏃剁殑榛樿鍊?|
+## 前置条件（要自己编译的话）
+
+1. **Visual Studio**（含 C++ 桌面工作负载，用它的 `VsDevCmd.bat` 提供 `cl.exe`）。
+2. **NetworkDirect / NDSPI 的头文件与库**：`ndspi.h`、`ndutil.h`/`ndutil.lib`。**本仓库不含这些**
+   （它们不是本工程的代码，来自 WDK/Windows SDK 的 NetworkDirect 部分，或网卡厂商的
+   ND 提供者安装包；实测环境是 HP/Mellanox ConnectX-3 Pro + WinOF 的 ND 提供者）。
+   编译时还需要厂商的 NDv2 头（Mellanox 的 `…\MLNX_VPI\IB\SDK\inc\ndv2`），有则加入包含路径。
+3. 三个路径通过**环境变量**覆盖，不设就用本机实测的默认值，**不需要改脚本**：
+
+   | 环境变量 | 含义 | 不设时的默认值 |
    |---|---|---|
-   | `ND_VS_DIR` | Visual Studio 瀹夎鐩綍 | `F:\Microsoft Visual Studio\18\Community` |
-   | `ND_NDUTIL_INC` | NetworkDirect 澶存枃浠剁洰褰?| `D:\rdma\NetworkDirect\src\ndutil` |
-   | `ND_NDUTIL_LIB` | `ndutil.lib` 鎵€鍦ㄧ洰褰?| `D:\rdma\NetworkDirect\src\x64\Release` |
-   | `ND_MLNX_INC` | 鍘傚晢 NDv2 澶寸洰褰曪紙鍙€夛級 | `C:\Program Files\Mellanox\MLNX_VPI\IB\SDK\inc\ndv2` |
+   | `ND_VS_DIR` | Visual Studio 安装目录 | `F:\Microsoft Visual Studio\18\Community` |
+   | `ND_NDUTIL_INC` | NetworkDirect 头文件目录 | `D:\rdma\NetworkDirect\src\ndutil` |
+   | `ND_NDUTIL_LIB` | `ndutil.lib` 所在目录 | `D:\rdma\NetworkDirect\src\x64\Release` |
+   | `ND_MLNX_INC` | 厂商 NDv2 头目录（可选） | `C:\Program Files\Mellanox\MLNX_VPI\IB\SDK\inc\ndv2` |
 
-   鑴氭湰鑷繁鎵€鍦ㄧ洰褰曚竴寰嬬敤 `$PSScriptRoot` 鎺ㄥ锛屾墍浠ヤ粨搴撴斁鍦ㄥ摢閲岄兘鑳借窇锛?
+   脚本自己所在目录一律用 `$PSScriptRoot` 推导，所以仓库放在哪里都能跑：
+
    ```powershell
    $env:ND_VS_DIR     = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
    $env:ND_NDUTIL_INC = 'C:\ndsdk\src\ndutil'
    $env:ND_NDUTIL_LIB = 'C:\ndsdk\src\x64\Release'
-   cd <浠撳簱>\src ; .\run_wire.ps1        # 鍏堣窇杩欎釜锛氫笉闇€瑕佺綉鍗?   ```
+   cd <仓库>\src ; .\run_wire.ps1        # 先跑这个：不需要网卡
+   ```
 
-4. `ref/` 涓嬩袱浠芥槸 Linux 鍐呮牳鐨勫弬鑰冨ご鏂囦欢锛坄linux_nvme.h` / `linux_nvme_rdma.h`锛?   GPL-2.0 鐨?UAPI/鍐呮牳澶达級锛?*鍙綔瀵圭収闃呰锛屼笉鍙備笌缂栬瘧**銆?
-## 璺戣捣鏉?
-涓€娆¤窇鍏ㄩ儴锛堢害 6 鍒嗛挓锛屾寜椤哄簭鎵ц銆佷簰鐩镐笉骞叉壈锛夛細
+4. `ref/` 下两份是 Linux 内核的参考头文件（`linux_nvme.h` / `linux_nvme_rdma.h`，
+   GPL-2.0 的 UAPI/内核头），**只作对照阅读，不参与编译**。
+
+## 跑起来
+
+一次跑全部（约 6 分钟，按顺序执行、互相不干扰）：
 
 ```powershell
-cd <浠撳簱>\src
+cd <仓库>\src
 .\run_all.ps1
 ```
 
-鍗曠嫭璺戞煇涓€濂楋細`run_xref.ps1`銆乣run_wire.ps1`銆乣run_f1.ps1`銆乣run_f3.ps1`銆?`run_f4.ps1`銆乣run_f5.ps1`銆乣run_f5_auth.ps1`銆乣run_f6.ps1`銆乣run_f7.ps1`銆?
-姣忓鐨勮鍒欓兘涓€鏍凤細**鍒犳帀鏃?exe 鈫?鐪嬬紪璇戦€€鍑虹爜 鈫?姣斿婧愮爜涓庡ご鏂囦欢鏃堕棿鎴?*锛?缁濅笉杩愯"鐪嬭捣鏉ヨ繕鍦?鐨勬棫浜岃繘鍒讹紙杩欐潯鏄粠涓€娆＄湡瀹炰簨鏁呴噷鏉ョ殑锛岃 DESIGN 搂8.6锛夈€?
-## 瑕佹帴鐪熷疄 host 鏃剁敤鍝釜浜岃繘鍒?
-| 鍦烘櫙 | 鐢ㄤ粈涔?|
+单独跑某一套：`run_xref.ps1`、`run_wire.ps1`、`run_f1.ps1`、`run_f3.ps1`、
+`run_f4.ps1`、`run_f5.ps1`、`run_f5_auth.ps1`、`run_f6.ps1`、`run_f7.ps1`。
+
+每套的规则都一样：**删掉旧 exe → 看编译退出码 → 比对源码与头文件时间戳**，
+绝不运行"看起来还在"的旧二进制（这条是从一次真实事故里来的，见 DESIGN §8.6）。
+
+## 要接真实 host 时用哪个二进制
+
+| 场景 | 用什么 |
 |---|---|
-| Linux `nvme-cli` / 浠讳綍澶栨潵 host 鎵撴垜浠?| **`f5_interop.exe -target <ip> <port>`** |
-| 鎴戜滑鐨?host 鎵?Linux `nvmet` 鎴栦换浣曞绔?| `f5_interop.exe -initiator <serverIp> <port> <localIp> [-subnqn <nqn>]` |
-| 鑷祴锛堜袱绔兘鏄垜浠級 | 浠绘剰 `run_f*.ps1` |
+| Linux `nvme-cli` / 任何外来 host 打我们 | **`f5_interop.exe -target <ip> <port>`** |
+| 我们的 host 打 Linux `nvmet` 或任何对端 | `f5_interop.exe -initiator <serverIp> <port> <localIp> [-subnqn <nqn>]` |
+| 自测（两端都是我们） | 任意 `run_f*.ps1` |
 
-**F6 鐨?target 鏄敓鍛藉懆鏈熸祴璇曟浛韬紝涓嶆槸浜掓搷浣?target**锛氬畠鐨?host 鏄弗鏍间竴闂竴绛旓紝
-鎵€浠ュ畠鍙寕涓€涓?Receive锛岄亣鍒颁細娴佹按鐨勭湡瀹?host 浼氫涪 capsule锛圖ESIGN 搂8.41锛夈€?F5 鐨?target 鏈?8 妲?receive ring 涓庡欢杩熷畬鎴愶紝鑳芥墰浣忛槦鍒楁繁搴?32 鐨?host銆?
-## 褰撳墠鐘舵€?
-| 楠屾敹椤?| 鐘舵€?|
+**F6 的 target 是生命周期测试替身，不是互操作 target**：它的 host 是严格一问一答，
+所以它只挂一个 Receive，遇到会流水的真实 host 会丢 capsule（DESIGN §8.41）。
+F5 的 target 有 8 槽 receive ring 与延迟完成，能扛住队列深度 32 的 host。
+
+## 当前状态
+
+| 验收项 | 状态 |
 |---|---|
-| 1 wire 鑷 | 鉁?`run_wire.ps1` |
-| 2 涓ょ Identify 涓€鑷?| 鉁?F1 / F6 |
-| 3 鍐欏悗璇婚€愬瓧鑺備竴鑷?| 鉁?F3 |
-| 4 閿欒璺緞鏈夌晫锛堝惈瀵圭娑堝け锛屽弻鍚戯級 | 鉁?F3 / F6 / F7 |
-| 5 **鎴戜滑鐨?host 鈫?Linux `nvmet`** | 鉁?**璺戦€氫簡**锛歚initiator failures: 0`锛?6 椤规鏌ワ級锛屽惈閫愬瓧鑺備竴鑷寸殑 WRITE/READ銆?2 鏉″湪椋炵殑娴佹按绾匡紝浠ュ強 **4 鏉?I/O 闃熷垪鍚勮嚜鍚屾椂璺戜竴鏉″懡浠?*锛圖ESIGN 搂8.46銆伮?.49锛?|
-| 6 鍚炲悙 vs 瑁?RDMA 鍩虹嚎 | 鉁?绾?1.17 GB/s 鈮?2.53 GB/s 鐨?**48%**锛圖ESIGN 搂8.16锛?|
-| 7 **鎴戜滑鐨?target 鈫?Linux `nvme-cli`** | 鉁?**璺戦€氫簡**锛歚nvme connect` rc=0锛宍nvme list` 鍑虹幇 `NDVMEOF0000000000001`锛?28 鍧楀啓鍏モ啋flush鈫掕鍥?**`cmp` 閫愬瓧鑺傜浉鍚?*锛涗富鏈哄缓 **8 鏉?I/O 闃熷垪**銆佸懡浠ゅ垎鏁ｅ湪 **6 鏉?*涓婏紙DESIGN 搂8.46銆伮?.49锛?|
-| 8 **DH-HMAC-CHAP 鍦ㄥ甫鍐呰璇?* | 鉁?**涓や釜鏂瑰悜閮借窇閫氫簡锛圠inux 瀵圭瀹炴祴锛?*锛氱湡 Linux 涓绘満鐢?`nvme connect -S <key>` 璁よ瘉鍒版垜浠殑 target锛堝唴鏍告棩蹇?`qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048`锛屽崟鍚戜笌**鍙屽悜**閮介€氳繃骞舵惉杩愪簡鏁版嵁锛?*閿欏瘑閽ヨ鎷?*锛宍authRefused=0`锛夛紱鍙嶅悜涔熶竴鏍封€斺€旀垜浠殑 host 璁よ瘉鍒?*瑕佹眰璁よ瘉鐨?nvmet**锛宍Success2 sent (the controller's own response verified)`锛屽嵆鐪?ffdhe2048 DH + 鍙屽悜锛圖ESIGN 搂8.51銆伮?.52锛?|
+| 1 wire 自检 | ✅ `run_wire.ps1` |
+| 2 两端 Identify 一致 | ✅ F1 / F6 |
+| 3 写后读逐字节一致 | ✅ F3 |
+| 4 错误路径有界（含对端消失，双向） | ✅ F3 / F6 / F7 |
+| 5 **我们的 host ↔ Linux `nvmet`** | ✅ **跑通了**：`initiator failures: 0`（36 项检查），含逐字节一致的 WRITE/READ、32 条在飞的流水线，以及 **4 条 I/O 队列各自同时跑一条命令**（DESIGN §8.46、§8.49） |
+| 6 吞吐 vs 裸 RDMA 基线 | ✅ 约 1.17 GB/s ≈ 2.53 GB/s 的 **48%**（DESIGN §8.16） |
+| 7 **我们的 target ↔ Linux `nvme-cli`** | ✅ **跑通了**：`nvme connect` rc=0，`nvme list` 出现 `NDVMEOF0000000000001`，128 块写入→flush→读回 **`cmp` 逐字节相同**；主机建 **8 条 I/O 队列**、命令分散在 **6 条**上（DESIGN §8.46、§8.49） |
+| 8 **DH-HMAC-CHAP 在带内认证** | ✅ **两个方向都跑通了（Linux 对端实测）**：真 Linux 主机用 `nvme connect -S <key>` 认证到我们的 target（内核日志 `qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048`，单向与**双向**都通过并搬运了数据，**错密钥被拒**，`authRefused=0`）；反向也一样——我们的 host 认证到**要求认证的 nvmet**，`Success2 sent (the controller's own response verified)`，即真 ffdhe2048 DH + 双向（DESIGN §8.51、§8.52） |
+| 9 **Linux 的 1 TB 真盘成为 Windows 的活动盘** | ✅ Linux `/dev/nvme1n1`（CT1000P3PSSD8，1953525168 × 512 B = 931.51 GiB）出现为 `Get-Disk` #3，**Online**、GPT、NTFS `E:` 可读；两次与 Linux 侧的字节级对照；**全程零写入**（DESIGN §8.55、§8.56，[EVIDENCE-1TB.md](EVIDENCE-1TB.md)） |
+| 10 **持续串流压测** | ⚠️ 读：整条 Windows 路径 **73–102 MB/s**（64 KiB–1 MiB 块，最高 1176 次/秒持续，零错误；数据路径 trace 默认关闭，打开会慢约 20 倍，调试时用 `-iscsitrace`）与裸栈 **1230 / 1179 MiB/s**（写/读，20 轮）。**桥的写路径不通**：桥发出的 R2T 被 Windows 判为非法 PDU、会话断开（DESIGN §8.57、§8.58）。桥默认只读，故第 9 项不受影响 |
 
-绗?5銆? 椤规槸鍞竴鑳藉彂鐜?鎴戜滑涓ょ涓€璧峰啓閿?鐨勬祴璇曗€斺€旂涓€娆＄湡璺戯紝
-瀹冧滑涓€鍏辨姄鍑?**11 涓己闄?*锛屽叾涓?7 涓槸鎴戜滑涓ょ瀵瑰悓涓€瀛楁鐨勭悊瑙ｄ笌瑙勮寖涓嶄竴鑷达紝
-鑰屾鍓?8/8 鑷鍏ㄧ豢锛圖ESIGN 搂8.46锛夈€?*鑷璇佹槑鍐呴儴涓€鑷达紝涓嶈瘉鏄庢纭€?*
+第 5、7 项是唯一能发现"我们两端一起写错"的测试——第一次真跑，
+它们一共抓出 **11 个缺陷**，其中 7 个是我们两端对同一字段的理解与规范不一致，
+而此前 8/8 自检全绿（DESIGN §8.46）。**自检证明内部一致，不证明正确。**
 
-**杩欎袱椤圭幇鍦ㄦ槸涓€鏉″懡浠?*锛堝疄娴嬶細鍙屽悜閮借繃锛屼箣鍚?`run_all.ps1` 9/9銆?37 绉掞級锛?
+**这两项现在是一条命令**（实测：双向都过，之后 `run_all.ps1` 9/9、137 秒）：
+
 ```powershell
-.\f5_session.ps1 -LaptopIp <瀵圭> -LaptopUser <鐢ㄦ埛>        # 閾捐矾 鈫?瀵圭 鈫?鏂瑰悜 A 鈫?discovery 鈫?鏂瑰悜 B
-.\f5_session.ps1 -Auth -LaptopIp <瀵圭> -LaptopUser <鐢ㄦ埛>  # 鍚屼竴鏉￠摼璺紝鏂瑰悜 B 甯?DH-HMAC-CHAP
-.\f5_session.ps1 -Down                                      # 鎷嗘ˉ + 鍥炶楠岃瘉
+.\f5_session.ps1 -LaptopIp <对端> -LaptopUser <用户>        # 链路 → 对端 → 方向 A → discovery → 方向 B
+.\f5_session.ps1 -Auth -LaptopIp <对端> -LaptopUser <用户>  # 同一条链路，方向 B 带 DH-HMAC-CHAP
+.\f5_session.ps1 -Down                                      # 拆桥 + 回读验证
 ```
 
-鍘熷杈撳嚭钀藉湪 `src/f5_session_<鏃堕棿鎴?.txt`銆傛妸鎵嬪伐姝ラ鍥哄寲鎴愯剼鏈殑杩囩▼閲?**鍙堟姄鍑?4 涓己闄?*锛堟柟鍚?A 婕忎紶鏈湴 IP銆佹帰娴嬪绔湴鍧€鐨勬椂鏈哄弽浜嗐€?杩滅▼鍛戒护涓茬┛杩?PowerShell鈫抯sh鈫抌ash 浼氫涪寮曞彿銆佹柟鍚?B 鑴氭湰鑷繁鐨勪笁涓潙锛夛紝
-瑙?DESIGN 搂8.47 鈥斺€?鍏朵腑"寮曞彿浼氫涪"閭ｄ竴鏉℃浘鍦ㄥ簭鍒椾腑闂村穿鎺夊苟鍦ㄥ绔暀涓嬫椿鎺у埗鍣ㄣ€?
-**澶?I/O 闃熷垪锛埪?.49锛?*锛歵arget 鐪熺殑鎷ユ湁 8 涓?queue pair锛堟瘡鏉￠槦鍒楃嫭绔?capsule ring 涓?in-flight 琛級锛宨nitiator 鎸夊绔巿浜堟暟寤洪槦鍒椼€傚绔瘉鎹細鏂瑰悜 A 鏄?4/4 鏉￠槦鍒楀悇鑷缓杩炲苟
-鍚屾椂鍚勮窇涓€鏉″懡浠わ紱鏂瑰悜 B 鏄?Linux 涓绘満寤?8 鏉°€佸懡浠ゅ垎鏁ｅ湪 6 鏉′笂銆傝嚜妫€ F5 榛樿灏辩敤 4 鏉￠槦鍒椼€?
-**discovery锛埪?.50锛?*锛歚nvme discover` 鑳藉垪鍑烘垜浠紙瀵圭瀹炴祴 `DISC: the discovery log names
-nqn.2024-01.local.rdma:windows-nd`锛屾湰鏈?target `discLogReads=3`銆乣controllers=2`锛夛紝
-鎴戜滑鑷繁鐨?host 涔熻兘鐢?`-discover` 璇?Linux nvmet 鐨勫彂鐜版棩蹇椼€俤iscovery 涓?I/O 鏄?*涓や釜
-鎺у埗鍣?*锛屾墍浠?target 鐢?`-serve N` 杩炵画鏈嶅姟锛堥粯璁?1锛屼繚鎸?F7 鐨?涓绘満娑堝け鍗抽€€鍑?鏂█锛夈€?
-**DH-HMAC-CHAP锛埪?.51锛?*锛歚-authkey <DHHC-1:..>` 璁?target 瑕佹眰璁よ瘉锛圕onnect 缁撴灉缃?ATR bit 17锛夛紝
-璁よ瘉涔嬪墠闄?fabrics 涔嬪鐨勫懡浠や竴寰嬪洖 `0x4191`锛沨ost 渚х湅鍒?ATR 灏辫嚜鍔ㄥ畬鎴?Negotiate鈫扖hallenge鈫扲eply鈫扴uccess1锛堟湁鎺у埗鍣ㄥ瘑閽ユ椂鍐嶅姞 Success2锛夈€?瀵嗙爜瀛︽槸鑷爺鐨?Montgomery 妯″箓鈥斺€擶indows 鐨?CNG **瀹炴祴**鎷掔粷鑷畾涔?DH 缇?锛坄STATUS_NOT_SUPPORTED`锛夛紝涔熸嫆缁濆鍏ヤ笉鍖归厤鐨勭閽ワ紙`STATUS_INVALID_PARAMETER`锛夛紝
-鑰?ffdhe 缇ゅ弬鏁版槸浠?RFC 7919 鍘熸枃鎶撳彇骞堕€愭潯楠岃瘉鐨勩€俙.\f5_interop.exe -genkey` 鐢熸垚瀵嗛挜锛?`.\run_f5_auth.ps1` 璺戝叚涓敤渚嬶紙鍚?閿欏瘑閽ュ繀椤昏鎷?鍜?鏃犺 ATR 蹇呴』琚?gate 鎷?锛夈€?
-**涓€涓湡鑳界敤鐨勫嵎锛埪?.53锛?*锛歚-nsfile F:\x.img` 鎶?namespace 鍙樻垚閭ｄ釜鏂囦欢锛堝嚑浣?= 鏂囦欢澶у皬锛?FLUSH 鎵嶅洖鍐欙級锛屼簬鏄竴鍙?Linux 涓绘満鍐欒繘鏉ョ殑瀛楄妭鍙互鐩存帴鍦?Windows 渚х湅鍒帮細
-```powershell
-# Windows锛歵arget 鐢ㄦ枃浠跺綋 namespace锛?serve 0 = 涓嶉檺鎺у埗鍣ㄦ暟锛?.\f5_interop.exe -target 192.168.100.2 4420 -serve 0 -nsfile F:\nvmeof-ns.img
-# 瀵圭锛堟ˉ鎺ョ獥鍙ｉ噷锛夛細
-~/f5_dirb_demo.sh 192.168.100.2 4420 nqn.2024-01.local.rdma:windows-nd
-# 鐒跺悗鍦?Windows 涓婄洿鎺ヨ閭ｄ釜鏂囦欢锛氬亸绉?4096 澶勬槸涓绘満鍐欒繘鏉ョ殑鏂囨湰锛?# LBA 3000 / 3100 澶勬槸 write-zeroes 涓?dsm deallocate 娓呭嚭鏉ョ殑闆躲€?```
+原始输出落在 `src/f5_session_<时间戳>.txt`。把手工步骤固化成脚本的过程里
+**又抓出 4 个缺陷**（方向 A 漏传本地 IP、探测对端地址的时机反了、
+远程命令串穿过 PowerShell→ssh→bash 会丢引号、方向 B 脚本自己的三个坑），
+见 DESIGN §8.47 —— 其中"引号会丢"那一条曾在序列中间崩掉并在对端留下活控制器。
 
-鍚屼竴杞噷 `linux/f5_nvmet_ref*.sh` 鎶?nvmet 褰撹鏍硷紝閫愯閲忓嚭鍙傝€冪瓟妗堬紙鏃ュ織椤?LID 绛栫暐銆?甯︽暟鎹紦鍐茬殑 Get Features 涓€寰?`SGL_INVALID_DATA`銆丼et VWC 蹇呴』鎷掋€丏SM 鐨?AD 浣嶅湪 CDW11锛夛紝
-骞舵嵁姝や慨鎺変簡涓変釜"鎴戜滑涓ょ鑷祴姘歌繙涓€鑷?鐨勫樊寮?鈥斺€?鍏朵腑鍖呮嫭涓€鏉?*浼氭妸鎺у埗鍣ㄦ寕姝?*鐨勶細
-`nvme persistent-event-log` 瑙﹀彂鐨?0 瀛楄妭 RDMA Write 姘镐笉瀹屾垚锛屾妸 admin 闃熷垪鍋滄锛?涓绘満 7.6 绉掑悗 Keep Alive 瓒呮椂骞舵媶閾俱€?
-浜掓搷浣滅殑鎿嶄綔姝ラ銆侀摼璺剼鏈笌鍥炴粴瑙?`INTEROP_F5.md`锛涚粨璁轰笌缂洪櫡娓呭崟瑙?DESIGN 搂8.46銆伮?.47銆伮?.49銆伮?.50銆伮?.51銆伮?.53銆伮?.54銆?
-**Windows 涓婄殑 NVMe-oF 鐩樼锛埪?.54锛?*锛歚mount_nvmeof.ps1` 璁╂垜浠嚜宸辩殑 initiator 鎵紨
-Windows 缂哄け鐨勯偅涓鑹诧紙瀹㈡埛绔?SKU 娌℃湁鍐呯疆 NVMe-oF initiator锛夛細
+**多 I/O 队列（§8.49）**：target 真的拥有 8 个 queue pair（每条队列独立 capsule ring 与
+in-flight 表），initiator 按对端授予数建队列。对端证据：方向 A 是 4/4 条队列各自建连并
+同时各跑一条命令；方向 B 是 Linux 主机建 8 条、命令分散在 6 条上。自检 F5 默认就用 4 条队列。
+
+**discovery（§8.50）**：`nvme discover` 能列出我们（对端实测 `DISC: the discovery log names
+nqn.2024-01.local.rdma:windows-nd`，本机 target `discLogReads=3`、`controllers=2`），
+我们自己的 host 也能用 `-discover` 读 Linux nvmet 的发现日志。discovery 与 I/O 是**两个
+控制器**，所以 target 用 `-serve N` 连续服务（默认 1，保持 F7 的"主机消失即退出"断言）。
+
+**DH-HMAC-CHAP（§8.51）**：`-authkey <DHHC-1:..>` 让 target 要求认证（Connect 结果置 ATR bit 17），
+认证之前除 fabrics 之外的命令一律回 `0x4191`；host 侧看到 ATR 就自动完成
+Negotiate→Challenge→Reply→Success1（有控制器密钥时再加 Success2）。
+密码学是自研的 Montgomery 模幂——Windows 的 CNG **实测**拒绝自定义 DH 群
+（`STATUS_NOT_SUPPORTED`），也拒绝导入不匹配的私钥（`STATUS_INVALID_PARAMETER`），
+而 ffdhe 群参数是从 RFC 7919 原文抓取并逐条验证的。`.\f5_interop.exe -genkey` 生成密钥，
+`.\run_f5_auth.ps1` 跑六个用例（含"错密钥必须被拒"和"无视 ATR 必须被 gate 拒"）。
+
+**一个真能用的卷（§8.53）**：`-nsfile F:\x.img` 把 namespace 变成那个文件（几何 = 文件大小，
+FLUSH 才回写），于是一台 Linux 主机写进来的字节可以直接在 Windows 侧看到：
 ```powershell
-# 浠?Linux nvmet 鍙栧洖 64 MiB 鍛藉悕绌洪棿 -> 鍖呮垚 fixed VHD -> 鎸傛垚 X:
+# Windows：target 用文件当 namespace（-serve 0 = 不限控制器数）
+.\f5_interop.exe -target 192.168.100.2 4420 -serve 0 -nsfile F:\nvmeof-ns.img
+# 对端（桥接窗口里）：
+~/f5_dirb_demo.sh 192.168.100.2 4420 nqn.2024-01.local.rdma:windows-nd
+# 然后在 Windows 上直接读那个文件：偏移 4096 处是主机写进来的文本，
+# LBA 3000 / 3100 处是 write-zeroes 与 dsm deallocate 清出来的零。
+```
+
+同一轮里 `linux/f5_nvmet_ref*.sh` 把 nvmet 当规格，逐行量出参考答案（日志页 LID 策略、
+带数据缓冲的 Get Features 一律 `SGL_INVALID_DATA`、Set VWC 必须拒、DSM 的 AD 位在 CDW11），
+并据此修掉了三个"我们两端自测永远一致"的差异 —— 其中包括一条**会把控制器挂死**的：
+`nvme persistent-event-log` 触发的 0 字节 RDMA Write 永不完成，把 admin 队列停死，
+主机 7.6 秒后 Keep Alive 超时并拆链。
+
+互操作的操作步骤、链路脚本与回滚见 `INTEROP_F5.md`；结论与缺陷清单见 DESIGN §8.46、§8.47、§8.49、§8.50、§8.51、§8.53、§8.54。
+
+**Windows 上的 NVMe-oF 盘符（§8.54）**：`mount_nvmeof.ps1` 让我们自己的 initiator 扮演
+Windows 缺失的那个角色（客户端 SKU 没有内置 NVMe-oF initiator）：
+```powershell
+# 从 Linux nvmet 取回 64 MiB 命名空间 -> 包成 fixed VHD -> 挂成 X:
 .\mount_nvmeof.ps1
-# 涓嶆兂瑕?Linux 鏃讹紝鐢ㄦ垜浠嚜宸辩殑 target 褰撴簮锛?.\f5_interop.exe -target 192.168.100.2 4420 -serve 0 -nsfile F:\nvmeof\target-ns.img
+# 不想要 Linux 时，用我们自己的 target 当源：
+.\f5_interop.exe -target 192.168.100.2 4420 -serve 0 -nsfile F:\nvmeof\target-ns.img
 .\mount_nvmeof.ps1 -TargetIp 192.168.100.2 -Subnqn nqn.2024-01.local.rdma:windows-nd
-# 鍦?X: 閲屽啓鏂囦欢锛岀劧鍚庡洖鎺紙bytes 璧?NVMe-oF/RDMA 鍥炲埌瀵圭鍛藉悕绌洪棿骞?FLUSH锛夛細
+# 在 X: 里写文件，然后回推（bytes 走 NVMe-oF/RDMA 回到对端命名空间并 FLUSH）：
 .\mount_nvmeof.ps1 -Unmount
 ```
 
-瀹冩槸**鐪熺殑 Windows 鍗?*锛圢TFS銆佽祫婧愮鐞嗗櫒鍙銆佸彲璇诲啓锛夛紝浣?*涓嶆槸娲诲姩鍧楄澶?*锛?鍐欏叆瑕佺瓑 `-Unmount` 鎵嶅洖鎺ㄣ€傚疄娴嬩竴鏁村湀瀵瑰緱涓?鈥斺€?Linux 璇诲洖 64 MiB 鐨?sha256 涓庢湰鏈洪暅鍍?閫愬瓧鑺傜浉鍚岋紝閲嶆柊鎸傝浇鍚庢枃浠朵粛鍦ㄣ€? MiB 闅忔満鏂囦欢鏍￠獙鍜屼笉鍙樸€?
-**閭ｇ"涓嶆槸娲诲姩鍧楄澶?鐨勯仐鎲撅紝鍦?搂8.55 琚幓鎺変簡**锛氬簳涓嬭繖涓€鏉¤矾缁欏嚭鐨勬槸**鐪熺殑娲诲姩纾佺洏**銆?
-**鐢ㄦ埛鎬?iSCSI 妗ワ紙搂8.55锛夛細璁?Windows 鑷甫鐨?initiator 鎶婅繙绔洏褰撹嚜宸辩殑鐩樼敤**
+它是**真的 Windows 卷**（NTFS、资源管理器可见、可读写），但**不是活动块设备**：
+写入要等 `-Unmount` 才回推。实测一整圈对得上 —— Linux 读回 64 MiB 的 sha256 与本机镜像
+逐字节相同，重新挂载后文件仍在、2 MiB 随机文件校验和不变。
 
-鍐呮牳椹卞姩閭ｄ竴灞傛垜浠笉鍋氾紙瀹㈡埛绔?SKU 娌℃湁 NVMe-oF initiator锛岀敤鎴锋€佷篃娌℃硶鎶婅嚜宸卞杩涘嵎鏍堬級锛?鎵€浠ュ弽杩囨潵鍋氾細鎴戜滑鑷繁瀹炵幇 iSCSI 鐨?*瀵圭**锛學indows 鐢ㄥ畠鍐呮牳閲岀幇鎴愮殑 initiator 杩炰笂鏉ャ€?`src/nvmeof_iscsi.h` 鏄偅涓?target锛屽悗绔洿鎺ヨ皟鍚屼竴杩涚▼銆佸悓涓€鏉￠槦鍒楀涓婄殑 NVMe-oF initiator
-鈥斺€旀病鏈夌浜屼釜杩炴帴銆佹病鏈?IPC銆?
+**那种"不是活动块设备"的遗憾，在 §8.55 被去掉了**：底下这一条路给出的是**真的活动磁盘**。
+
+**用户态 iSCSI 桥（§8.55）：让 Windows 自带的 initiator 把远端盘当自己的盘用**
+
+内核驱动那一层我们不做（客户端 SKU 没有 NVMe-oF initiator，用户态也没法把自己塞进卷栈），
+所以反过来做：我们自己实现 iSCSI 的**对端**，Windows 用它内核里现成的 initiator 连上来。
+`src/nvmeof_iscsi.h` 是那个 target，后端直接调同一进程、同一条队列对上的 NVMe-oF initiator
+——没有第二个连接、没有 IPC。
+
 ```powershell
-# 鎴戜滑鐨?NVMe-oF initiator 鎺ュ埌 Linux nvmet锛屽悓鏃舵妸缁撴灉鐢?iSCSI 鏆撮湶缁?Windows
+# 我们的 NVMe-oF initiator 接到 Linux nvmet，同时把结果用 iSCSI 暴露给 Windows
 .\f5_interop.exe -initiator 192.168.100.5 4420 192.168.100.2 `
                  -subnqn nqn.2024-01.local.rdma:linux-nvmet -iscsi 3260
-# Windows 鑷甫鐨?initiator 鐧诲綍锛堜笉闇€瑕佷换浣曞唴鏍搁┍鍔級
+# Windows 自带的 initiator 登录（不需要任何内核驱动）
 iscsicli AddTargetPortal 127.0.0.1 3260
 Connect-IscsiTarget -NodeAddress iqn.2024-01.com.nvmeof:bridge0 -IsPersistent $false
 Get-Disk | Where-Object BusType -eq 'iSCSI'      # -> NVMEOF iSCSI-NVMeoF, Online, GPT
 ```
 
-浠?鐧诲綍灏卞崱姝?鍒?鐩樺嚭鐜?涔嬮棿涓€鍏变慨浜?**7 涓?bug**锛屾牴鍥犳槸**鏀跺埌鐨?PDU 娌℃湁璺宠繃 data segment
-鐨?4 瀛楄妭瀵归綈濉厖**锛圧FC 7143 搂11.7 鐨?DataSegmentLength 涓嶅惈濉厖锛夛細discovery 鐨?login 鏂囨湰
-姝ｅソ 88 瀛楄妭锛? 鐨勫€嶆暟锛屾棤濉厖锛夛紝**鏅€氫細璇濇槸 127 瀛楄妭**锛屾紡鎺夐偅 1 瀛楄妭涔嬪悗姣忎釜 PDU 閮介敊浣嶏紝
-initiator 绗簩涓?Login Request 鐨?opcode 钀借繘浜嗘垜浠殑 flags 瀛楁锛岃璇绘垚 NOP-Out锛?浜庢槸 Windows 涓€鐩寸瓑涓€涓笉浼氭潵鐨?Login Response銆傚叾浣欏叚涓紙鍗曚細璇濅覆琛屻€丮axCmdSN 涓嶅墠杩涖€?鍙戦€佷晶鍚屾牱婕忓～鍏呫€佺煭浼犺緭鎶?residual 0銆佹垜鑷繁鏀瑰绾跨▼鏃舵妸宸叉敞鍐岀紦鍐叉崲鎴愮┖ vector銆?浠ュ強"鏃ュ織鍙鍙戦€佷笉璁版帴鏀?鐨勭洸鍖猴級閫愭潯璁板湪 DESIGN 搂8.55銆?
-**1 TB 鐪熺洏锛埪?.56锛夛細Linux 涓婇偅鍧?SSD锛屽彉鎴?Windows 鐨?`E:`**
+从"登录就卡死"到"盘出现"之间一共修了 **7 个 bug**，根因是**收到的 PDU 没有跳过 data segment
+的 4 字节对齐填充**（RFC 7143 §11.7 的 DataSegmentLength 不含填充）：discovery 的 login 文本
+正好 88 字节（4 的倍数，无填充），**普通会话是 127 字节**，漏掉那 1 字节之后每个 PDU 都错位，
+initiator 第二个 Login Request 的 opcode 落进了我们的 flags 字段，被读成 NOP-Out，
+于是 Windows 一直等一个不会来的 Login Response。其余六个（单会话串行、MaxCmdSN 不前进、
+发送侧同样漏填充、短传输报 residual 0、我自己改多线程时把已注册缓冲换成空 vector、
+以及"日志只记发送不记接收"的盲区）逐条记在 DESIGN §8.55。
+
+**1 TB 真盘（§8.56）：Linux 上那块 SSD，变成 Windows 的 `E:`**
 
 ```
 Get-Disk | ? BusType -eq iSCSI
 Number FriendlyName        PartitionStyle OperationalStatus SizeGB IsReadOnly
      3 NVMEOF iSCSI-NVMeoF GPT            Online            931.51       True
-鍒嗗尯锛?00 MB ESP + 16 MB MSR + 931.2 GB NTFS -> E:锛岄《灞?60 椤癸紝鏃堕棿鎴虫槸鐪熺殑
+分区：300 MB ESP + 16 MB MSR + 931.2 GB NTFS -> E:，顶层 60 项，时间戳是真的
 ```
 
-- **鍐呭鏄湡鐨勶紝涓ゆ瀛楄妭绾у鐓?*锛氱粡 `E:` 璇讳竴涓枃浠讹紙`fsutil file queryextents` 鎷?LCN锛?  鍔犲垎鍖哄亸绉荤畻鍑虹粷瀵?LBA 1073520锛変笌 Linux 渚ц８璇诲悓涓€ LBA锛宻ha256 閮芥槸
-  `dec615ae鈥?dd397`锛汦SP 寮曞鎵囧尯锛圠BA 40锛変袱渚т篃閮芥槸 `802b1462鈥2452293`銆?- **闆跺啓鍏ワ紝鐢辩洏鑷繁璇佹槑**锛歋MART `Data Units Written` 鎸傝浇鍓嶅悗**閮芥槸 32884752**锛?  鑰?`Data Units Read` 浠?144240893 娑ㄥ埌 144241018銆?47 鏉?CDB 閲屽彧鏈?*涓€娆?*鍐欏皾璇?  锛圵indows 鎯冲啓 NTFS 鑴忎綅锛孡BA 651264锛夛紝琚ˉ鎸夊彧璇绘嫆鎴?CHECK CONDITION銆?- 鍙鏄?*鏍忔潌**涓嶆槸榛樿鍊硷細`-iscsirw` 涓嶅紑銆丮ODE SENSE 鎶?WP銆乄RITE 鍦?SCSI 灞傛嫆缁?  鈥斺€?nvmet 娌℃湁鍙 namespace 灞炴€э紝鍙兘鍦ㄨ繖涓€渚т繚璇併€?- 鏈€鍚庝竴娈佃矾鏄摼璺細`src/interop_link.ps1 -Action Up` 鎶婁竴涓?CX3 鍙ｆˉ杩?LAN 娈碉紝
-  璁╁绔殑杞欢 RoCE 鑳?ARP 鍒帮紱鏀跺伐鐢?`-Action Down` + `-Action RestoreMtu` 鎶婄粦瀹氳繕缁欑郴缁熴€?
-鍏ㄩ儴瀹炴祴杈撳嚭锛堝惈鎷嗛櫎姝ラ涓庤俯鍒扮殑涓変釜鍧戯級瑙?`EVIDENCE-1TB.md`銆?
-## 纭欢鍓嶆彁
+- **内容是真的，两次字节级对照**：经 `E:` 读一个文件（`fsutil file queryextents` 拿 LCN，
+  加分区偏移算出绝对 LBA 1073520）与 Linux 侧裸读同一 LBA，sha256 都是
+  `dec615ae…5dd397`；ESP 引导扇区（LBA 40）两侧也都是 `802b1462…a2452293`。
+- **零写入，由盘自己证明**：SMART `Data Units Written` 挂载前后**都是 32884752**，
+  而 `Data Units Read` 从 144240893 涨到 144241018。747 条 CDB 里只有**一次**写尝试
+  （Windows 想写 NTFS 脏位，LBA 651264），被桥按只读拒成 CHECK CONDITION。
+- 只读是**栏杆**不是默认值：`-iscsirw` 不开、MODE SENSE 报 WP、WRITE 在 SCSI 层拒绝
+  —— nvmet 没有只读 namespace 属性，只能在这一侧保证。
+- 最后一段路是链路：`src/interop_link.ps1 -Action Up` 把一个 CX3 口桥进 LAN 段，
+  让对端的软件 RoCE 能 ARP 到；收工用 `-Action Down` + `-Action RestoreMtu` 把绑定还给系统。
 
-- 涓€鍙?Windows 鏈哄櫒 + 涓€鍧楁敮鎸?RoCE 鐨勭綉鍗★紙鏈伐绋嬪疄娴嬶細ConnectX-3 Pro锛?  HP 544+FLR-QSFP锛屽浐浠?2.40.5000锛學inOF 鐨?ND 鎻愪緵鑰咃級銆?- 鑷祴鍙涓€鍧楀弻鍙ｅ崱鎶婁袱鍙ｇ洿杩炲嵆鍙€?- 浜掓搷浣滈渶瑕佷竴涓?*鏈湴** Linux 瀵圭锛堟櫘閫氭満鍣?+ 杞欢 RoCE `rxe` 灏卞锛?  浜戞湇鍔″櫒涓嶈鈥斺€擱oCE 涓嶈繃璺敱锛岃 `INTEROP_F5.md`锛夈€?
-## 璁稿彲
+全部实测输出（含拆除步骤与踩到的三个坑）见 `EVIDENCE-1TB.md`。
 
-**GNU Affero General Public License v3.0 鎴栨洿鏂扮増鏈?*锛坄LICENSE`锛夆€斺€?閫愬瓧瀹樻柟鍘熸枃锛?34,523 瀛楄妭锛宻ha256 `8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef`銆?
+## 硬件前提
+
+- 一台 Windows 机器 + 一块支持 RoCE 的网卡（本工程实测：ConnectX-3 Pro，
+  HP 544+FLR-QSFP，固件 2.40.5000，WinOF 的 ND 提供者）。
+- 自测只要一块双口卡把两口直连即可。
+- 互操作需要一个**本地** Linux 对端（普通机器 + 软件 RoCE `rxe` 就够；
+  云服务器不行——RoCE 不过路由，见 `INTEROP_F5.md`）。
+
+## 许可
+
+**GNU Affero General Public License v3.0 或更新版本**（`LICENSE`）—— 逐字官方原文，
+34,523 字节，sha256 `8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef`。
+
 ```
 Copyright (C) 2026 Dingtaiqi
 
@@ -175,9 +249,19 @@ the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 ```
 
-**AGPL 鍏佽鍟嗕笟浣跨敤**锛屽畠绠＄殑鏄?闂簮"锛?
-- 鍏徃鍐呴儴浣跨敤銆佹嬁瀹冭禋閽便€佸仛鎴愭湇鍔?鈥斺€?**閮藉彲浠ワ紝鍏嶈垂**銆?- 浠ｄ环鏄洖棣堬細鍒嗗彂鏈伐绋嬫垨娲剧敓浣滃搧锛?*鍖呮嫭閫氳繃缃戠粶鎻愪緵鏈嶅姟**锛夋椂蹇呴』缁欏嚭瀹屾暣瀵瑰簲婧愮爜銆?  绗?13 鏉★紙`LICENSE` L540锛夊氨鏄笓闂ㄧ缃戠粶鏈嶅姟鐨勯偅涓€鏉★紝涔熸槸 AGPL 涓?GPL 鐨勫敮涓€瀹炶川鍖哄埆
-  鈥斺€?瀵逛粯"鎷垮紑婧愪唬鐮佸仛闂簮浜戞湇鍔?闈犵殑灏辨槸瀹冦€?- 纭疄闇€瑕侀棴婧愶紙宓岃繘闂簮浜у搧銆佸仛闂簮 SaaS锛夌殑鍏徃锛屽彲浠ヨ蛋 `COMMERCIAL.md` 鐨勫晢涓氭巿鏉冿紙鍙屾巿鏉冿級銆?
-涓や釜鍏煎鎬у潙锛?
-1. `ref/` 涓嬩袱浠?Linux 鍐呮牳澶达紙`linux_nvme.h`銆乣linux_nvme_rdma.h`锛夋槸 **GPL-2.0**锛?   **鍙綔瀵圭収闃呰銆佷笉鍙備笌缂栬瘧**銆?*GPL-2.0-only 涓?AGPL-3.0 涓嶅吋瀹?*锛?   涓嶈鎶婂畠浠殑浠ｇ爜骞惰繘鏈伐绋嬶紱瀹炲湪瑕佸苟锛屾湰宸ョ▼寰楁暣浣撴敼鎴?GPL-2.0銆?2. 閾炬帴鍘傚晢鐨?NetworkDirect 搴擄紙`ndutil`/NDSPI锛夋病鏈夊奖鍝嶁€斺€斿畠浠笉鏄?copyleft 璁稿彲銆?
+**AGPL 允许商业使用**，它管的是"闭源"：
+
+- 公司内部使用、拿它赚钱、做成服务 —— **都可以，免费**。
+- 代价是回馈：分发本工程或派生作品（**包括通过网络提供服务**）时必须给出完整对应源码。
+  第 13 条（`LICENSE` L540）就是专门管网络服务的那一条，也是 AGPL 与 GPL 的唯一实质区别
+  —— 对付"拿开源代码做闭源云服务"靠的就是它。
+- 确实需要闭源（嵌进闭源产品、做闭源 SaaS）的公司，可以走 `COMMERCIAL.md` 的商业授权（双授权）。
+
+两个兼容性坑：
+
+1. `ref/` 下两份 Linux 内核头（`linux_nvme.h`、`linux_nvme_rdma.h`）是 **GPL-2.0**，
+   **只作对照阅读、不参与编译**。**GPL-2.0-only 与 AGPL-3.0 不兼容**，
+   不要把它们的代码并进本工程；实在要并，本工程得整体改成 GPL-2.0。
+2. 链接厂商的 NetworkDirect 库（`ndutil`/NDSPI）没有影响——它们不是 copyleft 许可。
+
 
