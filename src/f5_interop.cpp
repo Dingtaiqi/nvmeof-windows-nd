@@ -726,11 +726,11 @@ static int surveyDisk(Queue& q, Device& dev, uint32_t nsid, uint64_t nsze,
 // ===========================================================================
 class NvmeIscsiBackend : public IscsiBackend {
 public:
-    NvmeIscsiBackend(Queue& q_, Device& d_, uint32_t nsid_, uint64_t nsze_, uint32_t bs_,
-                     uint8_t* cap_, uint16_t* cid_, Completion* c_, uint8_t* buf_,
-                     bool rw_, int katoMs_)
-        : q(q_), d(d_), nsid(nsid_), nsze(nsze_), bs(bs_), cap(cap_), cid(cid_), c(c_),
-          buf(buf_), rw(rw_), katoMs(katoMs_), lastKa(GetTickCount64()) {
+    NvmeIscsiBackend(Queue& q_, Queue& adm_, Device& d_, uint32_t nsid_, uint64_t nsze_,
+                     uint32_t bs_, uint8_t* cap_, uint16_t* cid_, Completion* c_,
+                     uint8_t* buf_, bool rw_, int katoMs_)
+        : q(q_), adm(adm_), d(d_), nsid(nsid_), nsze(nsze_), bs(bs_), cap(cap_), cid(cid_),
+          c(c_), buf(buf_), rw(rw_), katoMs(katoMs_), lastKa(GetTickCount64()) {
         snprintf(ser, sizeof(ser), "%s", g_foreignSerial);
         for (char* p = ser; *p; p++) if (*p == ' ') *p = '_';
     }
@@ -760,6 +760,16 @@ public:
     // disconnects a controller that goes quiet for KATO, and an iSCSI session can
     // easily outlive it - the first long copy through this bridge would otherwise
     // die in the middle with no hint as to why.
+    //
+    // ON THE ADMIN QUEUE.  Keep Alive is an admin command (opcode 0x18, QID 0), and
+    // this used to put it on the I/O queue pair - where a target is entitled to do
+    // exactly nothing with it.  Measured against our own backend: the I/O path logged
+    // "UNHANDLED opcode=0x18 - a real host sent this", never posted a completion, and
+    // the bridge reported a failed keep-alive 60 s into every session (katoMs/2).  The
+    // session survived only because nothing here enforces KATO; nvmet does, so against
+    // a real Linux target this was a controller teardown waiting for the first long
+    // copy.  Note the asymmetry with flush(): NVMe FLUSH is an NVM command and does
+    // belong on the I/O queue.
     void tick() override {
         if (katoMs <= 0) return;
         ULONGLONG now = GetTickCount64();
@@ -767,7 +777,7 @@ public:
         lastKa = now;
         fabricHeader(cap, NVMEOF_OPC_KEEP_ALIVE, ++(*cid), 0);
         nvmeof_sgl_set_null((nvmeof_sgl*)(cap + 24));
-        bool ok = submitCommand(q, d, cap, c, kWaitMs) && statusOk(c->status);
+        bool ok = submitCommand(adm, d, cap, c, kWaitMs) && statusOk(c->status);
         if (!ok) printf("  [iscsi] keep-alive to the NVMe target failed\n");
     }
 
@@ -801,7 +811,9 @@ private:
         if (opcode == NVMEOF_OPC_READ && p && p != stage) memcpy(p, stage, bytes);
         return true;
     }
-    Queue& q; Device& d;
+    Queue& q;
+    Queue& adm;                     // keep-alives only: 0x18 is an admin command
+    Device& d;
     uint32_t nsid; uint64_t nsze; uint32_t bs;
     uint8_t* cap; uint16_t* cid; Completion* c;
     uint8_t* buf;
@@ -1705,7 +1717,7 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
             dev.close(nullptr, nullptr, 0);
             return 1;
         }
-        NvmeIscsiBackend backend(io[0], dev, nsid, nsze, 1u << lbads, cap, &cid, &c,
+        NvmeIscsiBackend backend(io[0], admin, dev, nsid, nsze, 1u << lbads, cap, &cid, &c,
                                  dev.region(kIscsiOff), g_iscsiReadWrite,
                                  NVMEOF_KATO_DEFAULT);
         std::vector<uint8_t> scratch(kIscsiBytes);

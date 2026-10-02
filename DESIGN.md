@@ -3894,6 +3894,103 @@ NetworkDirect SDK，于是"每次 push 都该检查的东西"只能在已经装�
 实测：对端不开 → 桥连续三次失败重试仍存活；随后起对端 → **无需重启**即连上（`[PASS] admin
 RDMA-CM connection` + `full feature phase`）。
 
+### 8.64 ✅ 大块写通了：把"等 Data-Out"从阻塞循环改成状态机（4 MiB 首写三条独立证据逐字节一致）
+
+#### (1) 上一节留下的缺陷
+
+8.63 修好协商之后，写仍然必须"从小到大爬坡"：4 MiB 写**作为会话的第一次写**时，Data-Out
+一个都不来（`Data-Out: 0`），随后会话被 Windows 关掉；先写 64 KiB 再写 4 MiB 就正常。
+这个形状本身指向**状态**，而不是指向字节。
+
+#### (2) 为什么旧形状一定失败
+
+旧的 WRITE 分支在 `handleScsi()` 里**阻塞**：发 R2T，然后 `readPdu()` 循环直到凑满这一串。
+它只有一种输入能活下来——initiator 立刻、按序、只发我们正在等的那种 PDU。而
+
+- 命令窗口 > 1 时，Windows 会把下一条命令（含它的 immediate data）夹在中间；
+- 一旦它发的是别的东西，这个循环要么把命令当 Data-Out 吃掉，要么直接判错关会话——
+  **它没有"看一眼 Windows 到底发了什么"的能力**，因为它在等一个特定的 PDU；
+- 而且这件事做在 `handleScsi()` 里，等待期间整条会话线程都停在那儿。
+
+#### (3) 换成状态机：WRITE 不再是循环，而是一条挂起的命令
+
+`struct PendingWrite`（itt / lba / 总字节 / 已收字节 / 本次 R2T 区间 / 一个 burst 的缓冲）放进
+`pending_`，`session()` 的 `case ISCSI_OP_DATA_OUT` 按 **ITT** 找到它、填进去：
+
+- 收满一个 burst → 立刻写后端（只占一个 MaxBurstLength 的缓冲，不是整条命令）；
+- 还没收完 → 从 `sendNextR2T()` 再发一个 R2T 后**返回**，会话循环继续收 PDU；
+- 收满了 → `sendScsiRsp(GOOD, residual 0)`，并把 `curEdtl` 置 0：`sendScsiRsp` 的自动 underflow
+  基于"最新一条命令"，而这条响应属于更早的命令，不关掉就会拿别人的 EDTL 算残差。
+
+命令窗口同时从 1 改回 **8**：窗口为 1 是当年为这个阻塞循环打的补丁（8.60），循环没了，补丁就该撤。
+
+#### (4) 实测（三条独立证据，全部逐字节）
+
+| 规模 | 结果 | initiator 读回 SHA-256 | namespace 文件 SHA-256 |
+|---|---|---|---|
+| 4 MiB @ 0（**会话第一次写**） | PASS | `d842fcb1…0a85` | `d842fcb1…0a85` |
+| 8 MiB @ 8 MiB | PASS | `17fef77c…18e7` | 同 |
+| 64 KiB / 128 KiB / 1 MiB / 4 MiB（同一会话爬坡） | PASS | 四组一致 | 同 |
+| 1 MiB + 512 B（非整 burst 尾块）@ 32 MiB | PASS | `0c7b283c…4c76` | 同 |
+
+三条证据是：① Windows initiator 自己读回；② 后端 namespace 文件（先经 SYNCHRONIZE CACHE →
+NVMe FLUSH 落盘）；③ 目标端 `-iscsitrace` 的 PDU 轨迹。只有 ① 会骗人，所以三条都要。
+
+线形（`-iscsitrace` 实测，每条 256 KiB 写命令）：
+
+    <- SCSI CDB 2A ... edtl=262144
+       immediate data: 65536 byte(s) in the command PDU, R2T will start at offset 65536
+    -> R2T itt=0x19 ttt=1 sn=0 offset=65536 len=196608
+    <- Data-Out itt=0x19 DataSN=0 off=65536  len=65536
+    <- Data-Out itt=0x19 DataSN=1 off=131072 len=65536
+    <- Data-Out itt=0x19 DataSN=2 off=196608 len=65536 F
+    -> itt 0x00000019 status 0x00 residual 0
+
+16 条命令（itt 0x19…0x28）以窗口 8 流水进来，每条：即时数据 65536、一个 R2T、三个 Data-Out，
+与参考实现（tgt）的形状一致；DataSN 在每个 R2T 内从 0 重新计数（RFC 7143 §4.2.2.4）。
+
+回归：`run_f5.ps1` **40 PASS / 0 FAIL**（19 s，本机双端点）。
+
+#### (5) 顺带抓到的两件事（都不在写路径上，但都会骗人）
+
+**(a) `FlushFileBuffers` 到不了线上。** 测试脚本第一版写完 4 MiB 后"读回逐字节一致"，而
+namespace 文件**一个字节都没变**。原因不是桥：Windows 对**裸磁盘句柄**的 `FlushFileBuffers`
+（以及 `Set-Disk -IsOffline`）都没有发出 SYNCHRONIZE CACHE——桥的日志里从头到尾只有一条
+`CDB 35`，还是写之前那条。现在脚本自己用 `IOCTL_SCSI_PASS_THROUGH_DIRECT` 发
+SYNCHRONIZE CACHE(10)，桥收到后调 NVMe FLUSH，后端落盘，日志里出现
+`[io] q1 FLUSH -> 98304 blocks written to D:\nvmeof\ns48.img`。教训：**"读回来对"不等于"落盘了"**，
+中间隔着一个我们没验证过的承诺。（顺带：`SCSI_PASS_THROUGH_DIRECT` 必须按存储栈的定义布局——
+自然对齐 + 16 字节 CDB，x64 上 `sizeof == 56`；写成 `Pack=1` 或 32 字节 CDB 时 Length 不对，
+`DeviceIoControl` 直接返回 1306。）
+
+**(b) 用 `-iscsitrace` 测性能会把自己测进去。** 同一条 4 MiB 首写：开 trace **4162 ms**，
+不开 **1583 ms**（2.6×）。§8.61 的性能数字用的是 `-iscsitime`（每条命令一行汇总），不是全量
+trace；但这条差距值得记下来，免得下次有人边开 trace 边看吞吐。
+
+`src/tools_iscsi_write.ps1` 把整套检查做成一条命令，例如
+`.\tools_iscsi_write.ps1 -Drive 3 -Offset 0 -Size 4MB`。
+
+### 8.65 ✅ Keep Alive 发在了 I/O 队列上（0x18 是 admin 命令）
+
+桥的 `tick()` 负责在 SCSI 命令之间喂对端的 KATO 计时器，动机写得很清楚（"Linux nvmet 会把
+KATO 内没消息的控制器断掉"），**但命令发错了队列**：Keep Alive 是 admin 命令（opcode 0x18，
+QID 0），它却发在 `io[0]` 上。
+
+证据来自我们自己的后端日志，不是推测：
+
+    [io]    UNHANDLED opcode=0x18 - a real host sent this     <- 后端 I/O 路径收到它
+    [iscsi] keep-alive to the NVMe target failed             <- 桥等 5 s 没有完成
+
+时序也对得上：`katoMs/2` = 60 s，会话建立后整 60 s 第一次失败，此前此后一次都没成功过。
+
+后果比"少一条日志"重：本机后端不校验 KATO，所以只留一条失败记录；而 **nvmet 校验**——一台真
+Linux target 会在 KATO 到期后拆掉控制器，而且是在第一次长时间拷贝的中间。修法是把 admin 队列
+也交给 `NvmeIscsiBackend`：Keep Alive 走 admin，FLUSH 仍走 I/O 队列（NVMe FLUSH 是 NVM 命令，
+这个不对称是故意的，注释里写明）。
+
+实测：后端日志 `[admin] Keep Alive #1/#2/#3 (kato=120000 ms)`，`UNHANDLED opcode=0x18` 计数 0，
+桥侧 keep-alive 失败 0 次。
+
 ## 7. 已知风险
 
 | 风险 | 说明 | 缓解 |

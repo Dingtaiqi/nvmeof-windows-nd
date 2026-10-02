@@ -504,16 +504,16 @@ public:
 
 private:
     // The command window this target advertises, i.e. how many commands the initiator
-    // may have in flight.  1, not 64, and that is a correctness fix rather than
-    // tuning: this bridge handles ONE command at a time (single session thread, one
-    // NVMe queue pair behind a mutex), and a window of 64 lets Windows send the next
-    // WRITE while the previous one is still waiting for its Data-Out - which it then
-    // refuses to interleave, deadlocking the exchange.  Measured: with 64, a 1 MiB
-    // write dropped the session after three pipelined commands; a target that really
-    // does handle concurrency (the tgt reference) advertises 128 and copes.  RFC 7143
-    // section 6.3.1 only forbids MaxCmdSN < ExpCmdSN - 1, so 1 is legal and it states
-    // this target's actual capability.
-    static const uint32_t kCmdWindow = 1;
+    // may have in flight.  8, and the history matters: it was 1 for a real reason
+    // (see the note on PendingWrite - a WRITE that did not fit in the command PDU
+    // used to BLOCK in a readPdu loop, so a pipelined second command arriving during
+    // that wait was eaten or aborted, and a window of 64 dropped the session on a
+    // 1 MiB write).  With the WRITE parked as state instead of blocking, a second
+    // command is dispatched normally, so the window can be reopened - and it has to
+    // be, because Windows will not send Data-Out for a 4 MiB first write while it is
+    // pinned at one command (DESIGN 8.63).  RFC 7143 section 6.3.1 only forbids
+    // MaxCmdSN < ExpCmdSN - 1.
+    static const uint32_t kCmdWindow = 8;
 
     SOCKET listenSock, conn;
     std::string targetIqn;
@@ -534,6 +534,42 @@ private:
     // Immediate data of the command in flight: the SCSI Command PDU's own data
     // segment (ImmediateData=Yes).  Per connection, like everything else here.
     std::vector<uint8_t> cmdData_;
+    // ------------------------------------------------------------------
+    //  A WRITE THAT DOES NOT FIT IN THE COMMAND PDU IS A STATE, NOT A LOOP.
+    //
+    //  This used to be a blocking loop inside handleScsi: send R2T, then readPdu()
+    //  until the burst is full, then send the next R2T.  That shape cannot survive
+    //  an initiator that answers an R2T with something other than the data - the
+    //  loop either mistakes the next command for Data-Out or dies - and it cannot
+    //  survive a command window greater than one.  Measured (DESIGN 8.63): a 4 MiB
+    //  WRITE as the session's FIRST write produced ZERO Data-Out PDUs and killed
+    //  the session, while the identical command succeeded after a ramp of smaller
+    //  writes in the same session.  A target that stops reading to wait for one
+    //  specific PDU can never find out what Windows actually sent instead.
+    //
+    //  So the command is parked here instead: the R2T goes out, handleScsi returns,
+    //  and the session loop keeps dispatching PDUs by ITT until the last byte of
+    //  the write has arrived.  `buf` holds ONE burst, not the whole command, so the
+    //  memory a pending write costs is bounded by MaxBurstLength.
+    // ------------------------------------------------------------------
+    struct PendingWrite {
+        uint32_t itt = 0, ttt = 0;
+        uint64_t lba = 0;
+        uint32_t bs = 512;
+        uint32_t bytes = 0;         // total the command asked for
+        uint32_t received = 0;      // absolute offset of the next expected byte
+        uint32_t wantOff = 0;       // absolute offset of the outstanding R2T
+        uint32_t want = 0;          // bytes the outstanding R2T asked for
+        uint32_t chunkOff = 0;      // where `buf` starts within the command
+        uint32_t r2tSn = 0;
+        std::vector<uint8_t> buf;
+    };
+    std::vector<PendingWrite> pending_;
+
+    PendingWrite* findPending(uint32_t itt) {
+        for (auto& pw : pending_) if (pw.itt == itt) return &pw;
+        return nullptr;
+    }
     // PDUs that arrived while a command was waiting for its Data-Out.  Windows keeps
     // its command window full and legally sends the next WRITE while this target is
     // still collecting the previous one's data.  Aborting on that - which is what this
@@ -909,6 +945,11 @@ private:
     // ---- the session ----
     bool session(IscsiBackend& be, std::vector<uint8_t>& scratch);
     bool handleScsi(IscsiBackend& be, const IscsiBhs& bhs, std::vector<uint8_t>& scratch);
+    // A WRITE with more data than the command PDU carried is parked in pending_
+    // and the R2T goes out from here; the data comes back through handleDataOut.
+    bool sendNextR2T(PendingWrite& pw);
+    bool handleDataOut(const IscsiBhs& d, const std::vector<uint8_t>& payload,
+                       IscsiBackend& be);
     bool sendInquiry(const IscsiBhs& bhs, IscsiBackend& be, IscsiBackend* be2);
 };
 
@@ -1245,9 +1286,14 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
         case ISCSI_OP_SNACK_REQ:
             break;                            // nothing to retransmit: we never lose PDUs
         case ISCSI_OP_DATA_OUT:
-            // Only legal in answer to an R2T, and handleScsi consumes those inline.
-            printf("  [iscsi] unexpected Data-Out outside an R2T\n");
-            if (!sendReject(bhs, 0x04)) return false;
+            // Data-Out is only legal in answer to an R2T, and every outstanding R2T
+            // belongs to a parked write in pending_.  Dispatched by ITT rather than
+            // by "the command currently in flight", because with a window of 8 the
+            // data arriving here can belong to any of several commands.
+            {
+                std::lock_guard<std::mutex> lock(backendMutex());
+                if (!handleDataOut(bhs, data, be)) return false;
+            }
             break;
         default:
             printf("  [iscsi] unsupported opcode 0x%02X -> reject\n", bhs.opcode());
@@ -1361,6 +1407,96 @@ inline bool IscsiTarget::sendInquiry(const IscsiBhs& bhs, IscsiBackend& be, Iscs
     if (!sendDataIn(bhs.itt(), out, send, 0, 0, true)) return false;
     return sendScsiRsp(bhs.itt(), SCSI_STATUS_GOOD, nullptr, 0,
                        n > send ? n - send : 0, n > send);
+}
+
+// ---------------------------------------------------------------------------
+//  Parked writes: the R2T side and the Data-Out side.
+//
+//  ONE R2T PER BURST, not per Data-In-sized chunk.  MaxBurstLength is 262144 and
+//  MaxRecvDataSegmentLength is 65536, so a burst is up to four Data-Out PDUs;
+//  asking for the whole burst at once is the shape the reference target produces
+//  (DESIGN 8.63), and RFC 7143 section 11.8.4 only bounds the length by
+//  MaxBurstLength.  Whether Windows cares is unknown - the per-chunk shape it
+//  replaced asked for 65536 at a time and worked up to one command - but the
+//  whole-burst form is the one the reference uses.
+// ---------------------------------------------------------------------------
+inline bool IscsiTarget::sendNextR2T(PendingWrite& pw) {
+    const uint32_t remaining = pw.bytes - pw.received;
+    uint32_t burstMax = g_iscsiMaxBurst;
+    if (burstMax < maxChunk) burstMax = maxChunk;
+    uint32_t chunk = (remaining < burstMax) ? remaining : burstMax;
+    if (pw.bs && (chunk % pw.bs)) chunk -= chunk % pw.bs;
+    if (chunk == 0) {
+        printf("  [iscsi] write stalled: %u of %u byte(s) received, no whole block left\n",
+               pw.received, pw.bytes);
+        return false;
+    }
+    pw.chunkOff = pw.received;
+    pw.wantOff  = pw.received;
+    pw.want     = chunk;
+    pw.buf.assign(chunk, 0);            // one burst, not the whole command
+    if (!sendR2T(pw.itt, pw.ttt, pw.r2tSn++, pw.wantOff, chunk)) return false;
+    if (g_iscsiTrace) {
+        printf("    [iscsi] R2T #%u itt 0x%08X ttt 0x%08X: offset %u len %u "
+               "(%u of %u byte(s) in hand)\n",
+               pw.r2tSn - 1, pw.itt, pw.ttt, pw.wantOff, chunk, pw.received, pw.bytes);
+    }
+    return true;
+}
+
+inline bool IscsiTarget::handleDataOut(const IscsiBhs& d, const std::vector<uint8_t>& payload,
+                                       IscsiBackend& be) {
+    PendingWrite* p = findPending(d.itt());
+    if (!p) {
+        // Not fatal by itself - but it means an R2T was answered twice or the ITT is
+        // wrong, so it is worth a line in the log rather than a silent drop.
+        printf("  [iscsi] Data-Out for itt 0x%08X has no outstanding R2T "
+               "(%u byte(s) at offset %u) -> reject\n",
+               d.itt(), (unsigned)payload.size(), d.bufferOff());
+        return sendReject(d, 0x04);
+    }
+    PendingWrite& pw = *p;
+    const uint32_t off = d.bufferOff();
+    const uint32_t len = (uint32_t)payload.size();
+    if (off < pw.wantOff || (uint64_t)off + len > (uint64_t)pw.wantOff + pw.want) {
+        printf("  [iscsi] Data-Out for itt 0x%08X is outside its R2T: offset %u len %u, "
+               "R2T covers %u..%u\n", d.itt(), off, len, pw.wantOff, pw.wantOff + pw.want);
+        return false;                   // the byte stream is out of step: nothing to salvage
+    }
+    if (g_iscsiTrace) {
+        printf("    [iscsi] Data-Out itt 0x%08X DataSN=%u off=%u len=%u%s\n",
+               d.itt(), d.dataSn(), off, len, d.fBit() ? " F" : "");
+    }
+    memcpy(pw.buf.data() + (off - pw.chunkOff), payload.data(), len);
+    pw.received = off + len;
+    bytesIn += len;
+    if (pw.received < pw.wantOff + pw.want) return true;     // more PDUs of this burst
+
+    // The burst is complete: hand exactly this chunk to the NVMe side and keep only
+    // what is still to come, so a 4 MiB write costs one MaxBurstLength buffer.
+    if (!be.write(pw.lba + pw.chunkOff / pw.bs, pw.want / pw.bs, pw.buf.data())) {
+        printf("  [iscsi] WRITE lba=%llu blocks=%u failed on the NVMe side\n",
+               (unsigned long long)(pw.lba + pw.chunkOff / pw.bs), pw.want / pw.bs);
+        const uint32_t itt = pw.itt;
+        pending_.erase(pending_.begin() + (p - pending_.data()));
+        uint8_t s[18];
+        const uint32_t sl = buildSense(s, 0x03 /*MEDIUM ERROR*/, 0x0C /*write error*/, 0);
+        curEdtl = 0;                    // this answer is not about the newest command
+        return sendScsiRsp(itt, SCSI_STATUS_CHECK_COND, s, sl, 0, false);
+    }
+    if (pw.received >= pw.bytes) {
+        const uint32_t itt = pw.itt;
+        const uint32_t total = pw.bytes;
+        pending_.erase(pending_.begin() + (p - pending_.data()));
+        // curEdtl/curDataOut describe the NEWEST command, so the automatic underflow
+        // in sendScsiRsp has to be switched off here - this response belongs to a
+        // command that arrived earlier.  For a write the bytes received ARE the bytes
+        // transferred, so the residual is zero by construction.
+        curEdtl = 0;
+        curDataOut = total;
+        return sendScsiRsp(itt, SCSI_STATUS_GOOD, nullptr, 0, 0, false);
+    }
+    return sendNextR2T(pw);
 }
 
 inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
@@ -1615,7 +1751,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
         // reference target's R2T starts at 8192 for exactly this reason, and asking
         // for offset 0 while Windows had already sent 8192 bytes is what made the
         // exchange stall (DESIGN 8.63).
-        uint32_t offset = 0, r2tSn = 0, burstPdus = 0;
+        uint32_t offset = 0, burstPdus = 0;
         if (!cmdData_.empty() && bytes > 0) {
             uint32_t imm = (uint32_t)cmdData_.size();
             if (imm > bytes) imm = (uint32_t)bytes;
@@ -1733,72 +1869,31 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
         // sendScsiRsp), and curDataOut only ever counted Data-In bytes - so a fully
         // written command answered "residual 131072", which the trace showed and
         // which is simply wrong: the initiator sent everything, nothing was left
-        // over.  For a write, the bytes RECEIVED are the bytes transferred.
-        curDataOut = (uint32_t)bytes;
+        // over.  For a write, the bytes RECEIVED are the bytes transferred.  It is
+        // set at COMPLETION now, in handleDataOut, and not here: a parked write has
+        // received nothing yet, and claiming otherwise leaves a stale value for the
+        // residual of whatever command answers next.
 
-        while (offset < bytes) {
-            // ONE R2T PER BURST, not per Data-In-sized chunk.  MaxBurstLength is
-            // 262144 and MaxRecvDataSegmentLength is 65536, so a burst is up to four
-            // Data-Out PDUs; asking for the whole burst at once is the shape the
-            // reference target produces, and the per-chunk shape it replaced asked
-            // for 65536 at a time.  Whether Windows cares is unknown - both are
-            // legal under RFC 7143 s11.8.4, which only bounds the length by
-            // MaxBurstLength - but the whole-burst form is the one to compare first.
-            uint32_t burstMax = g_iscsiMaxBurst;
-            if (burstMax < maxChunk) burstMax = maxChunk;
-            uint32_t chunk = (uint32_t)((bytes - offset) < burstMax ? (bytes - offset) : burstMax);
-            if (chunk % bs) chunk -= chunk % bs;
-            if (chunk == 0) break;
-            uint32_t ttt = nextTtt++;
-            if (!sendR2T(bhs.itt(), ttt, r2tSn++, offset, chunk)) return false;
-
-            // Collect exactly `chunk` bytes of Data-Out PDUs.  MaxOutstandingR2T=1,
-            // so nothing else may arrive in between; anything else IS the error.
-            uint32_t got = 0, expectSn = 0;
-            while (got < chunk) {
-                IscsiBhs d;
-                std::vector<uint8_t> payload;
-                if (!readPdu(d, payload)) return false;
-                if (d.opcode() != ISCSI_OP_DATA_OUT) {
-                    // NOT an error: the initiator may keep sending commands while this
-                    // target collects a burst's data (it keeps its command window
-                    // full).  Hold it and keep waiting.
-                    if (deferred_.size() < 32) {
-                        printf("  [iscsi] deferring opcode 0x%02X while waiting for Data-Out\n",
-                               d.opcode());
-                        deferred_.push_back(std::make_pair(d, payload));
-                        continue;
-                    }
-                    printf("  [iscsi] too many deferred PDUs (%u); aborting\n",
-                           (unsigned)deferred_.size());
-                    return false;
-                }
-                if (d.itt() != bhs.itt() || d.dataSn() != expectSn) {
-                    printf("  [iscsi] Data-Out mismatch (itt 0x%08X vs 0x%08X, DataSN %u vs %u)\n",
-                           d.itt(), bhs.itt(), d.dataSn(), expectSn);
-                    return false;
-                }
-                if (d.bufferOff() != offset + got || payload.size() > chunk - got) {
-                    printf("  [iscsi] Data-Out offset %u (want %u) or %u bytes (room %u)\n",
-                           d.bufferOff(), offset + got, (unsigned)payload.size(), chunk - got);
-                    return false;
-                }
-                memcpy(scratch.data() + got, payload.data(), payload.size());
-                got += (uint32_t)payload.size();
-                bytesIn += payload.size();
-                expectSn++;
-            }
-            uint64_t curLba = lba + offset / bs;
-            if (!be.write(curLba, chunk / bs, scratch.data())) {
-                printf("  [iscsi] WRITE lba=%llu blocks=%u failed on the NVMe side\n",
-                       (unsigned long long)curLba, chunk / bs);
-                uint8_t s[18];
-                uint32_t sl = buildSense(s, 0x03 /*MEDIUM ERROR*/, 0x0C /*write error*/, 0);
-                return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
-            }
-            offset += chunk;
+        // Everything the command asked for arrived in the command PDU itself.
+        if (offset >= bytes) {
+            curDataOut = (uint32_t)bytes;
+            return sendScsiRsp(bhs.itt(), SCSI_STATUS_GOOD, nullptr, 0, 0, false);
         }
-        return sendScsiRsp(bhs.itt(), SCSI_STATUS_GOOD, nullptr, 0, 0, false);
+
+        // Park it and ask for the remainder.  handleScsi RETURNS here, and the
+        // Data-Out PDUs come back through session()'s dispatch - see PendingWrite
+        // for why this is state instead of the read loop it replaced.
+        {
+            PendingWrite pw;
+            pw.itt = bhs.itt();
+            pw.lba = lba;
+            pw.bs = bs;
+            pw.bytes = (uint32_t)bytes;
+            pw.received = offset;
+            pw.ttt = nextTtt++;
+            pending_.push_back(std::move(pw));
+        }
+        return sendNextR2T(pending_.back());
     }
 
     case 0x35:                               // SYNCHRONIZE CACHE(10)
