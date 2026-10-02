@@ -87,7 +87,17 @@ function Measure-Read([int]$chunk, [long]$total, [long]$offset) {
 # --- bring the stack up ------------------------------------------------------------
 Stop-Stack
 Start-Sleep -Milliseconds 500
-Get-IscsiSession -ErrorAction SilentlyContinue | ForEach-Object { iscsicli LogoutTarget $_.SessionIdentifier 2>&1 | Out-Null }
+# ONLY OUR OWN TARGET, NEVER "every session".
+#
+# A blanket logout used to sit here, and it contradicts the rule uninstall.ps1 states in
+# its own comment: the user's real NAS portal must survive.  On the machine this was
+# measured on there is normally a session to iqn.2026-02.com.fnnas:target-1..., so a
+# blanket logout does not just risk somebody's storage, it disconnects it - and this
+# script is a MEASUREMENT tool, which has no business touching anything it did not start.
+$ourNqn = 'iqn.2024-01.com.nvmeof:bridge0'
+Get-IscsiSession -ErrorAction SilentlyContinue |
+    Where-Object { $_.TargetNodeAddress -eq $ourNqn } |
+    ForEach-Object { iscsicli LogoutTarget $_.SessionIdentifier 2>&1 | Out-Null }
 Start-Sleep -Milliseconds 500
 
 $beLog = Join-Path $LogDir 'perf_backend.log'
@@ -105,8 +115,12 @@ Start-Process -FilePath $exe -ArgumentList $brArgs `
 Start-Sleep -Seconds 7
 
 for ($i = 1; $i -le 6; $i++) {
-    if (Get-IscsiSession -ErrorAction SilentlyContinue) { break }
-    Connect-IscsiTarget -NodeAddress 'iqn.2024-01.com.nvmeof:bridge0' -IsPersistent $false -ErrorAction SilentlyContinue | Out-Null
+    # OUR session specifically.  A bare Get-IscsiSession is satisfied by anything that is
+    # already there - a NAS session present on the machine would end this wait on the first
+    # pass and the run would then measure a bridge that never came up.
+    if (Get-IscsiSession -ErrorAction SilentlyContinue |
+        Where-Object { $_.TargetNodeAddress -eq $ourNqn }) { break }
+    Connect-IscsiTarget -NodeAddress $ourNqn -IsPersistent $false -ErrorAction SilentlyContinue | Out-Null
     Start-Sleep -Seconds 3
 }
 Start-Sleep -Seconds 4

@@ -3888,7 +3888,24 @@ static int runTarget(const char* ip, uint16_t port, int maxControllers) {
         hr = listener->GetConnectionRequest(admin.conn, &admin.ov);
         if (hr == ND_PENDING) hr = admin.waitOverlapped(listener, (DWORD)g_reconnectWaitMs);
         if (!ndOk(hr)) {
-            if (ctrlIndex == 1) { printf("admin connection request failed\n"); return 1; }
+            if (ctrlIndex == 1) {
+                // THE HRESULT, ALWAYS.  This line used to say only "admin connection
+                // request failed", and that sentence cannot distinguish the two cases that
+                // need completely different investigations: a WAIT that timed out (the host
+                // never came, or came to another port) versus a request that FAILED the
+                // moment it arrived (the CM refused it, or the listener is in a bad state).
+                // The client sees ND_CONNECTION_REFUSED either way, which points at the
+                // wrong end of the wire.
+                char b[64];
+                printf("admin connection request failed: %s (0x%08X) after %d ms\n",
+                       ndStr(hr, b, sizeof(b)), (unsigned)hr, g_reconnectWaitMs);
+                char ipStr[INET_ADDRSTRLEN] = {};
+                InetNtopA(AF_INET, &local.sin_addr, ipStr, sizeof(ipStr));
+                printf("          listener bound to %s:%u - a timeout here means nothing\n"
+                       "          connected to it at all; an immediate failure means the CM\n"
+                       "          refused the request.\n", ipStr, ntohs(local.sin_port));
+                return 1;
+            }
             // Not an error for a later controller: the host simply had nothing more
             // to do, which is exactly what `nvme discover` followed by `nvme connect`
             // looks like from here.
