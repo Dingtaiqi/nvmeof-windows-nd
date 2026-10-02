@@ -16,8 +16,28 @@
 
 static int g_failures = 0;
 
+// The condition goes through a function call, and that is not decoration: this file
+// checks CONSTANT comparisons on purpose (a wrong constant is exactly the bug it
+// exists to find), and MSVC 14.4x and earlier answer that with
+//
+//     warning C4127: conditional expression is constant
+//
+// which /W4 /WX turns into error C2220.  MSVC 14.5x stopped emitting it for this
+// shape, so the file built clean locally and failed on every CI run for 21 pushes:
+// the windows-2022 runner ships 14.44, this machine's default toolset is 14.51.
+// Reproduced by forcing the toolset locally:
+//
+//     cl /nologo /TC /W4 /WX wire_selftest.c      -vcvars_ver=14.44 -> error C2220
+//     cl /nologo /TC /W4 /WX wire_selftest.c      -vcvars_ver=14.51 -> clean
+//
+// Passing the value through a function keeps every check running, keeps /W4 /WX on
+// for the rest of the file (where a warning really is a wire-format bug), and does not
+// suppress anything.  Static layout assertions are unaffected: those are
+// NVMEOF_STATIC_ASSERT, which is a compile-time check in its own right.
+static int check_holds(int cond) { return cond; }
+
 #define CHECK(cond, msg) do { \
-    if (!(cond)) { printf("FAIL: %s (%s:%d)\n", msg, __FILE__, __LINE__); g_failures++; } \
+    if (!check_holds(!!(cond))) { printf("FAIL: %s (%s:%d)\n", msg, __FILE__, __LINE__); g_failures++; } \
 } while (0)
 
 static void test_sgl_keyed(void) {

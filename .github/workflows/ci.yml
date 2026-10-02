@@ -1,13 +1,15 @@
 # ===========================================================================
-#  CI for the two suites that need no hardware.
+#  CI for the three suites that need no hardware.
 #
 #  WHAT IS COVERED, AND WHAT IS DELIBERATELY NOT
-#  Of the ten suites in src/, only these two can run on a hosted runner:
+#  Of the eleven suites in src/, only these three can run on a hosted runner:
 #
 #    run_xref.ps1  - cross-checks our constants against the two Linux reference
 #                    headers in ref/.  Needs Python and the repository. Nothing else.
 #    run_wire.ps1  - the byte-level wire-format self-test, compiled as both C and
 #                    C++ with /W4 /WX.  Needs cl.exe and the repository.
+#    run_auth.ps1  - DH-HMAC-CHAP, which needs only bcrypt/wincrypt (test_auth.cpp
+#                    does not include the NetworkDirect headers).
 #
 #  The other eight (f1/f3/f4/f5/f5_auth/f6/f7/stag) need a real RoCE adapter and
 #  the NetworkDirect SDK, which is not part of this repository (it comes from the
@@ -15,6 +17,25 @@
 #  them here would produce a green check that means nothing, so this file does not
 #  try.  A red X here means the wire format, a protocol constant or a compile broke
 #  - which is exactly the class of defect a hosted runner CAN catch.
+#
+#  WHY THIS FILE NOW SAYS WHICH COMPILER IT USED, AND ANNOTATES ITS OWN FAILURES
+#
+#  This workflow was red on all 21 of its first runs.  The reason was a toolchain
+#  difference nobody could see: wire_selftest.c used constant conditions (which is
+#  what a self-test is FOR) and MSVC 14.4x answers that with warning C4127, which
+#  /W4 /WX turns into error C2220 - while MSVC 14.5x stopped emitting it, so the
+#  same file built clean on the development machine and failed on the runner's
+#  windows-2022 image (14.44) every single time.
+#
+#  Two things came out of that, and both are permanent:
+#    * the "Record the toolchain" step, so a log always says which compiler ran;
+#    * failures are published as ::error:: ANNOTATIONS.  The downloadable job log
+#      needs repository admin rights (the API answers 403 without them), so a red X
+#      whose reason cannot be read is a gate nobody can act on; annotations are
+#      readable with plain read access.
+#  The code side of the fix is in wire_selftest.c (the condition goes through a
+#  function), and src/run_wire.ps1 -AllToolsets builds against every MSVC installed
+#  on a machine, which is how a difference like this is caught before pushing.
 # ===========================================================================
 name: ci
 
@@ -26,11 +47,18 @@ on:
 
 jobs:
   wire-and-constants:
-    runs-on: windows-2022          # pinned: /W4 /WX is only meaningful against a known compiler
+    # Pinned on purpose: /W4 /WX is only meaningful against a known compiler, and the
+    # image's toolset is recorded below so a drift is visible in the log rather than
+    # inferred from a red X.
+    runs-on: windows-2022
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      # checkout v6 / setup-python v6: the v4/v5 lines still target Node 20, which the
+      # runner now forces onto Node 24 and reports as a deprecation warning on every
+      # run - noise that trains people to ignore the annotations.
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.x'
 
@@ -47,19 +75,64 @@ jobs:
           "ND_VS_DIR=$($vs.FullName)" >> $env:GITHUB_ENV
           Write-Host "using Visual Studio at $($vs.FullName)"
 
+      - name: Record the toolchain
+        shell: pwsh
+        run: |
+          Write-Host "ND_VS_DIR = $env:ND_VS_DIR"
+          $msvc = Join-Path $env:ND_VS_DIR 'VC\Tools\MSVC'
+          if (Test-Path $msvc) {
+            $sets = (Get-ChildItem $msvc -Directory | Select-Object -ExpandProperty Name) -join ', '
+            Write-Host "MSVC toolsets present: $sets"
+          }
+          $sdk = Join-Path 'C:\Program Files (x86)\Windows Kits\10\Include' '.'
+          if (Test-Path $sdk) {
+            Write-Host "Windows SDK: $((Get-ChildItem $sdk -Directory | Select-Object -ExpandProperty Name) -join ', ')"
+          }
+          # Build the command line first and hand it to cmd.exe as ONE argument: the
+          # same shape the build scripts in src/ use.  Inlining `cmd /c "call ... && cl"`
+          # re-parses differently under PowerShell 7's stricter native-argument passing,
+          # which is how this step failed the first time it was tried.
+          $vsdev = Join-Path $env:ND_VS_DIR 'Common7\Tools\VsDevCmd.bat'
+          $cmd = "call `"$vsdev`" -arch=x64 -no_logo >nul 2>&1 && cl"
+          & cmd.exe /c $cmd 2>&1 | Select-Object -First 4 | ForEach-Object { Write-Host "  $_" }
+          # This step records, it does not gate: `cl` with no input prints its banner
+          # and exits non-zero, and the pwsh shell Actions uses ends the step with
+          # $LASTEXITCODE - so without this the recorder would fail the job.
+          exit 0
+
+      # Run a suite, print everything it said, and on failure turn the tail of the
+      # output into annotations - see the header for why annotations and not just the
+      # log.  $Args is the only variable here, because everything else is fixed.
       - name: Cross-check constants against the Linux reference headers
         working-directory: src
         shell: pwsh
         run: |
-          .\run_xref.ps1
-          if ($LASTEXITCODE -ne 0) { throw "run_xref.ps1 failed (rc=$LASTEXITCODE)" }
+          $out = & .\run_xref.ps1 *>&1 | Out-String
+          $rc = $LASTEXITCODE
+          $out -split "`r?`n" | ForEach-Object { Write-Host $_ }
+          if ($rc -ne 0) {
+            ($out -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 12) | ForEach-Object {
+              Write-Host ("::error::" + ((($_ -replace '%','%25') -replace "`r",'') -replace "`n",' '))
+            }
+            throw "run_xref.ps1 failed (rc=$rc)"
+          }
 
       - name: Wire-format self-test, as both C and C++
         working-directory: src
         shell: pwsh
         run: |
-          .\run_wire.ps1
-          if ($LASTEXITCODE -ne 0) { throw "run_wire.ps1 failed (rc=$LASTEXITCODE)" }
+          # -AllToolsets compiles against every MSVC the image has: one toolset on a
+          # runner, but on a developer machine it is the check that catches "clean
+          # under 14.5x, error under 14.4x" before it reaches CI.
+          $out = & .\run_wire.ps1 -AllToolsets *>&1 | Out-String
+          $rc = $LASTEXITCODE
+          $out -split "`r?`n" | ForEach-Object { Write-Host $_ }
+          if ($rc -ne 0) {
+            ($out -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 12) | ForEach-Object {
+              Write-Host ("::error::" + ((($_ -replace '%','%25') -replace "`r",'') -replace "`n",' '))
+            }
+            throw "run_wire.ps1 failed (rc=$rc)"
+          }
 
       # DH-HMAC-CHAP, and it is here because it CAN be: test_auth.cpp includes only
       # nvmeof_auth.h and nvmeof_dhchap.h, which need bcrypt and wincrypt and no
@@ -73,8 +146,15 @@ jobs:
         working-directory: src
         shell: pwsh
         run: |
-          .\run_auth.ps1
-          if ($LASTEXITCODE -ne 0) { throw "run_auth.ps1 failed (rc=$LASTEXITCODE)" }
+          $out = & .\run_auth.ps1 *>&1 | Out-String
+          $rc = $LASTEXITCODE
+          $out -split "`r?`n" | ForEach-Object { Write-Host $_ }
+          if ($rc -ne 0) {
+            ($out -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 12) | ForEach-Object {
+              Write-Host ("::error::" + ((($_ -replace '%','%25') -replace "`r",'') -replace "`n",' '))
+            }
+            throw "run_auth.ps1 failed (rc=$rc)"
+          }
 
       # Three repository-wide checks, each one added because a mistake of exactly
       # that shape was committed here during development:
@@ -112,6 +192,7 @@ jobs:
 
           if ($bad.Count -gt 0) {
             $bad | ForEach-Object { Write-Host "  $_" }
+            $bad | Select-Object -First 10 | ForEach-Object { Write-Host "::error::$_" }
             throw "$($bad.Count) hygiene check(s) failed"
           }
           Write-Host "SPDX headers, .ps1 BOMs and doc encoding all check out"

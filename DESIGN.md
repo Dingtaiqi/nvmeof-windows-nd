@@ -4282,6 +4282,51 @@ PDU + 后端四次 256 KiB 写；测得 69 ms 里绝大部分是那 4 个 PDU �
     .\tools_iscsi_perf.ps1 -Concurrent 8        # 吞吐 + 桥内分解
     .\tools_iscsi_write.ps1 -Drive 3 -Offset 0 -Size 4MB   # 三条证据逐字节
 
+### 8.69 ✅ CI 连红 21 次的根因：一条编译器版本边界（14.44 vs 14.51），以及"红叉要看得到原因"
+
+**现象**：`ci.yml` 从建立到第 21 次运行**全部失败**，每次都在 `run_wire.ps1` 那一步、10 秒内结束；
+本机跑同一套东西一直是绿的。同事天天收到失败邮件，而红叉上没有任何可用信息。
+
+**怎么查的**（本机 HTTPS 受限，所以走 harness 的 web_fetch 读 GitHub API）：
+
+- `actions/runs` 列出 21 次运行，全 failure；`actions/runs/<id>/jobs` 指出失败步骤是
+  **Wire-format self-test**，其余步骤 success，`run_auth` 与 hygiene 因为前一步失败被 skipped；
+- `check-runs/<id>/annotations` 给出两条：一条 Node 20 弃用警告（`checkout@v4`/`setup-python@v5`），
+  一条就是 `Process completed with exit code 1.`——**没有编译器输出**；
+- `actions/jobs/<id>/logs` 匿名读返回 **403 "Must have admin rights"**，所以日志这条路走不通；
+- 于是改成**在本机复现工具集**：这台机器的 VS 18 同时装了 **MSVC 14.44.35207 和 14.51.36231**，
+  而 windows-2022 runner 装的正是 14.44 一档。用 `-vcvars_ver=14.44` 重跑 CI 的原始命令行：
+
+      cl /nologo /TC /W4 /WX wire_selftest.c   -vcvars_ver=14.44 -> error C2220 (C4127)
+      cl /nologo /TC /W4 /WX wire_selftest.c   -vcvars_ver=14.51 -> 干净
+
+    14.44 对 `CHECK(常量 == 常量)` 报 `warning C4127: 条件表达式是常量`，`/WX` 把它变成
+    `error C2220`；14.51 不再对这个形状报警。**自测文件"检查常量"本来就是它的工作**，
+    所以这不是代码写错了，而是编译器的诊断在这两个版本之间变了。
+
+**怎么修的**：
+
+1. `wire_selftest.c`：把条件过一个函数（`check_holds(!!(cond))`），编译器不再看到"常量条件"，
+   检查照跑，`/W4 /WX` 对文件其余部分（那里警告真的等于线上格式 bug）保持不放松，也没有
+   suppress 任何东西。14.44 与 14.51、C 与 C++ 四种组合全部 PASS。
+2. `run_wire.ps1 -AllToolsets`：把机器上**每个** MSVC 工具集都编一遍（runner 上只有一个，
+   开发机上正是这个开关能在 push 之前抓住这种差异）。
+3. `ci.yml`：
+   - `checkout@v6` / `setup-python@v6`（v4/v5 还在 Node 20 上，runner 强制 Node 24，于是每次
+     运行都多一条弃用警告——**噪音会把标注训练成没人看**）；
+   - 新增 **Record the toolchain** 步骤：把 `ND_VS_DIR`、可用工具集、Windows SDK、`cl` 版本
+     打进日志。失败时"哪个编译器"是第一个要问的问题，它应该已经在日志里；
+   - 三个套件步骤**捕获输出、原样打印**，失败时把最后 12 行以 `::error::` 形式发成
+     **annotation**——job log 要仓库 admin 权限才能下载（上面那个 403），而 annotation 只要有
+     读权限就能看。**一个没人能看出原因的红叉不是门禁。**
+
+**顺带确认**：`run_auth.ps1` 的编译在 14.44 和 14.51 下都干净，所以它不是第二个坑（它此前一直
+被 skip，从未真正跑过）。
+
+**教训**：`/W4 /WX` 是"和已知编译器比"的检查，而托管 runner 的工具集会漂移；要么把工具集钉住，
+要么让代码在**所有**装得到的工具集上都过，并且让环境信息随日志一起落下来。本机这次的代价是
+21 封失败邮件和一次本可以避免的排查。
+
 ## 7. 已知风险
 
 | 风险 | 说明 | 缓解 |
