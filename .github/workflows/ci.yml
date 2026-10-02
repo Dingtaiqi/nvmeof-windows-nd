@@ -134,6 +134,27 @@ jobs:
             throw "run_wire.ps1 failed (rc=$rc)"
           }
 
+      # The iSCSI/SCSI layer, which had no automated test at all until now - and which
+      # is where every regression in this project actually happened (an unpadded data
+      # segment, a residual from the wrong counter, an R2T asking for offset 0, an
+      # unbounded parked-write table, a negotiation rule applied backwards).  It runs
+      # here because the rules were extracted into socket-free units: the PDU builders,
+      # the padding rule, the negotiation helpers, the sense block and the parked-write
+      # table need no adapter and no initiator.
+      - name: iSCSI/SCSI protocol self-test (no hardware)
+        working-directory: src
+        shell: pwsh
+        run: |
+          $out = & .\run_iscsi.ps1 -AllToolsets *>&1 | Out-String
+          $rc = $LASTEXITCODE
+          $out -split "`r?`n" | ForEach-Object { Write-Host $_ }
+          if ($rc -ne 0) {
+            ($out -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 12) | ForEach-Object {
+              Write-Host ("::error::" + ((($_ -replace '%','%25') -replace "`r",'') -replace "`n",' '))
+            }
+            throw "run_iscsi.ps1 failed (rc=$rc)"
+          }
+
       # DH-HMAC-CHAP, and it is here because it CAN be: test_auth.cpp includes only
       # nvmeof_auth.h and nvmeof_dhchap.h, which need bcrypt and wincrypt and no
       # NetworkDirect SDK.  Before this suite existed the crypto self-test was

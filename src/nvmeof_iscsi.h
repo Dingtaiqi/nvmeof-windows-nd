@@ -53,6 +53,11 @@
 #include <mutex>
 #include <chrono>
 
+// The parked-write table: its own header because it has no sockets, no RDMA and no
+// wire format in it, which is what lets iscsi_selftest.cpp exercise its rules on a
+// hosted runner.
+#include "nvmeof_iscsi_pending.h"
+
 // ---------------------------------------------------------------------------
 //  Data-path diagnostics are OFF unless asked for, and that default is measured,
 //  not a matter of taste.  With these traces enabled (and unbuffered stdout, see
@@ -230,6 +235,123 @@ static inline void iscsi_wr32(uint8_t* p, uint32_t v) {
 }
 static inline void iscsi_wr64(uint8_t* p, uint64_t v) {
     iscsi_wr32(p, (uint32_t)(v >> 32)); iscsi_wr32(p + 4, (uint32_t)v);
+}
+
+// The iSCSI data segment is padded to a multiple of four bytes, and this one line is
+// the rule that broke the RECEIVE path once (an unpadded 127-byte login text left a
+// byte in the stream and shifted every following PDU) and the SEND path once (a
+// 7-byte VPD list put the trailing SCSI Response one byte out of phase and Windows
+// dropped the session after a "GOOD" answer).  It is a function now so the self-test
+// can pin 0..3 for every residue instead of the two cases that happened to be seen.
+static inline uint32_t iscsi_pad4(uint32_t len) { return (4u - (len & 3u)) & 3u; }
+
+// ---------------------------------------------------------------------------
+//  PDU BUILDERS: the wire bytes, with no socket in sight.
+//
+//  These blocks used to be written inline inside sendR2T / sendScsiRsp / sendDataIn,
+//  so the only way to check a header's layout was to attach a real initiator and read
+//  a capture - and layout is exactly what went wrong twice: the R2T Windows called
+//  "an invalid iSCSI PDU" (DESIGN 8.63) and the unpadded Data-In above.  Building is
+//  separated from sending so iscsi_selftest.cpp can assert the bytes on a hosted
+//  runner, where no initiator and no RDMA card exist.
+//
+//  Field offsets are RFC 7143 section 11.8 (R2T), 11.4 (SCSI Response) and 11.7
+//  (Data-In); the accessors in IscsiBhs read the same layout back.
+// ---------------------------------------------------------------------------
+static inline void iscsiBuildBhs(uint8_t p[48], uint8_t opcode, uint8_t flags,
+                                 uint32_t dataSegLen) {
+    memset(p, 0, 48);
+    p[0] = opcode;
+    p[1] = flags;                     // F / U / O / ... live here
+    iscsi_wr24(p + 5, dataSegLen);    // TotalAHSLength stays 0: this target sends no AHS
+}
+
+static inline void iscsiBuildR2T(uint8_t p[48], uint32_t itt, uint32_t ttt,
+                                 uint32_t statSn, uint32_t expCmdSn, uint32_t maxCmdSn,
+                                 uint32_t r2tSn, uint32_t offset, uint32_t len) {
+    iscsiBuildBhs(p, ISCSI_OP_R2T, 0x80, 0);   // byte 1 = 0x80, as the reference sends
+    iscsi_wr32(p + 16, itt);
+    iscsi_wr32(p + 20, ttt);
+    iscsi_wr32(p + 24, statSn);
+    iscsi_wr32(p + 28, expCmdSn);
+    iscsi_wr32(p + 32, maxCmdSn);
+    iscsi_wr32(p + 36, r2tSn);
+    iscsi_wr32(p + 40, offset);
+    iscsi_wr32(p + 44, len);
+}
+
+static inline void iscsiBuildScsiRsp(uint8_t p[48], uint32_t itt, uint8_t status,
+                                     bool underflow, uint32_t statSn, uint32_t expCmdSn,
+                                     uint32_t maxCmdSn, uint32_t residual) {
+    iscsiBuildBhs(p, ISCSI_OP_SCSI_RSP, (uint8_t)(0x80 | (underflow ? 0x40 : 0x00)), 0);
+    p[2] = 0x00;                      // Response: command completed at target
+    p[3] = status;                    // <- byte 3, not byte 2 (see the header note)
+    iscsi_wr32(p + 16, itt);
+    iscsi_wr32(p + 20, 0xFFFFFFFFu);  // TTT: unsolicited
+    iscsi_wr32(p + 24, statSn);
+    iscsi_wr32(p + 28, expCmdSn);
+    iscsi_wr32(p + 32, maxCmdSn);
+    iscsi_wr32(p + 36, 0);            // ExpDataSN
+    iscsi_wr32(p + 44, residual);
+}
+
+static inline void iscsiBuildDataIn(uint8_t p[48], uint32_t itt, uint32_t statSn,
+                                    uint32_t expCmdSn, uint32_t maxCmdSn, uint32_t dataSn,
+                                    uint32_t offset, uint32_t len, bool final) {
+    iscsiBuildBhs(p, ISCSI_OP_DATA_IN, (uint8_t)(final ? 0x80 : 0x00), len);
+    iscsi_wr32(p + 16, itt);
+    iscsi_wr32(p + 20, 0xFFFFFFFFu);  // TTT: unsolicited data-in
+    iscsi_wr32(p + 24, statSn);       // StatSN: NOT incremented by data PDUs
+    iscsi_wr32(p + 28, expCmdSn);
+    iscsi_wr32(p + 32, maxCmdSn);
+    iscsi_wr32(p + 36, dataSn);
+    iscsi_wr32(p + 40, offset);
+}
+
+// The 18-byte fixed-format sense block (SPC-4): response code 0x70, the sense key in
+// byte 2, additional sense length 10 in byte 7, ASC/ASCQ at 12/13.  A function, not an
+// inline block, so iscsi_selftest.cpp can pin the layout Windows parses.
+static inline uint32_t iscsiBuildSense(uint8_t* s, uint8_t key, uint8_t asc, uint8_t ascq) {
+    memset(s, 0, 18);
+    s[0] = 0x70;            // fixed format, current error
+    s[2] = key;
+    s[7] = 10;              // additional sense length
+    s[12] = asc;
+    s[13] = ascq;
+    return 18;
+}
+// ---------------------------------------------------------------------------
+//  NEGOTIATION RULES, as functions.
+//
+//  Three key kinds, three rules, and the difference between them is not style: it is
+//  what LIO's iscsi_check_acceptor_state() implements, and getting InitialR2T wrong is
+//  what made Windows reject this target's R2T through a whole debugging round
+//  (DESIGN 8.63).  Fifteen hypotheses about the R2T's own bytes died against a
+//  negotiation that answered No where the reference answers Yes.
+//
+//    * BOOL keys negotiated with OR  (InitialR2T): if EITHER side says Yes, Yes wins.
+//      A responder that answers No to an initiator that offered Yes has changed a
+//      negotiation it does not own.
+//    * BOOL keys negotiated with AND (ImmediateData): Yes only if BOTH say Yes.
+//    * Number keys: the smaller value wins, and a responder may only lower its own.
+//
+//  Pure functions so iscsi_selftest.cpp can pin them on a hosted runner - the login
+//  handler calls these instead of hand-rolling a comparison whose rule is invisible
+//  at the call site.
+// ---------------------------------------------------------------------------
+static inline std::string iscsiBoolOr(const std::string& offer, const std::string& ours) {
+    return (offer == "Yes" || ours == "Yes") ? "Yes" : "No";
+}
+static inline std::string iscsiBoolAnd(const std::string& offer, const std::string& ours) {
+    return (offer == "Yes" && ours == "Yes") ? "Yes" : "No";
+}
+// The negotiated value of a number key: the smaller of the two, with an absent or
+// unusable offer meaning "no constraint from that side".
+static inline uint32_t iscsiNumberMin(const std::string& offer, uint32_t ours) {
+    if (offer.empty()) return ours;
+    const long v = atol(offer.c_str());
+    if (v <= 0) return ours;
+    return ((uint32_t)v < ours) ? (uint32_t)v : ours;
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +539,13 @@ public:
         sockaddr_in a = {};
         a.sin_family = AF_INET;
         a.sin_port = htons(port);
-        a.sin_addr.s_addr = inet_addr(bindAddr.c_str());
+        // InetPtonA, not inet_addr: the old API is deprecated (C4996) and, more to the
+        // point, it reports failure as INADDR_NONE, which is also the broadcast
+        // address - an unusable bind address would silently become a broadcast bind.
+        if (InetPtonA(AF_INET, bindAddr.c_str(), &a.sin_addr) != 1) {
+            printf("  [iscsi] bind address '%s' is not an IPv4 literal\n", bindAddr.c_str());
+            return false;
+        }
         if (bind(listenSock, (sockaddr*)&a, sizeof(a)) != 0) {
             printf("  [iscsi] bind 127.0.0.1:%u failed (%d)\n", port, WSAGetLastError());
             return false;
@@ -558,7 +686,11 @@ public:
             // round trip stalls by a timer quantum) and changed nothing - 19.2/20.8 ms
             // per command against 19.3/21.0 with the default.  DESIGN 8.68.
             char who[64];
-            sprintf_s(who, "%s:%u", inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+            // InetNtopA, not inet_ntoa: inet_ntoa is deprecated (C4996) and returns a
+            // pointer into a per-thread static buffer.
+            char ipStr[INET_ADDRSTRLEN] = {};
+            InetNtopA(AF_INET, &from.sin_addr, ipStr, sizeof(ipStr));
+            sprintf_s(who, "%s:%u", ipStr, ntohs(from.sin_port));
             printf("\n  [iscsi] session from %s\n", who);
             IscsiTarget* t = cloneForConnection(s, who);
             std::thread([t, &be]() {
@@ -618,29 +750,22 @@ private:
     //  writes in the same session.  A target that stops reading to wait for one
     //  specific PDU can never find out what Windows actually sent instead.
     //
-    //  So the command is parked here instead: the R2T goes out, handleScsi returns,
-    //  and the session loop keeps dispatching PDUs by ITT until the last byte of
-    //  the write has arrived.  `buf` holds ONE burst, not the whole command, so the
-    //  memory a pending write costs is bounded by MaxBurstLength.
+    //  So the command is parked instead: the R2T goes out, handleScsi returns, and the
+    //  session loop keeps dispatching PDUs by ITT until the last byte has arrived.
+    //  The table itself lives in nvmeof_iscsi_pending.h so that its rules - one entry
+    //  per ITT, bounded by the advertised window, stalled entries detectable - can be
+    //  unit-tested without a socket, a backend or an RDMA card (iscsi_selftest.cpp).
     // ------------------------------------------------------------------
-    struct PendingWrite {
-        uint32_t itt = 0, ttt = 0;
-        uint64_t lba = 0;
-        uint32_t bs = 512;
-        uint32_t bytes = 0;         // total the command asked for
-        uint32_t received = 0;      // absolute offset of the next expected byte
-        uint32_t wantOff = 0;       // absolute offset of the outstanding R2T
-        uint32_t want = 0;          // bytes the outstanding R2T asked for
-        uint32_t chunkOff = 0;      // where `buf` starts within the command
-        uint32_t r2tSn = 0;
-        std::vector<uint8_t> buf;
-    };
-    std::vector<PendingWrite> pending_;
+    PendingWrites pending_{kCmdWindow};
 
-    PendingWrite* findPending(uint32_t itt) {
-        for (auto& pw : pending_) if (pw.itt == itt) return &pw;
-        return nullptr;
-    }
+    PendingWrite* findPending(uint32_t itt) { return pending_.find(itt); }
+
+    // How long a parked write may make no progress before the session gives up on it.
+    // 60 s is deliberately longer than the initiator's own request hold time
+    // (MaxRequestHoldTime is 60 in the Microsoft iSCSI initiator's registry, and its
+    // SRB timeout adds 15 more): killing a session before the peer's own recovery has
+    // had its chance would turn a slow patch into a dropped disk.
+    static const uint64_t kWriteStallMs = 60000;
     // PDUs that arrived while a command was waiting for its Data-Out.  Windows keeps
     // its command window full and legally sends the next WRITE while this target is
     // still collecting the previous one's data.  Aborting on that - which is what this
@@ -798,7 +923,10 @@ private:
         // bridge had.  An earlier version of this line returned nextTsih++ for every
         // response, on the strength of one RFC sentence read out of context; the
         // reference disagreed and the capture settled it.
-        iscsi_wr16(p + 14, (req.loginCsg() == ISCSI_STAGE_SECURITY) ? 0 : nextTsih);
+        // The cast is explicit because nextTsih is a 32-bit counter and the TSIH field
+        // is 16 bits: the wrap is part of the field, not an accident, and saying so is
+        // better than a silent narrowing (C4244).
+        iscsi_wr16(p + 14, (uint16_t)((req.loginCsg() == ISCSI_STAGE_SECURITY) ? 0 : nextTsih));
         iscsi_wr32(p + 16, req.itt());
         iscsi_wr32(p + 24, statSn++);
         iscsi_wr32(p + 28, expCmdSn);
@@ -846,12 +974,8 @@ private:
             residual = curEdtl - curDataOut;
             underflow = true;
         }
-        uint8_t p[48] = {};
-        p[0] = ISCSI_OP_SCSI_RSP;
-        p[1] = 0x80;                        // F
-        if (underflow) p[1] |= 0x40;        // U
-        p[2] = 0x00;                        // Response: command completed at target
-        p[3] = status;                      // <- byte 3, not byte 2 (see the header note)
+        uint8_t p[48];
+        iscsiBuildScsiRsp(p, itt, status, underflow, statSn++, expCmdSn, maxCmdSn, residual);
         // One line per answer, for the same reason the receive trace exists: a
         // command the target answered wrongly and a command it never answered look
         // identical from the initiator's side (it closes the session either way).
@@ -859,15 +983,6 @@ private:
                itt, status, residual, senseLen,
                (unsigned long long)GetTickCount64() % 100000000,
                (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tCmdHr).count() / 1000);
-        uint32_t dl = senseLen ? senseLen + 2 : 0;
-        iscsi_wr24(p + 5, dl);
-        iscsi_wr32(p + 16, itt);
-        iscsi_wr32(p + 20, 0xFFFFFFFFu);
-        iscsi_wr32(p + 24, statSn++);
-        iscsi_wr32(p + 28, expCmdSn);
-        iscsi_wr32(p + 32, maxCmdSn);
-        iscsi_wr32(p + 36, 0);              // ExpDataSN
-        iscsi_wr32(p + 44, residual);
         if (!sendAll(p, 48)) return false;
         if (senseLen) {
             // SenseLength (2) + sense (18) = 20 bytes, already 4-aligned; padding is
@@ -876,7 +991,7 @@ private:
             uint8_t sl[2] = { (uint8_t)(senseLen >> 8), (uint8_t)senseLen };
             if (!sendAll(sl, 2)) return false;
             if (!sendAll(sense, senseLen)) return false;
-            uint32_t pad = (4 - ((senseLen + 2) % 4)) % 4;
+            uint32_t pad = iscsi_pad4(senseLen + 2);
             if (pad) { uint8_t z[3] = {}; if (!sendAll(z, pad)) return false; }
         }
         return true;
@@ -884,17 +999,8 @@ private:
 
     bool sendDataIn(uint32_t itt, const uint8_t* data, uint32_t len, uint32_t offset,
                     uint32_t dataSn, bool final) {
-        uint8_t p[48] = {};
-        p[0] = ISCSI_OP_DATA_IN;
-        if (final) p[1] |= 0x80;            // F
-        iscsi_wr24(p + 5, len);
-        iscsi_wr32(p + 16, itt);
-        iscsi_wr32(p + 20, 0xFFFFFFFFu);    // TTT: unsolicited data-in
-        iscsi_wr32(p + 24, statSn);         // StatSN: not incremented by data PDUs
-        iscsi_wr32(p + 28, expCmdSn);
-        iscsi_wr32(p + 32, maxCmdSn);
-        iscsi_wr32(p + 36, dataSn);
-        iscsi_wr32(p + 40, offset);
+        uint8_t p[48];
+        iscsiBuildDataIn(p, itt, statSn, expCmdSn, maxCmdSn, dataSn, offset, len, final);
         // Pad the data segment to a 4-byte boundary, exactly the rule that broke the
         // RECEIVE path (see readPdu).  It matters on this side just as much: an
         // INQUIRY answer whose VPD list is 7 bytes long, with no padding, puts the
@@ -908,7 +1014,7 @@ private:
         // Data-Out PDU from Windows' initiator in ~306 us but needing ~669 us to
         // send a 64 KiB Data-In PDU back to it, and the question is whether that
         // 2.2x is this side's syscall pattern or the initiator's Data-In path.
-        uint32_t pad = (4 - (len & 3)) & 3;
+        uint32_t pad = iscsi_pad4(len);
         static const char zeroPad[4] = {};
         WSABUF iov[3];
         DWORD nbuf = 0;
@@ -936,23 +1042,20 @@ private:
         if (g_r2tProbe.maxcmdsn == 0)       r2tMaxCmd = expCmdSn;   // equal, not windowed
         else if (g_r2tProbe.maxcmdsn == -2) r2tMaxCmd = 0;
         else if (g_r2tProbe.maxcmdsn > 0)   r2tMaxCmd = (uint32_t)g_r2tProbe.maxcmdsn;
-        uint8_t p[48] = {};
-        p[0] = ISCSI_OP_R2T;
+        uint8_t p[48];
         // Byte 1.  The reference target sends 0x80 here; this bridge sent 0x00, and
         // that is the difference sixteen hypotheses never found.  Behind the probe
         // while it is being confirmed, then promoted to the shipped value.
-        p[1] = (g_r2tProbe.flags >= 0) ? (uint8_t)g_r2tProbe.flags : 0x80;
-        if (g_iscsiTrace) printf("    [iscsi] R2T byte1 = 0x%02X (probe %d)\n", p[1], g_r2tProbe.flags);
-        iscsi_wr32(p + 16, itt);
-        iscsi_wr32(p + 20, ttt);
+        const uint8_t flags = (g_r2tProbe.flags >= 0) ? (uint8_t)g_r2tProbe.flags : 0x80;
+        if (g_iscsiTrace) printf("    [iscsi] R2T byte1 = 0x%02X (probe %d)\n", flags, g_r2tProbe.flags);
         // StatSN is NOT incremented here, and that was tested rather than assumed.
         //
-        // The R2T this target sends is rejected by Windows as "an invalid iSCSI PDU"
+        // The R2T this target sends was rejected by Windows as "an invalid iSCSI PDU"
         // (iScsiPrt event 23, with the header dumped), and the dump and this code
         // were compared byte for byte: opcode 0x31, flags 0, DataSegmentLength 0,
         // LUN 0, ITT echoed, TTT 1, StatSN, ExpCmdSN, MaxCmdSN, R2TSN 0, Buffer
         // Offset 0, Desired Data Transfer Length 65536 - every field of RFC 7143
-        // section 11.9 in the right place with a sane value.  Layout is therefore
+        // section 11.8 in the right place with a sane value.  Layout is therefore
         // not the problem.
         //
         // The first hypothesis was the sequence number: Windows accepted every PDU
@@ -960,12 +1063,8 @@ private:
         // not, so the R2T was changed to statSn++.  Windows rejected it exactly the
         // same way, so that hypothesis is dead and the RFC reading (an R2T carries
         // the current StatSN) is what this code does.
-        iscsi_wr32(p + 24, statSn);
-        iscsi_wr32(p + 28, expCmdSn);
-        iscsi_wr32(p + 32, r2tMaxCmd);
-        iscsi_wr32(p + 36, r2tSn);
-        iscsi_wr32(p + 40, offset);
-        iscsi_wr32(p + 44, len);
+        iscsiBuildR2T(p, itt, ttt, statSn, expCmdSn, r2tMaxCmd, r2tSn, offset, len);
+        p[1] = flags;                       // the builder's default is 0x80; the probe can override it
         // Traced because a write that stalls is otherwise invisible: the command
         // arrives, no response follows, and nothing in the log says whether an R2T
         // ever went out.  A 64 KiB WRITE(10) the initiator never answers looks
@@ -1023,16 +1122,7 @@ private:
         return sendAll(req.raw, 48);
     }
 
-    // ---- sense builders ----
-    static uint32_t buildSense(uint8_t* s, uint8_t key, uint8_t asc, uint8_t ascq) {
-        memset(s, 0, 18);
-        s[0] = 0x70;            // fixed format, current error
-        s[2] = key;
-        s[7] = 10;              // additional sense length
-        s[12] = asc;
-        s[13] = ascq;
-        return 18;
-    }
+    // ---- sense: iscsiBuildSense lives at file scope so it can be unit-tested ----
 
     // ---- the session ----
     bool session(IscsiBackend& be, std::vector<uint8_t>& scratch);
@@ -1083,6 +1173,20 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
                 // next command.
                 std::lock_guard<std::mutex> lock(backendMutex());
                 if (be.lost()) return false;
+                // And where a parked write that stopped making progress is given up on.
+                // The table is bounded, so a stuck write cannot grow memory - but it
+                // would hold its buffer, and this session, until TCP noticed.  The
+                // initiator has its own 60 s request hold plus a 15 s SRB timeout, so a
+                // longer grace period here means we only ever fire on a peer that is
+                // really gone, never on one that is merely slow.
+                const uint64_t now = GetTickCount64();
+                if (PendingWrite* stuck = pending_.stalled(now, kWriteStallMs)) {
+                    printf("  [iscsi] parked WRITE itt 0x%08X stalled: %u of %u byte(s) "
+                           "received, no Data-Out for %llu ms -> ending the session\n",
+                           stuck->itt, stuck->received, stuck->bytes,
+                           (unsigned long long)(now - stuck->lastDataMs));
+                    return false;
+                }
                 continue;
             }
             if (r < 0) return false;
@@ -1233,6 +1337,7 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
                 //  in separate Data-Out PDUs - one shape to receive instead of two.
                 // ------------------------------------------------------------------
                 const std::string peerIr2t = t.get("InitialR2T");
+                const std::string peerImmed = t.get("ImmediateData");
                 const std::string peerFbl  = t.get("FirstBurstLength");
                 // ---- THE FIX (DESIGN 8.63) -------------------------------------------
                 // Answer EXACTLY what the reference target answers: InitialR2T=Yes
@@ -1250,17 +1355,26 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
                 //
                 // InitialR2T is OR-negotiated, so Yes is always legal to answer; it
                 // is what the initiator offered here anyway (it offers No) and Yes
-                // simply wins the OR.
-                std::string ir2tAnswer = "Yes";
-                if (g_r2tProbe.ir2t == 0) ir2tAnswer = "No";
+                // simply wins the OR.  The RULE is applied rather than assumed:
+                // iscsiBoolOr(offer, ours), which is what LIO does and what
+                // iscsi_selftest.cpp pins.
+                std::string ir2tAnswer = iscsiBoolOr(peerIr2t, "Yes");
+                if (g_r2tProbe.ir2t == 0) ir2tAnswer = "No";    // -iscsir2tcfg A/B
                 if (!peerIr2t.empty()) offer("InitialR2T", ir2tAnswer);
-                offer("ImmediateData", g_r2tProbe.immed == 0 ? "No" : "Yes");
+                // ImmediateData is AND-negotiated: Yes only if both sides say Yes.
+                // This target's own answer is Yes (the reference's, and what makes
+                // Windows deliver the first burst inside the command PDU before it
+                // honours an R2T); the peer's offer still has a veto, which is the
+                // difference between AND and OR spelled out at the call site.
+                offer("ImmediateData",
+                      iscsiBoolAnd(peerImmed.empty() ? "Yes" : peerImmed,
+                                   g_r2tProbe.immed == 0 ? "No" : "Yes"));
                 if (ir2tAnswer == "No") {
                     // Negotiated FirstBurstLength is the smaller of the two values
                     // (iscsi_check_acceptor_state(), number case: proposer > acceptor
                     // means the acceptor's value wins).  A number key may only be
                     // lowered by the responder, so answer the smaller one.
-                    uint32_t fbl = peerFbl.empty() ? 65536u : (uint32_t)atoi(peerFbl.c_str());
+                    uint32_t fbl = iscsiNumberMin(peerFbl, 65536u);
                     if (fbl < 512u) fbl = 512u;              // RFC 7143 s13.14 range
                     if (fbl > 65536u) fbl = 65536u;          // one Data-Out PDU's worth
                     if (fbl > g_iscsiMaxBurst) fbl = g_iscsiMaxBurst;
@@ -1324,11 +1438,15 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
             }
             // The initiator's MaxRecvDataSegmentLength is what WE may put in one
             // Data-In PDU: the key declares what the sender can receive, so their
-            // value caps our reads and ours caps their writes.
-            std::string peer = t.get("MaxRecvDataSegmentLength");
-            if (!peer.empty()) {
-                uint32_t m = (uint32_t)atoi(peer.c_str());
-                if (m >= 512 && m < maxChunk) maxChunk = m;
+            // value caps our reads and ours caps their writes.  Named for the key, not
+            // "peer": the outer scope already has a `peer` (the initiator's address),
+            // and shadowing it here read like the address being reused as a length.
+            const std::string peerRecv = t.get("MaxRecvDataSegmentLength");
+            if (!peerRecv.empty()) {
+                // Number key: the smaller of the two wins, and this one caps BOTH
+                // directions (the initiator's value caps our Data-In PDUs, ours caps
+                // their Data-Out PDUs), so the negotiated value becomes maxChunk.
+                maxChunk = iscsiNumberMin(peerRecv, maxChunk);
             }
             if (!sendLoginRsp(bhs, 0x00, 0x00, keys)) return false;
             loggedIn = true;
@@ -1524,7 +1642,7 @@ inline bool IscsiTarget::sendInquiry(const IscsiBhs& bhs, IscsiBackend& be, Iscs
         n = 20;
     } else {
         uint8_t s[18];
-        uint32_t sl = buildSense(s, SCSI_SENSE_ILLEGAL_REQUEST, SCSI_ASC_INVALID_FIELD, 0);
+        uint32_t sl = iscsiBuildSense(s, SCSI_SENSE_ILLEGAL_REQUEST, SCSI_ASC_INVALID_FIELD, 0);
         return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
     }
 
@@ -1605,6 +1723,7 @@ inline bool IscsiTarget::handleDataOut(const IscsiBhs& d, const std::vector<uint
     }
     memcpy(pw.buf.data() + (off - pw.chunkOff), payload.data(), len);
     pw.received = off + len;
+    pw.lastDataMs = GetTickCount64();       // progress: the stall guard measures this
     bytesIn += len;
     if (pw.received < pw.wantOff + pw.want) return true;     // more PDUs of this burst
 
@@ -1614,16 +1733,16 @@ inline bool IscsiTarget::handleDataOut(const IscsiBhs& d, const std::vector<uint
         printf("  [iscsi] WRITE lba=%llu blocks=%u failed on the NVMe side\n",
                (unsigned long long)(pw.lba + pw.chunkOff / pw.bs), pw.want / pw.bs);
         const uint32_t itt = pw.itt;
-        pending_.erase(pending_.begin() + (p - pending_.data()));
+        pending_.erase(p);
         uint8_t s[18];
-        const uint32_t sl = buildSense(s, 0x03 /*MEDIUM ERROR*/, 0x0C /*write error*/, 0);
+        const uint32_t sl = iscsiBuildSense(s, 0x03 /*MEDIUM ERROR*/, 0x0C /*write error*/, 0);
         curEdtl = 0;                    // this answer is not about the newest command
         return sendScsiRsp(itt, SCSI_STATUS_CHECK_COND, s, sl, 0, false);
     }
     if (pw.received >= pw.bytes) {
         const uint32_t itt = pw.itt;
         const uint32_t total = pw.bytes;
-        pending_.erase(pending_.begin() + (p - pending_.data()));
+        pending_.erase(p);
         // curEdtl/curDataOut describe the NEWEST command, so the automatic underflow
         // in sendScsiRsp has to be switched off here - this response belongs to a
         // command that arrived earlier.  For a write the bytes received ARE the bytes
@@ -1748,7 +1867,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
         uint64_t bytes = (uint64_t)count * bs;
         if (count == 0 || lba + count > nblocks || bytes > edtl) {
             uint8_t s[18];
-            uint32_t sl = buildSense(s, SCSI_SENSE_ILLEGAL_REQUEST,
+            uint32_t sl = iscsiBuildSense(s, SCSI_SENSE_ILLEGAL_REQUEST,
                                      SCSI_ASC_LBA_OUT_OF_RANGE, 0);
             return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
         }
@@ -1822,7 +1941,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
                 printf("  [iscsi] READ lba=%llu blocks=%u failed on the NVMe side\n",
                        (unsigned long long)curLba, unit / bs);
                 uint8_t s[18];
-                uint32_t sl = buildSense(s, 0x04 /*HARDWARE ERROR*/, 0x11 /*unrecovered read*/, 0);
+                uint32_t sl = iscsiBuildSense(s, 0x04 /*HARDWARE ERROR*/, 0x11 /*unrecovered read*/, 0);
                 return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
             }
             // Hand the staged bytes out as Data-In PDUs, each no larger than what the
@@ -1895,7 +2014,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
                 printf("  [iscsi] immediate data of %u bytes is not a whole number of "
                        "%u-byte blocks\n", imm, bs);
                 uint8_t s[18];
-                uint32_t sl = buildSense(s, 0x05, 0x1A, 0);
+                uint32_t sl = iscsiBuildSense(s, 0x05, 0x1A, 0);
                 return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
             }
             if (scratch.size() < imm) scratch.resize(imm);
@@ -1909,7 +2028,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
                 printf("  [iscsi] WRITE (immediate data) lba=%llu blocks=%u failed on the NVMe side\n",
                        (unsigned long long)lba, imm / bs);
                 uint8_t s[18];
-                uint32_t sl = buildSense(s, 0x03, 0x0C, 0);
+                uint32_t sl = iscsiBuildSense(s, 0x03, 0x0C, 0);
                 return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
             }
         }
@@ -1962,7 +2081,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
                 printf("  [iscsi] first burst of %u bytes is not a whole number of "
                        "%u-byte blocks\n", got, bs);
                 uint8_t s[18];
-                uint32_t sl = buildSense(s, 0x05, 0x1A, 0);   // invalid field in parameter list
+                uint32_t sl = iscsiBuildSense(s, 0x05, 0x1A, 0);   // invalid field in parameter list
                 return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, offset, false);
             }
         }
@@ -1975,12 +2094,12 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
                    "first burst of %u byte(s) drained)\n",
                    (unsigned long long)lba, count, offset);
             uint8_t s[18];
-            uint32_t sl = buildSense(s, SCSI_SENSE_DATA_PROTECT, SCSI_ASC_WRITE_PROTECTED, 0);
+            uint32_t sl = iscsiBuildSense(s, SCSI_SENSE_DATA_PROTECT, SCSI_ASC_WRITE_PROTECTED, 0);
             return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, offset, false);
         }
         if (count == 0 || lba + count > nblocks || bytes > edtl) {
             uint8_t s[18];
-            uint32_t sl = buildSense(s, SCSI_SENSE_ILLEGAL_REQUEST,
+            uint32_t sl = iscsiBuildSense(s, SCSI_SENSE_ILLEGAL_REQUEST,
                                      SCSI_ASC_LBA_OUT_OF_RANGE, 0);
             return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, offset, false);
         }
@@ -1988,7 +2107,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
             printf("  [iscsi] WRITE (first burst) lba=%llu blocks=%u failed on the NVMe side\n",
                    (unsigned long long)lba, offset / bs);
             uint8_t s[18];
-            uint32_t sl = buildSense(s, 0x03 /*MEDIUM ERROR*/, 0x0C /*write error*/, 0);
+            uint32_t sl = iscsiBuildSense(s, 0x03 /*MEDIUM ERROR*/, 0x0C /*write error*/, 0);
             return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, offset, false);
         }
         if (g_iscsiTime && offset) {
@@ -2019,24 +2138,41 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
         // Park it and ask for the remainder.  handleScsi RETURNS here, and the
         // Data-Out PDUs come back through session()'s dispatch - see PendingWrite
         // for why this is state instead of the read loop it replaced.
-        {
-            PendingWrite pw;
-            pw.itt = bhs.itt();
-            pw.lba = lba;
-            pw.bs = bs;
-            pw.bytes = (uint32_t)bytes;
-            pw.received = offset;
-            pw.ttt = nextTtt++;
-            pending_.push_back(std::move(pw));
+        //
+        // A REFUSAL IS AN ANSWER, not an abort.  The table refuses a duplicate ITT
+        // (the initiator reused a tag that is still outstanding, which would make the
+        // Data-Out matching ambiguous) and refuses to grow past the command window it
+        // was told about.  Both mean the initiator broke a rule this target stated, and
+        // the honest response is one CHECK CONDITION for that command - the session
+        // survives, memory stays bounded, and a buggy initiator reports an I/O error
+        // instead of eating this process.
+        const char* why = nullptr;
+        PendingWrite* pw = pending_.add(bhs.itt(), GetTickCount64(), &why);
+        if (!pw) {
+            printf("  [iscsi] REFUSED a parked WRITE (itt 0x%08X, %llu bytes): %s\n",
+                   bhs.itt(), (unsigned long long)bytes, why ? why : "no room");
+            uint8_t s[18];
+            // 0x0B ABORTED COMMAND / 0x00 for "you did this" (duplicate tag),
+            // 0x04 HARDWARE ERROR / 0x44 internal target failure for "we ran out".
+            const bool duplicate = (why && strstr(why, "duplicate") != nullptr);
+            const uint32_t sl = duplicate
+                ? iscsiBuildSense(s, 0x0B /*ABORTED COMMAND*/, 0x00, 0)
+                : iscsiBuildSense(s, 0x04 /*HARDWARE ERROR*/, 0x44 /*internal target failure*/, 0);
+            return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
         }
-        return sendNextR2T(pending_.back());
+        pw->lba = lba;
+        pw->bs = bs;
+        pw->bytes = (uint32_t)bytes;
+        pw->received = offset;
+        pw->ttt = nextTtt++;
+        return sendNextR2T(*pw);
     }
 
     case 0x35:                               // SYNCHRONIZE CACHE(10)
     case 0x91: {                             // SYNCHRONIZE CACHE(16)
         if (be.writable() && !be.flush()) {
             uint8_t s[18];
-            uint32_t sl = buildSense(s, 0x04, 0x11, 0);
+            uint32_t sl = iscsiBuildSense(s, 0x04, 0x11, 0);
             return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
         }
         return sendScsiRsp(bhs.itt(), SCSI_STATUS_GOOD, nullptr, 0, 0, false);
@@ -2048,7 +2184,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
 
     printf("  [iscsi] unsupported SCSI opcode 0x%02X -> CHECK CONDITION\n", op);
     uint8_t s[18];
-    uint32_t sl = buildSense(s, SCSI_SENSE_ILLEGAL_REQUEST, SCSI_ASC_INVALID_OPCODE, 0);
+    uint32_t sl = iscsiBuildSense(s, SCSI_SENSE_ILLEGAL_REQUEST, SCSI_ASC_INVALID_OPCODE, 0);
     return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
 }
 
