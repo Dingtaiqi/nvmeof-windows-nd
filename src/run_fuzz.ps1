@@ -24,22 +24,50 @@ $vs    = if ($env:ND_VS_DIR) { $env:ND_VS_DIR } else { "F:\Microsoft Visual Stud
 $vsdev = "$vs\Common7\Tools\VsDevCmd.bat"
 $rc = 0
 
-# ASAN on Windows needs its runtime DLL findable at run time; cl.exe does not copy it.
-# Searched across VC rather than only VC\Tools\MSVC: the DLL ships with the toolset on
-# some layouts and only in the redist on others, and CI's VS layout is not this machine's.
-# A miss here FAILS the suite instead of quietly skipping the sanitizer, because a fuzz run
-# without the sanitizer is a run that cannot see the thing it exists to see.
-function Add-AsanToPath {
-    $root = Join-Path $vs 'VC'
-    $dll = Get-ChildItem $root -Recurse -Filter 'clang_rt.asan_dynamic-x86_64.dll' -ErrorAction SilentlyContinue |
-           Select-Object -First 1
-    if ($dll) { $env:PATH = "$($dll.DirectoryName);$env:PATH"; return $true }
-    return $false
+# ASAN on Windows needs its runtime DLL findable at run time; cl.exe does NOT copy it next
+# to the exe, and a binary that cannot load it dies with 0xC0000135 (STATUS_DLL_NOT_FOUND) -
+# which my first version reported as "the fuzzer found a failure", on a CI runner where the
+# DLL simply was not where I had guessed (the annotation from that run is what said so).
+#
+# So: ASK THE TOOLCHAIN.  cl.exe sits in the same directory as the ASAN runtime in every
+# MSVC layout (bin\Hostx64\x64), which makes "where is cl" the one answer that does not
+# depend on a layout guess.  Only if that fails is the filesystem searched, and every
+# candidate checked is printed, because a missing runtime must be diagnosable from the CI
+# annotation alone.
+function Find-AsanDll {
+    $tried = New-Object System.Collections.Generic.List[string]
+
+    $clPath = (& cmd.exe /c "call `"$vsdev`" -arch=x64 -no_logo >nul 2>&1 && where cl" 2>&1 |
+               Where-Object { $_ -match 'cl\.exe' } | Select-Object -First 1)
+    if ($clPath) {
+        $dir = Split-Path -Parent $clPath.Trim()
+        $tried.Add($dir)
+        $dll = Join-Path $dir 'clang_rt.asan_dynamic-x86_64.dll'
+        if (Test-Path $dll) { return $dll }
+    } else { $tried.Add("(where cl found nothing under $vsdev)") }
+
+    foreach ($glob in @("$vs\VC\Tools\MSVC\*\bin\Hostx64\x64",
+                        "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.ASAN.RT",
+                        "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.ASAN")) {
+        $tried.Add($glob)
+        $hit = Get-ChildItem $glob -Filter 'clang_rt.asan_dynamic-x86_64.dll' -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    Write-Host "  clang_rt.asan_dynamic-x86_64.dll was not found.  Looked in:"
+    $tried | ForEach-Object { Write-Host "    $_" }
+    return $null
 }
-if (-not (Add-AsanToPath)) {
-    Write-Host "  the ASAN runtime DLL was not found under $vs - cannot judge a fuzz run"
+
+$asanDll = Find-AsanDll
+if (-not $asanDll) {
+    # NOT skipped quietly: a fuzz run without the sanitizer cannot see the thing it exists
+    # to see, so the suite fails and says why rather than reporting a clean run.
+    Write-Host "  the ASAN runtime is missing - cannot judge a fuzz run (see the paths above)"
     exit 1
 }
+$env:PATH = "$(Split-Path -Parent $asanDll);$env:PATH"
+Write-Host "  ASAN runtime: $asanDll"
 
 function Build-Fuzzer([string] $exe, [string] $extra) {
     $obj = [System.IO.Path]::ChangeExtension($exe, '.obj')
