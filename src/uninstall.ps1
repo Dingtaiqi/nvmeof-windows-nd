@@ -1,4 +1,4 @@
-﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #Requires -RunAsAdministrator
 <#
@@ -50,7 +50,23 @@ if ($svc) {
     Write-Host "service $ServiceName is not installed"
 }
 
-# 3. Remove the files.
+# 3. Put the initiator's burst parameters back, if this install changed them.
+#    install.ps1 saved the originals before touching them; restoring is what keeps an
+#    uninstall from leaving a machine quietly reconfigured (DESIGN 8.68).
+$tuneScript = Join-Path $PSScriptRoot 'tune_initiator.ps1'
+$backup = Join-Path $DataDir 'initiator-tuning.json'
+if (Test-Path $backup) {
+    if (Test-Path $tuneScript) {
+        Write-Host "restoring the initiator parameters saved at $backup"
+        & $tuneScript -Restore -SaveFile $backup | ForEach-Object { "  $_" }
+    } else {
+        Write-Host "initiator parameters were tuned by this install, but $tuneScript is gone - not touching the registry"
+    }
+} else {
+    Write-Host "initiator parameters: nothing was saved by install, leaving the registry alone"
+}
+
+# 4. Remove the files.
 if (-not $KeepFiles) {
     foreach ($d in @($InstallDir, $DataDir)) {
         if (Test-Path $d) {

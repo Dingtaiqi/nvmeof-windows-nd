@@ -1,4 +1,4 @@
-﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #Requires -RunAsAdministrator
 <#
@@ -65,6 +65,13 @@ param(
     [int] $MaxBurstLength = 4194304,      # -iscsimbl: one R2T burst / CDB size
     [int] $MaxSegmentLength = 1048576,    # -iscsichunk: one Data-In / Data-Out PDU
 
+    # The OTHER half of the tuning is on Windows' side and lives in the registry, so a
+    # machine that installs without it is silently slow (11.9 MB/s instead of 81.9 on a
+    # 4 MiB read - DESIGN 8.68).  Applying it here is what makes "install it and it is
+    # fast" true; tune_initiator.ps1 saves the originals and uninstall.ps1 restores them,
+    # so it stays reversible.  -NoTuneInitiator leaves the system alone.
+    [switch] $NoTuneInitiator,
+
     [string] $ExeSource = (Join-Path $PSScriptRoot 'f5_interop.exe')
 )
 
@@ -124,6 +131,21 @@ New-Service -Name $ServiceName -BinaryPathName $binPath -DisplayName 'NVMe-oF iS
 # first.  The cmdlet takes the binary path as one string, which is what is needed.
 # Restart on failure, because a bridge that died silently is a missing disk.
 & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/15000/restart/60000 | Out-Null
+
+# Before starting: the initiator's own burst parameters.  Without them the bridge is
+# correct and slow, and the reason is invisible from this side - so they are part of an
+# install, not advice in a README.  tune_initiator.ps1 backs the originals up;
+# uninstall.ps1 puts them back.  It re-enables the iSCSI device instance, which drops
+# any iSCSI session that is up right now - expected during an install.
+if ($NoTuneInitiator) {
+    Write-Host "tuning     : skipped (-NoTuneInitiator); throughput will be a fraction of what the hardware allows"
+} else {
+    Write-Host "tuning     : initiator burst parameters"
+    & (Join-Path $PSScriptRoot 'tune_initiator.ps1') -Apply `
+        -MaxTransferLength $MaxBurstLength -MaxBurstLength $MaxBurstLength `
+        -MaxRecvDataSegmentLength $MaxSegmentLength | ForEach-Object { "             $_" }
+}
+
 Write-Host "installed  : $exe"
 Write-Host "config     : $conf"
 Write-Host "log        : $log"
