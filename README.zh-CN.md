@@ -42,6 +42,7 @@
 | `src/tools_login_probe.ps1` | 把 Windows 真实发出的 iSCSI login **逐字节重放**给任意 target（做 LIO 参考实现的 A/B 对比用） |
 | `src/mount_nvmeof.ps1` | 命名空间 → fixed VHD → 盘符，卸载时回推 |
 | `EVIDENCE-1TB.md` | 1 TB 真盘挂到 Windows 的全部实测输出（含拆除记录） |
+| `ROADMAP.md` | **还差什么才算完备**，写成可排期的工作表：每项的范围、依赖、工作量估算，以及——每一项都有——验收判据；另有里程碑、关键路径，和会改变排序的几个决定 |
 | `ref/linux_nvme.h`、`ref/linux_nvme_rdma.h` | 参考副本，供上面对比与查证 |
 | `linux/` | 对端脚本：`nvmet_setup.sh`（含 rxe 软件 RoCE 与可选 `AUTH_KEY=` 认证）、`f5_linux_up.sh`、`nvmet_teardown.sh`、`f5_dirb_check.sh`（方向 B）、`f5_dirb_auth.sh`（方向 B + 认证）、`f5_dirb_demo.sh`（宽扫描 + 持久化演示）、`f5_nvmet_ref*.sh`（把 nvmet 当规格逐行量参考答案）、`f5_dsm_check.sh`（DSM 的 AD 位到底在哪） |
 
