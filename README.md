@@ -158,8 +158,9 @@ random file keeps its checksum across a remount.
 | `src/f7_faults.cpp` | F7 — fault injection (peer vanishes, and the reverse) |
 | `src/wire_selftest.c` | Byte-level golden self-test, compiled as both C and C++ |
 | `src/xref_constants.py` | Cross-checks every constant against the two Linux reference headers (104 checked pairs, 21 of them DH-HMAC-CHAP). The count is the one the script prints; it grows as the target advertises more |
-| `src/run_all.ps1` | Runs all 12 suites and prints a verdict table (~250 s) |
+| `src/run_all.ps1` | Runs all 14 suites and prints a verdict table (~250 s) |
 | `src/run_f5_auth.ps1` | The six DH-HMAC-CHAP cases (two local ports, no Linux needed) |
+| `src/run_fuzz.ps1` | The iSCSI wire fuzzer, built and run **twice**: 200k mutations under AddressSanitizer (the PDU builders, login text, the negotiation helpers, and the parked-write table driven as an operation sequence), then a second build with a deliberate read one byte past a heap buffer that ASAN **must** catch — if it does not, the suite fails, because a fuzzer that cannot fail looks exactly like one that is not looking. It found a real defect on its first run: a malformed `"12abc"` offer made the number-key negotiation hand back 12 bytes for FirstBurstLength/MaxRecvDataSegmentLength, where RFC 7143 §13.14 puts the floor at 512 (DESIGN §8.75) |
 | `src/run_iscsi.ps1` | The iSCSI layer's own tests with **no hardware and no NIC**: 4-byte padding, the BHS accessors, every PDU builder against exact bytes, login-text parsing, the negotiation rules (InitialR2T is OR, ImmediateData is AND, numbers take the smaller value), the R2T burst sizing that protects the backend's staging buffer, and the parked-write table. `-AllToolsets` compiles it with every MSVC toolset on the machine |
 | `src/hygiene.ps1` | The three repository-wide checks CI runs — SPDX headers on every source file, a UTF-8 BOM on every `.ps1`, no mojibake in the three docs — as a script, so the same code gates a push **and** a local run (`run_all.ps1` calls it). The rules used to live only in `ci.yml`, and a push then went red on a BOM its author had no way to check first |
 | `src/tune_initiator.ps1` | Reads, applies or restores Windows' iSCSI initiator tuning (`MaxTransferLength` / `MaxBurstLength` / `MaxRecvDataSegmentLength`), and reloads the driver the way that actually works. `-Show` / `-Apply` / `-Restore` |
@@ -218,10 +219,13 @@ Individually: `run_xref.ps1`, `run_wire.ps1`, `run_auth.ps1`, `run_f1.ps1`, `run
 `run_f4.ps1`, `run_f5.ps1`, `run_f5_auth.ps1`, `run_iscsi.ps1`, `run_f6.ps1`, `run_f7.ps1`,
 `run_stag.ps1`.
 
-`run_xref.ps1`, `run_wire.ps1`, `run_auth.ps1` and `run_iscsi.ps1` need no NIC and no
-NetworkDirect SDK, which is why CI runs exactly those four (plus `hygiene.ps1`, the three
+`run_xref.ps1`, `run_wire.ps1`, `run_auth.ps1`, `run_iscsi.ps1` and `run_fuzz.ps1` need no NIC
+and no NetworkDirect SDK, which is why CI runs exactly those five (plus `hygiene.ps1`, the three
 repository-wide checks: SPDX headers, UTF-8 BOMs on every `.ps1`, and no mojibake in the docs —
-the same script `run_all.ps1` runs first). `run_auth.ps1` builds
+the same script `run_all.ps1` runs first). `run_fuzz.ps1` builds the wire fuzzer twice: once to
+fuzz 200k mutations under AddressSanitizer, and once with a deliberate out-of-bounds read that
+the sanitizer **must** catch — if that second build passes, the suite fails, because a fuzzer
+that cannot find anything is indistinguishable from one that is not looking. `run_auth.ps1` builds
 `test_auth.cpp` — the DH-HMAC-CHAP primitives and protocol pieces against published vectors — and
 then hands the same exe to `run_authselftest.ps1`, which recomputes the Diffie-Hellman values with
 `System.Numerics.BigInteger` as an independent cross-check. The crypto is therefore verified on

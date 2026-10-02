@@ -28,10 +28,11 @@
 | `src/nvmeof_dhchap.h` | DH-HMAC-CHAP 协议：密钥解析（DHHC-1 + CRC32）、`Kt` 变换、target 半边、host 半边、环回自检 |
 | `src/wire_selftest.c` | 字节级 golden 自检，C 与 C++ 双份编译 |
 | `src/xref_constants.py` | 常量与两份 Linux 参考头文件**逐值比对**（104 对，含 DH-HMAC-CHAP 的 21 个）；这个数字就是脚本自己打印的那个，随着 target 通告的能力增加而增长 |
-| `src/run_all.ps1` | 一次跑完全部 12 套并给结论表（约 180 秒） |
+| `src/run_all.ps1` | 一次跑完全部 14 套并给结论表（约 220 秒） |
 | `src/interop_link.ps1` | 互操作链路：桥接 + 搬 IP/路由 + 降 MTU，失败自动回滚 |
 | `src/f5_session.ps1` | **互操作整场**：链路 → 对端 → 方向 A → discovery → 方向 B → 一份报告文件；`-Auth` 换成带认证的版本 |
 | `src/run_f5_auth.ps1` | DH-HMAC-CHAP 六个用例（本机两口直连，不需要 Linux） |
+| `src/run_fuzz.ps1` | iSCSI wire fuzzer，**编两遍跑两遍**：一遍在 AddressSanitizer 下做 20 万次变异（PDU 构造器、login 文本、协商助手，以及按操作序列驱动的挂起写表），另一遍故意读堆缓冲区后一字节、**要求** ASAN 抓住；抓不到就判套件失败，因为"不会失败的 fuzzer"和"根本没在看"长得一模一样。它第一次跑就抓到真 bug：畸形报价 `"12abc"` 让数字键协商返回 12 字节，而 RFC 7143 §13.14 的下限是 512（DESIGN §8.75） |
 | `src/run_iscsi.ps1` | iSCSI 层自己的测试，**不需要硬件也不需要网卡**：4 字节 padding、BHS 取值器、每个 PDU 构造器对精确字节、login 文本解析、协商规则（InitialR2T 取 OR、ImmediateData 取 AND、数字键取小值）、保护后端 staging 缓冲的 R2T burst 尺寸、挂起写表。`-AllToolsets` 用机器上每个 MSVC 工具集各编一遍 |
 | `src/hygiene.ps1` | CI 的三条仓库级检查——每个源文件有 SPDX 头、每个 `.ps1` 有 UTF-8 BOM、三份文档无乱码——做成脚本，于是**同一份代码既门禁 push 也门禁本地全量**（`run_all.ps1` 第一项就是它）。这些规则原先只写在 `ci.yml` 里，结果一次 push 因为 BOM 变红，而写它的人当时没有任何办法先自查 |
 | `src/tune_initiator.ps1` | 读 / 应用 / 还原 Windows iSCSI initiator 的调优（`MaxTransferLength` / `MaxBurstLength` / `MaxRecvDataSegmentLength`），并用**真正有效**的方式重载驱动。`-Show` / `-Apply` / `-Restore` |
@@ -87,11 +88,14 @@ cd <仓库>\src
 `run_f4.ps1`、`run_f5.ps1`、`run_f5_auth.ps1`、`run_iscsi.ps1`、`run_f6.ps1`、`run_f7.ps1`、
 `run_stag.ps1`。
 
-`run_xref.ps1`、`run_wire.ps1`、`run_auth.ps1` 和 `run_iscsi.ps1` 不需要网卡也不需要
-NetworkDirect SDK，所以 CI 跑的正是这四套（外加 `hygiene.ps1` 这三条仓库级检查：SPDX 头、
+`run_xref.ps1`、`run_wire.ps1`、`run_auth.ps1`、`run_iscsi.ps1` 和 `run_fuzz.ps1` 不需要网卡也不需要
+NetworkDirect SDK，所以 CI 跑的正是这五套（外加 `hygiene.ps1` 这三条仓库级检查：SPDX 头、
 每个 `.ps1` 的 UTF-8 BOM、三份文档无乱码——它也是 `run_all.ps1` 的第一项）。
 `run_iscsi.ps1` 把 iSCSI 层按同样方式钉住：没有 target、没有 initiator、
 没有 RDMA，直接驱动 PDU 构造器、login 文本、协商规则与挂起写表。
+`run_fuzz.ps1` 把 wire fuzzer **编两遍**：一遍在 AddressSanitizer 下跑 20 万次变异，另一遍故意越界读
+一个字节、**要求** sanitizer 抓住它 —— 那一遍如果通过，套件判失败，因为"找不到东西的 fuzzer"和
+"根本没在看"的 fuzzer 长得一模一样。
 
 每套的规则都一样：**删掉旧 exe → 看编译退出码 → 比对源码与头文件时间戳**，
 绝不运行"看起来还在"的旧二进制（这条是从一次真实事故里来的，见 DESIGN §8.6）。

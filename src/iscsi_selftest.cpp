@@ -240,6 +240,14 @@ static void test_negotiation(void) {
     CHECK_EQ_U32(iscsiNumberMin("0", 65536), 65536, "a zero offer is not a constraint");
     CHECK_EQ_U32(iscsiNumberMin("not-a-number", 65536), 65536, "garbage offer: ours stands");
     CHECK_EQ_U32(iscsiNumberMin("512", 65536), 512, "the RFC 7143 s13.14 minimum is respected");
+    // Below the minimum is UNUSABLE, not a small value.  Found by the wire fuzzer: a peer
+    // offering "12abc" made atol() return 12, and this helper handed back a 12-byte
+    // FirstBurstLength / MaxRecvDataSegmentLength (iscsi_fuzz.cpp, seed 0x5EED1234).
+    CHECK_EQ_U32(iscsiNumberMin("12", 65536), 65536, "a 12-byte offer is below the minimum: ignored");
+    CHECK_EQ_U32(iscsiNumberMin("511", 65536), 65536, "511 is one below the minimum: ignored");
+    CHECK_EQ_U32(iscsiNumberMin("513", 65536), 513, "513 is above the minimum: it wins");
+    CHECK_EQ_U32(iscsiNumberMin("12abc", 65536), 65536, "a malformed offer is not a number");
+    CHECK_EQ_U32(iscsiNumberMin("-512", 65536), 65536, "a negative offer is not a constraint");
 }
 
 // ---------------------------------------------------------------------------

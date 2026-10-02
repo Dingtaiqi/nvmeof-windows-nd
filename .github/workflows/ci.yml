@@ -155,6 +155,26 @@ jobs:
             throw "run_iscsi.ps1 failed (rc=$rc)"
           }
 
+      # The wire fuzzer, and the reason it can be trusted: it is built TWICE.  The second
+      # build (-DFUZZ_PROVE_DETECTION) performs one deliberate read past the end of a heap
+      # buffer and REQUIRES AddressSanitizer to catch it - if that build exits 0, the suite
+      # fails, because a fuzzer that cannot find anything looks exactly like a fuzzer that
+      # is not looking.  The iteration count is fixed so the step's cost is bounded and a
+      # failure can be replayed from the seed it prints.
+      - name: iSCSI wire fuzz, with the harness proved able to fail
+        working-directory: src
+        shell: pwsh
+        run: |
+          $out = & .\run_fuzz.ps1 -Iterations 200000 *>&1 | Out-String
+          $rc = $LASTEXITCODE
+          $out -split "`r?`n" | ForEach-Object { Write-Host $_ }
+          if ($rc -ne 0) {
+            ($out -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 12) | ForEach-Object {
+              Write-Host ("::error::" + ((($_ -replace '%','%25') -replace "`r",'') -replace "`n",' '))
+            }
+            throw "run_fuzz.ps1 failed (rc=$rc)"
+          }
+
       # DH-HMAC-CHAP, and it is here because it CAN be: test_auth.cpp includes only
       # nvmeof_auth.h and nvmeof_dhchap.h, which need bcrypt and wincrypt and no
       # NetworkDirect SDK.  Before this suite existed the crypto self-test was

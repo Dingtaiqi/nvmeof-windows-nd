@@ -347,10 +347,24 @@ static inline std::string iscsiBoolAnd(const std::string& offer, const std::stri
 }
 // The negotiated value of a number key: the smaller of the two, with an absent or
 // unusable offer meaning "no constraint from that side".
+//
+// A BELOW-MINIMUM OFFER IS UNUSABLE, NOT A VALUE.  RFC 7143 section 13.14 gives every
+// number key a minimum - 512 for both keys this helper is used on (FirstBurstLength and
+// MaxRecvDataSegmentLength)- and a peer that offers less than that is malformed, not
+// modest.  Taking it literally means negotiating a 12-byte burst or PDU size off a peer
+// that sent "12abc", which atol() happily reads as 12.  Measured by the wire fuzzer
+// (iscsi_fuzz.cpp, seed 0x5EED1234 iteration 30) as the first real defect that harness
+// found; the tolerant answer matches this function's existing contract for garbage, 0 and
+// negative offers.  If a key with a smaller minimum is ever negotiated through here, the
+// floor has to become a parameter rather than a constant - both current call sites are
+// 512, so it is written here once and pinned by the self-test.
+static const long kNumberKeyMin = 512;
+
 static inline uint32_t iscsiNumberMin(const std::string& offer, uint32_t ours) {
     if (offer.empty()) return ours;
     const long v = atol(offer.c_str());
     if (v <= 0) return ours;
+    if (v < kNumberKeyMin) return ours;          // below the spec minimum: no constraint
     return ((uint32_t)v < ours) ? (uint32_t)v : ours;
 }
 

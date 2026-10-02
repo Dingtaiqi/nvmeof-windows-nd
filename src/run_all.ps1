@@ -20,7 +20,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $src = $PSScriptRoot
-$all = @('hygiene.ps1', 'run_xref.ps1', 'run_wire.ps1', 'run_iscsi.ps1', 'run_auth.ps1', 'run_f1.ps1', 'run_f3.ps1',
+$all = @('hygiene.ps1', 'run_xref.ps1', 'run_wire.ps1', 'run_iscsi.ps1', 'run_fuzz.ps1', 'run_auth.ps1', 'run_f1.ps1', 'run_f3.ps1',
          'run_f4.ps1', 'run_f5.ps1', 'run_f5_auth.ps1', 'run_f6.ps1', 'run_f7.ps1',
          'run_stag.ps1')
 $scripts = if ($Only.Count -gt 0) { $Only } else { $all }
