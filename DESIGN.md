@@ -4503,6 +4503,102 @@ no UTF-8 BOM: src/uninstall.ps1
 静态文件方法按**进程工作目录**解析（不是 PowerShell 的当前位置），于是从别处运行时每个文件都报
 "missing"，输出一片假红。**假失败比没有检查更糟**——它训练读者忽略输出。
 
+---
+
+### 8.72 ✅ 三项"不依赖 Linux"的工程落地：写状态机收紧、无硬件自测进 CI、调优做成可装可还
+
+§8.63/8.64 记的是**怎么发现**写状态机的问题；这一节记的是**收紧之后的三条规则**、给 iSCSI 层配的
+无硬件自测套件（以及它抓到的第一个真 bug），和把 initiator 调优从 README 的"配方"变成安装的一部分。
+
+#### (1) 挂起写表的三条规则：有界、拒重复、超时放弃
+
+写不进命令 PDU 的 WRITE 不再阻塞在 `handleScsi()` 里，而是按 ITT 挂起成状态（`PendingWrite`）。
+挂起就必须回答三个问题，三个都有明确答案：
+
+| 规则 | 触发 | 处理 |
+|---|---|---|
+| **一个 ITT 一条** | 同一 ITT 再次到达 | 拒绝，回 CHECK CONDITION `0x0B/0x00`（ABORTED COMMAND） |
+| **表有界** | 挂起数达到命令窗口（`kCmdWindow = 8`） | 拒绝，回 CHECK CONDITION `0x04/0x44`（HARDWARE ERROR / internal target failure） |
+| **卡死写有超时** | 60 s 内没有任何 Data-Out（`kWriteStallMs`） | 结束会话，而不是继续持有缓冲和这条会话 |
+
+**60 s 不是拍的**：initiator 自己的 `MaxRequestHoldTime` 是 60 s、`SrbTimeoutDelta` 是 15 s，
+所以取一个**更长**的宽限期，只会在对端真的消失时触发，绝不会打在"只是慢"的对端身上。
+
+第一条规则的理由比听起来具体：两条同 ITT 的挂起项会让 `find()` 产生歧义，第二笔写的 Data-Out
+会被拷进第一笔的缓冲——这不是理论问题，它就是下面那个 use-after-free 的邻居。
+
+#### (2) 表被抽成可单测的单元，而它**第一次运行就抓到了真 bug**
+
+`struct PendingWrite` / `class PendingWrites` 移进 `nvmeof_iscsi_pending.h`（`add` / `find` /
+`erase` / `stalled` / `bufferedBytes` / `clear` / `all`），于是它可以脱离 socket、脱离 NVMe、
+脱离 Windows 被直接驱动。
+
+第一次跑就红了：`add()` 返回的指针在下一次 `add()` 之后失效——底层是 `std::vector`，扩容会把
+元素搬走，而调用方一直握着那个指针。自检抓到的是 `131072` 对 `393216` 字节这类具体数字，不是
+"结果不对"。改成 `std::deque`（追加不使已有元素的指针失效）之后才过。
+
+**这是这个项目里自检第一次抓到真 bug**，而不是确认一个已经知道答案的结论——这也是给它单独建一个
+套件的理由（下一节）。
+
+#### (3) 无硬件自测套件（`src/iscsi_selftest.cpp` + `run_iscsi.ps1`），并且进了 CI
+
+覆盖范围（每一组都能单独失败）：
+
+- **padding 与 BHS**：4 字节对齐规则、48 字节头里每个字段的取值器；
+- **每个 PDU 构造器对精确字节**：BHS、R2T（byte 1 = 0x80）、SCSI Response、Data-In（只有最后一个
+  带 F）、Sense（`0x70` 固定格式 + 18 字节 + ASC）；
+- **login 文本**：解析与生成（Windows 的两键 NUL 分隔形式，`:1` 后缀）；
+- **协商语义**：`iscsiBoolOr`（InitialR2T：Yes 赢）、`iscsiBoolAnd`（ImmediateData：有一个 No 就 No）、
+  `iscsiNumberMin`（取小），外加**缺失 / 0 / 垃圾字符串**三种输入；
+- **R2T burst 尺寸**：7 项，含"4 MiB burst 打 256 KiB 缓冲"这个越界回归（§8.70(5)）；
+- **挂起写表与整条 4 MiB 写流程**的记账。
+
+**前提是这些东西得是纯函数。** 为此把构造器与规则抽到文件作用域：`iscsi_pad4`、`iscsiBuildBhs`、
+`iscsiBuildR2T`、`iscsiBuildScsiRsp`、`iscsiBuildDataIn`、`iscsiBuildSense`、`iscsiBoolOr`、
+`iscsiBoolAnd`、`iscsiNumberMin`、`iscsiBurstSize`，`sendR2T` / `sendScsiRsp` / `sendDataIn` 改为
+调用它们。否则"测试"只能是把手写字节再抄一遍——那测的是抄写，不是实现。
+
+它已经证明过自己两次：**(2) 的 vector use-after-free**，以及写 §8.70(5) 检查时**我自己写错的
+预期值**（`iscsiBurstSize(1000000, …, bs=512)` 我写了 1000000，实际 999936）。
+
+CI 侧：`run_iscsi.ps1 -AllToolsets`（本机两个 MSVC 工具集都编一遍，正是那次 C4127 教训的产物），
+失败时按 §8.69 的规则发 `::error::` annotation。它**不需要网卡、不需要 ND SDK**，所以它和
+`run_xref` / `run_wire` / `run_auth` 一起，是 push 时真正会跑的四套。
+
+#### (4) initiator 调优：从"README 里的一段配方"变成安装的一部分
+
+原先 README 写的是"去改这个注册表键、然后重载"——这类配方有两个现实问题：**没人会执行**，
+以及**执行错了会得出错误结论**（这三个值只在设备实例重新启用时生效，`Restart-Service msiscsi`
+不够；照着做一遍再测，会看到"调了没用"）。
+
+现在是一个脚本 `src/tune_initiator.ps1`：
+
+- `-Show` 打印当前值（含"设备实例是靠 `DriverDesc -eq 'Microsoft iSCSI Initiator'` 找到的"这件事，
+  不去猜 `\0009` 这个后缀——它在别的机器上不一定是 9）；
+- `-Apply` 写入 `MaxTransferLength` / `MaxBurstLength` / `MaxRecvDataSegmentLength`，然后用
+  `Disable-PnpDevice` + `Enable-PnpDevice` 重载（`-NoReload` 可跳过）；
+- `-Restore` 从备份还原；
+- 原始值**一次性**备份到 `%ProgramData%\nvmeof-windows-nd\initiator-tuning.json`：文件已存在就
+  永不覆盖，所以反复 `-Apply` 不会把"已经调过的值"记成原始值（这类基线棘轮在 §7 的 MTU 那条上
+  已经付过一次代价）。
+
+接线是双向的：`install.ps1` 调用 `-Apply`（`-NoTuneInitiator` 可跳过，并会说明"吞吐会只有硬件
+允许的一小部分"），`uninstall.ps1` 调用 `-Restore`。**所以卸载会把机器还原**，而不是留下一台被
+改过注册表的机器。
+
+#### (5) 复现
+
+```powershell
+cd <repo>\src
+.\run_iscsi.ps1 -AllToolsets      # (2)(3)：无硬件自测
+.\tune_initiator.ps1 -Show        # (4)：当前值
+.\tune_initiator.ps1 -Apply       #     应用 + 重载
+.\tune_initiator.ps1 -Restore     #     还原
+.\hygiene.ps1                     # §8.71 的三条卫生检查
+```
+
+本机全量门禁：**13 / 13 套通过，181 秒**（`run_all.ps1`，hygiene 为第一项）。
+
 ## 7. 已知风险
 
 | 风险 | 说明 | 缓解 |
