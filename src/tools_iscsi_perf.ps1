@@ -28,6 +28,14 @@ param(
     [string]   $ServerIp   = '192.168.100.2',
     [string]   $LocalIp    = '192.168.100.3',
     [int]      $IscsiPort  = 3260,
+    # Burst sizes, defaulting to the tuned values from DESIGN 8.68: they are the
+    # difference between 11.9 and 81.9 MB/s on a 4 MiB read, so measuring anything else
+    # by default would measure a configuration nobody deploys.  They only take effect
+    # if the initiator's registry agrees (MaxBurstLength / MaxRecvDataSegmentLength
+    # under the Microsoft iSCSI Initiator class key) AND that device instance has been
+    # re-enabled since the registry last changed.
+    [int]      $MaxBurstLength = 4194304,
+    [int]      $MaxSegmentLength = 1048576,
     [switch]   $ReadWrite,
     [switch]   $KeepRunning
 )
@@ -89,7 +97,8 @@ Remove-Item $beLog, $brLog -ErrorAction SilentlyContinue
 Start-Process -FilePath $exe -ArgumentList @('-target', $ServerIp, '4420', '-serve', '0', '-nsfile', $NsFile) `
     -RedirectStandardOutput $beLog -RedirectStandardError "$beLog.err" -WindowStyle Hidden | Out-Null
 Start-Sleep -Seconds 3
-$brArgs = @('-initiator', $ServerIp, '4420', $LocalIp, '-iscsi', "$IscsiPort", '-iscsitime')
+$brArgs = @('-initiator', $ServerIp, '4420', $LocalIp, '-iscsi', "$IscsiPort", '-iscsitime',
+            '-iscsimbl', "$MaxBurstLength", '-iscsichunk', "$MaxSegmentLength")
 if ($ReadWrite) { $brArgs += '-iscsirw' }
 Start-Process -FilePath $exe -ArgumentList $brArgs `
     -RedirectStandardOutput $brLog -RedirectStandardError "$brLog.err" -WindowStyle Hidden | Out-Null
@@ -121,6 +130,18 @@ foreach ($c in $Chunks) {
 if ($Concurrent -gt 0) {
     $chunk = ConvertTo-Bytes $Chunks[-1]
     $per = [long]($Total)
+    # Each reader gets its own offset, so N readers need N x per bytes of namespace.
+    # Without this the far end of the sweep lands past the last block and the readers
+    # fail with "the drive cannot find the requested sector" - which reads like a bridge
+    # bug and is not one (measured: it produced a 5.2 MB/s "aggregate").
+    $nsBytes = 0
+    $dsk = Get-Disk -Number $Drive -ErrorAction SilentlyContinue
+    if ($dsk) { $nsBytes = [long]$dsk.Size }
+    if ($nsBytes -gt 0 -and ($per * $Concurrent) -gt $nsBytes) {
+        $per = [long][Math]::Floor($nsBytes / $Concurrent)
+        $per = $per - ($per % $chunk)
+        Write-Host ("             namespace is only {0:N0} MiB; using {1:N0} MiB per reader" -f ($nsBytes / 1MB), ($per / 1MB))
+    }
     Write-Host ("  {0} concurrent readers, {1} blocks each:" -f $Concurrent, $Chunks[-1])
     $jobs = 1..$Concurrent | ForEach-Object {
         $off = [long](($_ - 1) * $per)
