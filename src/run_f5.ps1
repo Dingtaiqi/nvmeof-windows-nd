@@ -89,19 +89,69 @@ Remove-Item $cliOut -ErrorAction SilentlyContinue
 
 $srv = $null
 $srvOut = "$src\f5_srv.txt"
+# A PORT OF OUR OWN FOR THE LOCAL PAIR.
+#
+# $port keeps its meaning for the -initiatorOnly case, where the peer is the Linux box
+# listening on 4420 and the README documents reaching it by default.  For the local pair
+# both ends belong to this script, so the only requirement is a port nothing else uses -
+# and 4420 is precisely the one thing it must not be: it is what the ad-hoc measurement
+# sessions in this repository use for the bridge's backend, and a process force-killed
+# while it owned that listener leaves the RDMA-CM port unusable in a way that neither a
+# process list nor netstat shows (DESIGN 8.74(7)).  Measured while 4420 refused every
+# connection: f1/f3/f4 ran happily on 543xx over the same two adapters, and 4421 bound
+# and served normally throughout.
+$localPort = if ($initiatorOnly) { $port } else { 54370 }
 if (-not $initiatorOnly) {
-    Remove-Item $srvOut -ErrorAction SilentlyContinue
-    $srvArgs = @("-target", $serverIp, "$port")
-    if ($TargetAuthKey -ne "") {
-        $srvArgs += @("-authkey", $TargetAuthKey, "-authdhgroup", "$TargetDhGroup")
+    # A DIRTY RDMA-CM PORT MUST NOT LOOK LIKE A TEST FAILURE.
+    #
+    # The listener's port belongs to the ND provider, not to a process: when a process
+    # that owned it is killed with -Force the port can stay stuck in
+    # STATUS_SHARING_VIOLATION, and nothing shows it - no process, no netstat entry.
+    # The symptom then appears in the NEXT run as an INITIATOR-side ND_CONNECTION_REFUSED,
+    # which reads like "the target never started" and sends the reader after the wrong
+    # bug (DESIGN 8.74(7) is that afternoon).  This script makes it worse for itself:
+    # the loop above force-kills leftovers, and if one of them held the port, the bind
+    # three lines later fails.
+    #
+    # Measured on this machine: 4420 was unusable for every later run while 4421 bound
+    # normally throughout, and restarting the adapter cleared it.  So instead of
+    # depending on a clean port, walk to the next one - the target prints
+    # "listener Bind 0xC0000043" and exits, which is a clean failure, not a hang.
+    for ($try = 0; $try -le 3; $try++) {
+        Remove-Item $srvOut -ErrorAction SilentlyContinue
+        $srvArgs = @("-target", $serverIp, "$localPort")
+        if ($TargetAuthKey -ne "") {
+            $srvArgs += @("-authkey", $TargetAuthKey, "-authdhgroup", "$TargetDhGroup")
+        }
+        $srv = Start-Process -FilePath $exe -ArgumentList $srvArgs `
+                -PassThru -RedirectStandardOutput $srvOut
+        # A FIXED SLEEP IS A RACE, AND IT IS STILL HERE ON PURPOSE.
+        #
+        # The target now prints "[listener armed] <ip>:<port> is accepting connections"
+        # once the listener really is up, which is what this should wait for.  A wait
+        # loop was written and REVERTED because it could not be verified: with stdout
+        # redirected to a file this program's output is block-buffered, so the armed line
+        # can be invisible to the reader for as long as the target runs (measured - the
+        # line appeared in f5_srv.txt only after the target was killed, even though the
+        # target had printed it).  A wait that cannot see the line reports "the target
+        # never armed" while it demonstrably had, which is a worse failure than a sleep.
+        # Making this reliable means unbuffering the target's stdout when it is not a
+        # console; that is a change to the program, not to this script.
+        Start-Sleep -Seconds 2
+        $bindFail = $false
+        if (Test-Path $srvOut) {
+            $txt = Get-Content $srvOut -Raw -ErrorAction SilentlyContinue
+            if ($txt -match 'listener Bind') { $bindFail = $true }
+        }
+        if (-not $bindFail) { break }
+        if ($srv -and -not $srv.HasExited) { $null = $srv.WaitForExit(5000) }
+        $port++
+        Write-Host "  the listener port was held by a previous run; retrying on $port"
     }
-    $srv = Start-Process -FilePath $exe -ArgumentList $srvArgs `
-            -PassThru -RedirectStandardOutput $srvOut
-    Start-Sleep -Seconds 2
 }
 
-Write-Host "===== f5_interop  $clientLocalIp -> $serverIp`:$port  (subnqn $subnqn)"
-$cliArgs = @("-initiator", $serverIp, "$port", $clientLocalIp,
+Write-Host "===== f5_interop  $clientLocalIp -> $serverIp`:$localPort  (subnqn $subnqn)"
+$cliArgs = @("-initiator", $serverIp, "$localPort", $clientLocalIp,
              "-subnqn", $subnqn, "-hostnqn",
              "nqn.2014-08.org.nvmexpress:uuid:ndvmeof-f5-0001",
              "-queues", "$queues")

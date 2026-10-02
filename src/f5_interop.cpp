@@ -1383,6 +1383,26 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
                        idCntlid == cntlid && kas != 0 && ioccsz >= 4 && iorcsz >= 1 && maxcmd != 0, d);
                 Report("the target advertises the keyed SGLs this host sends",
                        (sgls & NVMEOF_CTRL_SGLS_KEYED) != 0, d);
+                // THE CAPABILITY BITS ARE A PROMISE, SO READ THEM BACK AND CHECK THEM.
+                // ONCS is what makes a host's block layer offer discard and
+                // write-zeroes at all; a bit set for a command the target has no case
+                // for is worse than no bit, because the host acts on it.  This asserts
+                // both halves at once: the two commands we do answer are advertised,
+                // and the four we do not are absent (DESIGN 8.74).
+                uint16_t oncs = nvmeof_rd16(idb + NVMEOF_ID_CTRL_OFF_ONCS);
+                sprintf_s(d, "oncs=0x%04X dsm=%d write-zeroes=%d compare=%d wu=%d resv=%d ts=%d",
+                          oncs, (oncs & NVMEOF_CTRL_ONCS_DSM) ? 1 : 0,
+                          (oncs & NVMEOF_CTRL_ONCS_WRITE_ZEROES) ? 1 : 0,
+                          (oncs & NVMEOF_CTRL_ONCS_COMPARE) ? 1 : 0,
+                          (oncs & NVMEOF_CTRL_ONCS_WRITE_UNCOR) ? 1 : 0,
+                          (oncs & NVMEOF_CTRL_ONCS_RESERVATIONS) ? 1 : 0,
+                          (oncs & NVMEOF_CTRL_ONCS_TIMESTAMP) ? 1 : 0);
+                Report("the controller advertises deallocate/write-zeroes, and nothing it cannot answer",
+                       (oncs & (NVMEOF_CTRL_ONCS_DSM | NVMEOF_CTRL_ONCS_WRITE_ZEROES)) ==
+                               (NVMEOF_CTRL_ONCS_DSM | NVMEOF_CTRL_ONCS_WRITE_ZEROES) &&
+                           (oncs & (NVMEOF_CTRL_ONCS_COMPARE | NVMEOF_CTRL_ONCS_WRITE_UNCOR |
+                                    NVMEOF_CTRL_ONCS_RESERVATIONS | NVMEOF_CTRL_ONCS_TIMESTAMP)) == 0,
+                       d);
             } else {
                 printf("    (discovery controller: ioccsz/iorcsz are 0 by design)\n");
             }
@@ -1431,6 +1451,19 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
         sprintf_s(d, "nsze=%llu blocks, lbaf[0].ds=%u (%u B)", (unsigned long long)nsze,
                   lbads, 1u << lbads);
         Report("Identify CNS 0 (namespace geometry)", ok && nsze != 0, d);
+        // The namespace-side half of the deallocate promise.  ONCS.DSM says "send me
+        // a deallocate"; NSFEAT bit 0 says "a deallocated block reads as something
+        // defined".  A host wants both before it enables discard on the namespace, so
+        // both are checked here rather than assumed from the controller bits.
+        if (ok) {
+            uint8_t  nsfeat = idb[NVMEOF_ID_NS_OFF_NSFEAT];
+            uint8_t  dlfeat = idb[NVMEOF_ID_NS_OFF_DLFEAT];
+            uint16_t npdg   = nvmeof_rd16(idb + NVMEOF_ID_NS_OFF_NPDG);
+            sprintf_s(d, "nsfeat=0x%02X thin=%d dlfeat=%u npdg=%u (0-based blocks)",
+                      nsfeat, (nsfeat & NVMEOF_NS_FEAT_THIN) ? 1 : 0, dlfeat, npdg);
+            Report("the namespace advertises thin provisioning (the other half of discard)",
+                   (nsfeat & NVMEOF_NS_FEAT_THIN) != 0, d);
+        }
         if (ok) printf("    the I/O size below follows the target's own block size\n");
     }
 
@@ -2459,15 +2492,62 @@ static void fillIdentifyCtrl(uint8_t* id, const F5State& st) {
     // No volatile write cache: the namespace is this process's memory.  A host
     // that sees VWC=0 does not need to flush before an unmount, but Flush is
     // answered anyway.
-    id[NVMEOF_ID_CTRL_OFF_VWC] = 0;
+    // VOLATILE WRITE CACHE: CONDITIONED ON THE BACKING, BECAUSE THE TWO BACKINGS
+    // MAKE OPPOSITE PROMISES.
+    //
+    // VWC = 0 tells a host "a completed write is already durable, you need not
+    // flush".  For a file-backed namespace that is FALSE here: writes land in this
+    // process's RAM cache and only FLUSH writes them back to the file (that is the
+    // whole point of -nsfile), so a host that trusted VWC = 0 could unmount without
+    // a flush and lose bytes it was told were safe.  nvmet reports 1 for the same
+    // reason - it sits on a real block device (f3_io.cpp has recorded that since the
+    // first target).
+    //
+    // A memory-only namespace is the case the older comment was written for: Flush
+    // has nothing to write anywhere, so the honest value there is 0 and the host's
+    // flush path stays off the critical path.  The four F-suites with in-memory
+    // namespaces (f3/f6/f7 and f1/f4, which chose 1) are unchanged.
+    id[NVMEOF_ID_CTRL_OFF_VWC] = g_nsFile ? 1 : 0;
     nvmeof_wr16(id + NVMEOF_ID_CTRL_OFF_KAS, 1);
     nvmeof_wr32(id + NVMEOF_ID_CTRL_OFF_SGLS, NVMEOF_CTRL_SGLS_ADVERTISED);
+    // ONCS: WHAT WE ANSWER, NOT WHAT WOULD LOOK GOOD.
+    //
+    // This field sat at 0 while Write Zeroes and DSM were implemented, tested and
+    // byte-verified - the Linux side drove both explicitly (`nvme write-zeroes`,
+    // `nvme dsm`) and they worked.  The cost of the omission is concrete: a host's
+    // block layer does not offer discard or write-zeroes on a namespace whose
+    // controller answers ONCS = 0, so `blkdiscard`, `fstrim` and every filesystem
+    // discard path were dead on a namespace that could have served them.
+    //
+    // Computed from kNvmeOfIoCaps (nvmeof_wire.h), so the field cannot promise a
+    // command the I/O dispatch has no case for - and the table is unit-tested.
+    nvmeof_wr16(id + NVMEOF_ID_CTRL_OFF_ONCS, nvmeofOncsFromCaps());
     memcpy(id + NVMEOF_ID_CTRL_OFF_SUBNQN, st.subnqn, strlen(st.subnqn));
     nvmeof_wr32(id + NVMEOF_ID_CTRL_OFF_IOCCSZ, 4);   // one 64 B SQE, no in-capsule data
     nvmeof_wr32(id + NVMEOF_ID_CTRL_OFF_IORCSZ, 1);
     nvmeof_wr16(id + NVMEOF_ID_CTRL_OFF_ICDOFF, 0);
     id[NVMEOF_ID_CTRL_OFF_MSDBD] = 1;
     nvmeof_wr32(id + NVMEOF_ID_CTRL_OFF_VER, 0x00010400);
+
+    // A CHECK, NOT A COMMENT, for the volatile-write-cache bit: it must agree with
+    // the backing this process was actually given.  VWC = 0 on a file-backed
+    // namespace tells a host its writes are durable without a Flush, which is false
+    // here and would lose bytes the host was told were safe; VWC = 1 on a memory-only
+    // namespace makes Flush meaningless.  Printed with the [FAIL] marker that
+    // run_all.ps1 scans for, so the rule is gated rather than remembered.  Skipped on
+    // a discovery controller, which has no namespace at all.
+    if (!st.discovery) {
+        int vwc = id[NVMEOF_ID_CTRL_OFF_VWC] ? 1 : 0;
+        int want = g_nsFile ? 1 : 0;
+        if (vwc != want) {
+            printf("  [FAIL] Identify says VWC=%d but the namespace backing is %s - "
+                   "a host would %s\n", vwc, g_nsFile ? "a file (needs Flush)" : "memory (nothing to flush)",
+                   vwc ? "flush needlessly" : "skip the flush that makes its data durable");
+        } else {
+            printf("  [ok]   Identify VWC=%d, which matches the %s namespace\n", vwc,
+                   g_nsFile ? "file-backed" : "memory-only");
+        }
+    }
 
     // A discovery controller is a different kind of controller, not a second I/O
     // controller: the host checks cntrltype, the subnqn it is connected to, and
@@ -2497,6 +2577,31 @@ static void fillIdentifyNs(uint8_t* id) {
     id[NVMEOF_ID_NS_OFF_NLBAF] = 0;
     id[NVMEOF_ID_NS_OFF_FLBAS] = 0;
     id[NVMEOF_ID_NS_OFF_LBAF + 2] = 9;          // lbaf[0].ds = 9 -> 512 B
+    // THIN PROVISIONING, and the granularity hints that go with it.
+    //
+    // NSFEAT bit 0 says "this namespace can be deallocated and a deallocated block
+    // reads as something defined" - it is the namespace-side half of the promise
+    // that ONCS.DSM makes on the controller side, and without it a host has no
+    // reason to believe a deallocate did anything.  Our deallocate zeroes the
+    // range, which is what a deallocated block has to read as (DESIGN 8.54).
+    id[NVMEOF_ID_NS_OFF_NSFEAT] = NVMEOF_NS_FEAT_THIN;
+    // DLFEAT stays 0 = "not reported", and that is a deliberate stop rather than an
+    // oversight: the field encodes WHAT a deallocated block reads as (all-zero vs
+    // all-ones vs undefined), and that encoding is in the NVMe base spec, which this
+    // repository cannot cross-check - ref/linux_nvme.h names the field and not its
+    // bits, and this project's rule is that a wire value is read from a header, never
+    // remembered.  It is recorded in ROADMAP A2: if the Linux side reports no discard
+    // after ONCS and NSFEAT are set, nailing DLFEAT's encoding from the spec is the
+    // next step (0 is "unreported", not "no support").
+    //
+    // The granularity hints are 0-based in LOGICAL BLOCKS: 7 means 8 blocks = 4 KiB,
+    // which is the page the file backend actually writes in.  0 would mean "one
+    // block", i.e. 512 bytes, and would have every host issuing 512-byte deallocates.
+    nvmeof_wr16(id + NVMEOF_ID_NS_OFF_NPWG, 7);
+    nvmeof_wr16(id + NVMEOF_ID_NS_OFF_NPWA, 7);
+    nvmeof_wr16(id + NVMEOF_ID_NS_OFF_NPDG, 7);
+    nvmeof_wr16(id + NVMEOF_ID_NS_OFF_NPDA, 7);
+    nvmeof_wr16(id + NVMEOF_ID_NS_OFF_NOWS, 7);
 }
 
 // The discovery log page: a 1024-byte header (generation counter, record count,
@@ -3700,11 +3805,54 @@ static int runTarget(const char* ip, uint16_t port, int maxControllers) {
     HRESULT hr = dev.adapter->CreateListener(IID_IND2Listener, dev.ovFile, (VOID**)&listener);
     if (FAILED(hr)) { printf("CreateListener failed\n"); return 1; }
     hr = listener->Bind((const sockaddr*)&local, sizeof(local));
-    if (!ndOk(hr)) { char b[64]; printf("listener Bind %s\n", ndStr(hr, b, sizeof(b))); return 1; }
+    if (!ndOk(hr)) {
+        char b[64];
+        printf("listener Bind %s\n", ndStr(hr, b, sizeof(b)));
+        // 0xC0000043 is an NTSTATUS (STATUS_SHARING_VIOLATION), NOT an HRESULT:
+        // HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION) is 0x80070005 and would never
+        // match.  The ND provider hands back NTSTATUS values directly, which is also
+        // why ndStr prints them in that form.  It means the RDMA-CM port is STILL
+        // HELD, and the two things that hold it are worth naming because the value
+        // says nothing and the failure it produces is misleading: the initiator
+        // reports "connection refused", which reads like the target never started.
+        // The usual cause is a previous process on this port killed with -Force while
+        // it owned the listener (measured: killing an f5_interop backend that served
+        // on 4420 left that port unusable for every later run, with no process and no
+        // netstat entry to show for it - the state lives in the provider, not in a
+        // process).  Restarting the adapter that owns the address clears it, and a
+        // port that was never used (4421 in that same run) bound normally throughout.
+        if ((uint32_t)hr == 0xC0000043u) {
+            printf("          the RDMA-CM port is held by a previous process.  Either use\n"
+                   "          another port (-target <ip> <port>), or clear it by restarting\n"
+                   "          the adapter that owns the address, e.g.\n"
+                   "            Get-NetAdapter -InterfaceIndex <idx> | Restart-NetAdapter\n");
+        }
+        return 1;
+    }
     // The backlog must cover the burst: the host issues its I/O connects back to
     // back, and a connection that arrives with the backlog full is refused by the
     // peer before this target's accept loop ever sees it.
     listener->Listen((int)kMaxIoQueues + 2);
+
+    // A READY LINE, FOR THE HARNESS TO WAIT ON.
+    //
+    // Everything above this point is printed BEFORE the listener starts accepting, so a
+    // script that sleeps a fixed two seconds and then connects is racing the provider's
+    // initialisation - and it loses that race on a cold start (right after a reboot, or
+    // after a NIC restart, which is what this project's own measurement sessions do).
+    // The failure it produces is an INITIATOR-side ND_CONNECTION_REFUSED, i.e. "connect
+    // failed", which reads like the target never started and sends the reader after the
+    // wrong bug.  Measured while chasing exactly that: the same command pair connected
+    // every time with a four-second gap and failed every time with two.
+    //
+    // run_f5.ps1 now waits for this line instead of sleeping.  Keep it on one line and
+    // keep the wording: the script matches "listener armed".
+    {
+        char ipStr[INET_ADDRSTRLEN] = {};
+        InetNtopA(AF_INET, &local.sin_addr, ipStr, sizeof(ipStr));
+        printf("[listener armed] %s:%u is accepting connections\n", ipStr, ntohs(local.sin_port));
+        fflush(stdout);
+    }
 
     // =========================================================================
     //  One iteration of this loop is ONE CONTROLLER.

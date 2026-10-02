@@ -1118,6 +1118,48 @@ enum {
 #define NVMEOF_CTRL_ONCS_RESERVATIONS   (1u << 5)
 #define NVMEOF_CTRL_ONCS_TIMESTAMP      (1u << 6)
 
+// nsfeat bits (Identify Namespace byte 24).  Value from include/linux/nvme.h:
+// NVME_NS_FEAT_THIN = 1 << 0.  Thin provisioning means "a deallocated block may
+// read as something defined" - without it a host has no reason to believe a
+// deallocate did anything, and without ONCS.DSM it never sends one at all.
+#define NVMEOF_NS_FEAT_THIN             (1u << 0)
+
+// WHAT WE ADVERTISE, IN ONE PLACE, TOGETHER WITH THE REASON.
+//
+// ONCS is a promise: a bit set here says "send me this and I will answer it".  A
+// host that believes a promise this target cannot keep loses data or wedges, so
+// the rule is "advertise only what the dispatch answers".  A comment cannot make
+// that rule survive editing; this can:
+//
+//   * the value written into Identify Controller is COMPUTED from this table
+//     (nvmeofOncsFromCaps below), so the field and the table cannot drift;
+//   * the table is unit-tested with no hardware and no target (iscsi_selftest.cpp,
+//     "nvmeof capability table"), which pins the exact set - a new bit has to be
+//     added here deliberately and the test has to be updated with it.
+//
+// Compare (0x05), Write Uncorrectable (0x04) and Reservations are deliberately
+// ABSENT: there is no case for any of them in the I/O dispatch, so advertising
+// them would be a lie the host acts on.  They were absent before this table
+// existed too - the difference is that now their absence is checked.
+struct NvmeOfIoCaps { uint16_t oncsBit; uint8_t opcode; const char* name; };
+
+// "struct NvmeOfIoCaps", not "NvmeOfIoCaps": this header is compiled as BOTH C and C++
+// (wire_selftest.c is built both ways on purpose), and in C a struct tag does not become
+// a type name.  Writing it the C++ way here compiles in every C++ file and fails only in
+// the C build - which is exactly what happened, and exactly why that build exists.
+static const struct NvmeOfIoCaps kNvmeOfIoCaps[] = {
+    { NVMEOF_CTRL_ONCS_DSM,          NVMEOF_OPC_DSM,          "Dataset Management" },
+    { NVMEOF_CTRL_ONCS_WRITE_ZEROES, NVMEOF_OPC_WRITE_ZEROES, "Write Zeroes" },
+};
+
+// Identify Controller's ONCS: the OR of the table above.
+static inline uint16_t nvmeofOncsFromCaps(void) {
+    uint16_t v = 0;
+    for (unsigned i = 0; i < sizeof(kNvmeOfIoCaps) / sizeof(kNvmeOfIoCaps[0]); i++)
+        v |= kNvmeOfIoCaps[i].oncsBit;
+    return v;
+}
+
 // Convenience readers over a 4096-byte Identify Controller buffer.
 typedef struct { uint8_t raw[NVMEOF_IDENTIFY_SIZE]; } nvmeof_id_ctrl_buf;
 
@@ -1138,6 +1180,22 @@ static inline const char* nvmeof_idc_str(const nvmeof_id_ctrl_buf* b, uint32_t o
 #define NVMEOF_ID_NS_OFF_NSZE     0u    // u64, size in logical blocks
 #define NVMEOF_ID_NS_OFF_NCAP     8u    // u64
 #define NVMEOF_ID_NS_OFF_NUSE     16u   // u64
+// The next five offsets are DERIVED FROM THE REFERENCE STRUCT, not remembered.
+// ref/linux_nvme.h:438 (struct nvme_id_ns) lists the fields in order, and the
+// offsets already in use here are the anchors that prove the walk is right:
+// nlbaf 25, flbas 26, nmic 30, nsattr 99 and lbaf 128 all agree with the values
+// this file has been using.  Counting the same field list gives:
+//   nsfeat 24 (u8)   dlfeat 33 (u8)   npwg 64 (u16)   npwa 66 (u16)
+//   npdg 68 (u16)    npda 70 (u16)    nows 72 (u16)
+// These exist because the target now advertises deallocate; before that it told
+// hosts it had no thin provisioning at all and a mounted namespace had no discard.
+#define NVMEOF_ID_NS_OFF_NSFEAT   24u   // u8,  bit 0 = thin provisioning
+#define NVMEOF_ID_NS_OFF_DLFEAT   33u   // u8,  what a deallocated block reads as
+#define NVMEOF_ID_NS_OFF_NPWG     64u   // u16, preferred write granularity, 0-based blocks
+#define NVMEOF_ID_NS_OFF_NPWA     66u   // u16, preferred write alignment
+#define NVMEOF_ID_NS_OFF_NPDG     68u   // u16, preferred deallocate granularity
+#define NVMEOF_ID_NS_OFF_NPDA     70u   // u16, preferred deallocate alignment
+#define NVMEOF_ID_NS_OFF_NOWS     72u   // u16, optimal write size
 #define NVMEOF_ID_NS_OFF_NLBAF    25u   // u8, number of LBA formats - 1
 #define NVMEOF_ID_NS_OFF_FLBAS    26u   // u8, formatted LBA size index
 #define NVMEOF_ID_NS_OFF_NMIC     30u   // u8, multi-path capabilities

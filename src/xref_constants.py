@@ -87,6 +87,11 @@ PAIRS = [
     ("NVME_CTRL_VWC_PRESENT",        "NVMEOF_CTRL_VWC_PRESENT",        "volatile write cache"),
     ("NVME_CTRL_ONCS_DSM",           "NVMEOF_CTRL_ONCS_DSM",           "ONCS DSM"),
     ("NVME_CTRL_ONCS_WRITE_ZEROES",  "NVMEOF_CTRL_ONCS_WRITE_ZEROES",  "ONCS write zeroes"),
+    # The namespace-side half of the same promise: without this bit a host has no
+    # reason to believe a deallocate defined anything, so discard stays disabled even
+    # with ONCS.DSM set.  It was missing from the header AND from this table until the
+    # target started advertising deallocate at all (DESIGN 8.74).
+    ("NVME_NS_FEAT_THIN",            "NVMEOF_NS_FEAT_THIN",            "nsfeat thin provisioning"),
 
     # --- Optional async events: this is what gates whether a host posts an AEN ---
     ("NVME_AEN_CFG_NS_ATTR",     "NVMEOF_OAES_NS_ATTR",     "OAES namespace attribute"),

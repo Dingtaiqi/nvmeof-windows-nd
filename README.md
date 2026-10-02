@@ -157,7 +157,7 @@ random file keeps its checksum across a remount.
 | `src/f6_lifecycle.cpp` | F6 — full host sequence plus target-side lifecycle (31 assertions) |
 | `src/f7_faults.cpp` | F7 — fault injection (peer vanishes, and the reverse) |
 | `src/wire_selftest.c` | Byte-level golden self-test, compiled as both C and C++ |
-| `src/xref_constants.py` | Cross-checks every constant against the two Linux reference headers (97 pairs, 21 of them DH-HMAC-CHAP) |
+| `src/xref_constants.py` | Cross-checks every constant against the two Linux reference headers (104 checked pairs, 21 of them DH-HMAC-CHAP). The count is the one the script prints; it grows as the target advertises more |
 | `src/run_all.ps1` | Runs all 12 suites and prints a verdict table (~250 s) |
 | `src/run_f5_auth.ps1` | The six DH-HMAC-CHAP cases (two local ports, no Linux needed) |
 | `src/run_iscsi.ps1` | The iSCSI layer's own tests with **no hardware and no NIC**: 4-byte padding, the BHS accessors, every PDU builder against exact bytes, login-text parsing, the negotiation rules (InitialR2T is OR, ImmediateData is AND, numbers take the smaller value), the R2T burst sizing that protects the backend's staging buffer, and the parked-write table. `-AllToolsets` compiles it with every MSVC toolset on the machine |

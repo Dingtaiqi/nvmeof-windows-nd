@@ -47,6 +47,8 @@ C 中，D、E 低（见 §6）。**每个里程碑与合计的人日都由 §3 �
 
 ### A. 收尾与自洽（全本机，最快见效）· 小计 **6–12 人日**
 
+> **状态（2026-10）：A1–A5 全部完成**，逐项证据见 §10。A2 还剩一个只能在 Linux 侧做的验证。
+
 | 编号 | 任务 | 工作量 | 对端 | 验收判据 |
 |---|---|---|---|---|
 | A1 | 同步 `DESIGN.md` §2"非目标"清单——**它已经过期**：里面写着 Discovery、认证、Write Zeroes/DSM 都不做，实际都做了 | S (1–2) | 本机 | 清单每一条都能在代码里找到对应实现或"确实未做"的依据 |
@@ -236,3 +238,25 @@ initiator 侧（E1b）的对方才是我们自己，价值取决于 D2/D1 怎么
 **对本计划的影响**：不动 G-8 在本机的结论，也不影响我们的 **target 侧**；但它意味着"Windows 没有
 NVMe-oF initiator"这句话是 **SKU 相关**的，如果将来要在 Server 上部署，D1 的 StorPort 驱动必要性
 需要重新评估——那时 D3 的剩余那一问必须先有答案。
+
+## 10. A1–A5 完成情况（2026-10）
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| A1 | ✅ | `DESIGN.md` §2 的每一行都标了今天的状态：Discovery、DH-HMAC-CHAP 认证、Write Zeroes/DSM 标"已做"并指到对应章节；多路径/ANA、Format、固件、元数据/PI、SRQ、Namespace Management 标"仍不做"并指到本表的编号 |
+| A2 | ✅ 代码 + 三道本机门禁；**Linux 侧待验** | 能力位与实现同源：`kNvmeOfIoCaps` 表 + `nvmeofOncsFromCaps()`，Identify 写出的 ONCS = 0x000C（DSM + Write Zeroes，**不含** Compare/Write Uncorrectable/Reservations/Timestamp）；命名空间侧 `NSFEAT.THIN` + 粒度提示 7（4 KiB）。门禁三条：`run_iscsi.ps1` 的 `test_nvmeof_caps`（无硬件）、`run_xref.ps1`（104 常量 0 不匹配，新增 `NVME_NS_FEAT_THIN`）、`run_f5.ps1` 本机 initiator→target 两条 `[PASS]`。`DLFEAT` 刻意留 0（未报告），理由见 DESIGN §8.74(2) |
+| A3 | ✅ 两半都实测 | `VWC = g_nsFile ? 1 : 0`：内存后端 `[ok] Identify VWC=0, which matches the memory-only namespace`，文件后端 `[ok] Identify VWC=1, which matches the file-backed namespace`（同一次运行里能看到 `q1 FLUSH -> 98304 blocks written to D:\nvmeof\ns48.img`，这正是 VWC=1 的依据）。target 每次填 Identify 自检，不一致就打 `run_all.ps1` 会抓的 `[FAIL]` |
+| A4 | ✅ | `INTEROP_F5.en.md`（40966 B / 656 行；与中文版行数相同，49 个 `#` 行、26 个代码块一一对应；命令/路径/IP/NQN 原样；`hygiene.ps1` PASS） |
+| A5 | ✅ | DESIGN §7 两行标注为已解决（memory window → `stag_smoketest.cpp` 已进 `run_f1/run_f3` 的前置步骤；远端 STag 失效 → 是误解，host 自己本地 `IB_WR_LOCAL_INV`），并新增一行"通告位与实现漂移"的风险（§8.70 与 §8.74 各发生一次） |
+
+**A2 剩下的那一步（只能在 Linux 侧做，命令备好）**：
+
+```bash
+mount /dev/nvme1n1 /mnt/ns
+lsblk -D                                  # DISC-GRAN / DISC-MAX 应为非零
+blkdiscard -o 0 -l 8M /dev/nvme1n1        # 真的下发 DSM
+nvme read /dev/nvme1n1 -s 0 -c 8 -z 4096  # 读回全零
+fstrim -v /mnt/ns                         # fstrim 是否报出释放量
+```
+
+**下一步**：按 §8 的建议第一批里还差 `F1`（wire 编解码 fuzz，3–5 人日，本机可做）。

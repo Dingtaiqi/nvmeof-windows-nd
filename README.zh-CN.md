@@ -27,7 +27,7 @@
 | `src/nvmeof_auth.h` | DH-HMAC-CHAP 的密码学原语：CNG 的 SHA/HMAC + 自研定长 Montgomery 模幂（`nvmeof_bignum.h`）+ RFC 7919 ffdhe 群（`nvmeof_dhgroups.h`） |
 | `src/nvmeof_dhchap.h` | DH-HMAC-CHAP 协议：密钥解析（DHHC-1 + CRC32）、`Kt` 变换、target 半边、host 半边、环回自检 |
 | `src/wire_selftest.c` | 字节级 golden 自检，C 与 C++ 双份编译 |
-| `src/xref_constants.py` | 常量与两份 Linux 参考头文件**逐值比对**（97 对，含 DH-HMAC-CHAP 的 21 个） |
+| `src/xref_constants.py` | 常量与两份 Linux 参考头文件**逐值比对**（104 对，含 DH-HMAC-CHAP 的 21 个）；这个数字就是脚本自己打印的那个，随着 target 通告的能力增加而增长 |
 | `src/run_all.ps1` | 一次跑完全部 12 套并给结论表（约 180 秒） |
 | `src/interop_link.ps1` | 互操作链路：桥接 + 搬 IP/路由 + 降 MTU，失败自动回滚 |
 | `src/f5_session.ps1` | **互操作整场**：链路 → 对端 → 方向 A → discovery → 方向 B → 一份报告文件；`-Auth` 换成带认证的版本 |

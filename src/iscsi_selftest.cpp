@@ -26,6 +26,7 @@
 
 #include "nvmeof_iscsi_pending.h"
 #include "nvmeof_iscsi.h"          // pulls in winsock2, but no NetworkDirect
+#include "nvmeof_wire.h"           // the NVMe-oF side: capability bits and Identify offsets
 
 static int g_failures = 0;
 
@@ -428,6 +429,65 @@ static void test_write_flow(void) {
     CHECK(u.stalled(5000 + 60000, 60000) == q, "a write that never got its Data-Out is stalled");
 }
 
+// ---------------------------------------------------------------------------
+//  8b. The NVMe-oF capability table: what we advertise must be what we answer
+// ---------------------------------------------------------------------------
+//
+// ONCS and NSFEAT are promises a host acts on.  This target sat with ONCS = 0 while
+// Write Zeroes and DSM were implemented and byte-verified, and the cost was that no
+// host's block layer would offer discard on the namespace at all; the opposite
+// mistake - a bit set for a command the dispatch has no case for - is worse, because
+// the host sends it and gets a failure it could not have predicted.  The two sides
+// therefore come from one place, kNvmeOfIoCaps in nvmeof_wire.h, and this pins it.
+static void test_nvmeof_caps(void) {
+    const uint16_t want = NVMEOF_CTRL_ONCS_DSM | NVMEOF_CTRL_ONCS_WRITE_ZEROES;
+    const uint16_t advertised = nvmeofOncsFromCaps();
+
+    CHECK_EQ_U32(advertised, want, "ONCS is exactly Dataset Management + Write Zeroes");
+
+    // Every row contributes its bit and every bit comes from a row: a bit cannot be
+    // advertised without a row, and a row cannot be silently ignored.
+    uint16_t fromRows = 0;
+    for (unsigned i = 0; i < sizeof(kNvmeOfIoCaps) / sizeof(kNvmeOfIoCaps[0]); i++) {
+        fromRows |= kNvmeOfIoCaps[i].oncsBit;
+        CHECK((advertised & kNvmeOfIoCaps[i].oncsBit) != 0,
+              "every row's bit appears in the ONCS the target writes");
+        CHECK(kNvmeOfIoCaps[i].opcode == NVMEOF_OPC_DSM ||
+              kNvmeOfIoCaps[i].opcode == NVMEOF_OPC_WRITE_ZEROES,
+              "every row names an opcode the I/O dispatch has a case for");
+    }
+    CHECK_EQ_U32(fromRows, advertised, "no ONCS bit exists outside the table");
+
+    // The bits we must NOT set, each because there is no case for the command behind
+    // it.  These four are where "a made-up capability bit is worse than a missing
+    // one" stops being a slogan: a host believes them.
+    CHECK((advertised & NVMEOF_CTRL_ONCS_COMPARE) == 0, "Compare is not advertised");
+    CHECK((advertised & NVMEOF_CTRL_ONCS_WRITE_UNCOR) == 0, "Write Uncorrectable is not advertised");
+    CHECK((advertised & NVMEOF_CTRL_ONCS_RESERVATIONS) == 0, "Reservations are not advertised");
+    CHECK((advertised & NVMEOF_CTRL_ONCS_TIMESTAMP) == 0, "Timestamp is not advertised");
+
+    // The namespace-side half, with its value read from the reference header
+    // (ref/linux_nvme.h: NVME_NS_FEAT_THIN = 1 << 0).
+    CHECK_EQ_U32(NVMEOF_NS_FEAT_THIN, 1u, "nsfeat bit 0 is thin provisioning");
+
+    // The Identify Namespace offsets.  NSFEAT/DLFEAT/NPWG..NOWS were DERIVED by
+    // walking struct nvme_id_ns (ref/linux_nvme.h:438), and the five older offsets
+    // are the anchors that prove the walk - so they are pinned here alongside the new
+    // ones.  A future edit that moves a field has to argue with the derivation.
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_NSFEAT, 24u, "nsfeat follows nsze/ncap/nuse");
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_NLBAF,  25u, "anchor: nlbaf is byte 25");
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_FLBAS,  26u, "anchor: flbas is byte 26");
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_NMIC,   30u, "anchor: nmic is byte 30");
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_DLFEAT, 33u, "dlfeat follows nmic/rescap/fpi");
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_NPWG,   64u, "npwg follows nvmcap[16]");
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_NPWA,   66u, "npwa follows npwg");
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_NPDG,   68u, "npdg follows npwa");
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_NPDA,   70u, "npda follows npdg");
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_NOWS,   72u, "nows follows npda");
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_NSATTR, 99u, "anchor: nsattr is byte 99");
+    CHECK_EQ_U32(NVMEOF_ID_NS_OFF_LBAF,  128u, "anchor: lbaf[0] is byte 128");
+}
+
 int main(void) {
     printf("nvmeof_iscsi self-test\n");
     test_padding();
@@ -438,10 +498,12 @@ int main(void) {
     test_burst_size();
     test_pending_table();
     test_write_flow();
+    test_nvmeof_caps();
 
     if (g_failures == 0) {
         printf("  iscsi self-test: PASS (padding, BHS, PDU builders, login text, "
-               "negotiation rules, R2T burst sizing, parked-write table)\n");
+               "negotiation rules, R2T burst sizing, parked-write table, "
+               "NVMe-oF capability table)\n");
         return 0;
     }
     printf("  iscsi self-test: %d FAILURE(S)\n", g_failures);

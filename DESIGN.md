@@ -60,12 +60,18 @@ NVMe-oF 1.1a 很大。第一版只做**能让一个真实的 Linux `nvmet` targe
 
 ### 非目标（第一版明确不做，写下来是为了不偷偷省略）
 
-- Discovery 服务 / Discovery Log Page（直连 NQN，不做发现）
-- 认证（DH-HMAC-CHAP）、TLS
-- 多路径、ANA、namespace 热插拔
-- `Compare` / `Write Zeroes` / `DSM` / `Format` / 固件下载
-- 元数据（metadata SGL）、PI（端到端保护）
-- SRQ、多 QP 负载均衡、CQ 中断模式（先用轮询）
+**这张表是"第一版"的取舍，不是现状。** 每一行后面标了它今天的状态——不标的话，一个读者会以为
+Discovery 和认证仍然没做（它们都做了），而这张表的用处恰恰是"哪些是真的没做"。
+
+- Discovery 服务 / Discovery Log Page —— **已做**（§8.50：`nvme discover` 对得上 nvmet）
+- 认证（DH-HMAC-CHAP）—— **已做**（§8.44–§8.52：六个用例 + 双向 + Linux 互操作）；TLS 仍不做
+  （TLS 是 NVMe/TCP 的东西，RDMA 路径上没有它）
+- 多路径、ANA、namespace 热插拔 —— **仍不做**（ROADMAP C1/C2/B1）
+- `Compare` / `Write Zeroes` / `DSM` / `Format` / 固件下载 —— Write Zeroes 与 DSM **已做且已通告**
+  （§8.74）；`Compare`、`Format`、固件下载**仍不做**（ROADMAP B3/B5，且通告位里刻意不含 Compare）
+- 元数据（metadata SGL）、PI（端到端保护）—— **仍不做**
+- SRQ、多 QP 负载均衡、CQ 中断模式（先用轮询）—— **仍不做**
+- （后来加进来的目标）Namespace Management、多命名空间 —— **不做**（ROADMAP B1）
 
 ---
 
@@ -4650,13 +4656,163 @@ cd <repo>\src
 .\hygiene.ps1        # FAIL(1): possible GBK mojibake: <file> - 26.2% of its CJK ...
 ```
 
+---
+
+### 8.74 ✅ 通告位：已经实现、测过、主机却用不到的那两个 bit（以及 VWC 这个反向的坑）
+
+§8.70 修的是"实现没问题、能力位没写"，这一节是同一类问题的第二处和第三处，而且两处的方向相反：
+**ONCS 少写了**（主机因此不启用 discard），**VWC 写反了**（主机因此以为不必 flush）。
+
+#### (1) ONCS：Write Zeroes 和 DSM 早就通了，但控制器说"我不会"
+
+事实摆在那里：`nvme write-zeroes` 与 `nvme dsm` 在方向 B 上都跑过，字节级验证过（§8.54、§8.87
+的 `f5_dsm_check.sh`），`f5_dirb_demo.sh` 里那条 `[ok] DATASET MANAGEMENT (deallocate)` 就是它们。
+但 `fillIdentifyCtrl()` **从来没有写过 ONCS**，于是这个字段一直是 memset 出来的 0。
+
+代价不是"少个功能"，而是**主机侧整条 discard 路径根本不存在**：块层看到 `ONCS = 0` 就不会给这个
+namespace 开 discard，于是 `blkdiscard`、`fstrim`、文件系统的 discard/零页优化全部不生效——
+一个人面对一块"支持 deallocate 但被自己声明为不支持"的盘，是查不出原因的。
+
+修法不是把位写死，而是**让位和实现来自同一处**（`nvmeof_wire.h`）：
+
+```c
+struct NvmeOfIoCaps { uint16_t oncsBit; uint8_t opcode; const char* name; };
+static const NvmeOfIoCaps kNvmeOfIoCaps[] = {
+    { NVMEOF_CTRL_ONCS_DSM,          NVMEOF_OPC_DSM,          "Dataset Management" },
+    { NVMEOF_CTRL_ONCS_WRITE_ZEROES, NVMEOF_OPC_WRITE_ZEROES, "Write Zeroes" },
+};
+static inline uint16_t nvmeofOncsFromCaps(void);      // Identify 里写的值 = 上表的 OR
+```
+
+**Compare（0x05）、Write Uncorrectable（0x04）、Reservations、Timestamp 一个都不通告**，
+因为 I/O 分发里没有它们的 case —— 一个主机相信了的假能力位比缺一个位更糟。
+
+三道门禁，全部实测通过：
+
+1. **无硬件单测**（`run_iscsi.ps1`，新增 `test_nvmeof_caps`）：ONCS 恰好等于 DSM|WZ、表里每一行的
+   位都出现在值里、值里没有表外的位、四个"不能通告"的位全为 0；顺带把 §8.74(3) 的 Identify 偏移
+   与它的推导锚点一起钉住。
+2. **常量交叉检查**（`run_xref.ps1`）：新增 `NVME_NS_FEAT_THIN` ↔ `NVMEOF_NS_FEAT_THIN`，
+   比对 104 个常量、0 不匹配。
+3. **本机端到端**（`run_f5.ps1`，我们的 initiator 读回我们 target 的 Identify）：
+
+```
+[PASS] the controller advertises deallocate/write-zeroes, and nothing it cannot answer
+       - oncs=0x000C dsm=1 write-zeroes=1 compare=0 wu=0 resv=0 ts=0
+[PASS] the namespace advertises thin provisioning (the other half of discard)
+       - nsfeat=0x01 thin=1 dlfeat=0 npdg=7 (0-based blocks)
+```
+
+#### (2) NSFEAT：控制器那半边承诺了，命名空间这半边也得说
+
+`ONCS.DSM` 是"你可以发 deallocate"，`NSFEAT` bit 0（thin provisioning）是"被释放的块读回来是个
+有定义的值"。主机要两边都看到才肯开 discard，所以两个位是一对，缺一个都不生效。命名空间侧同时
+补了粒度提示 `NPWG/NPWA/NPDG/NPDA/NOWS = 7`（0-based，即 8 块 = 4 KiB，文件后端实际写回的页大小）。
+
+**DLFEAT 刻意留 0（"未报告"），这是停手而不是疏忽**：它编码的是"被释放的块读回来是 0x00、0xFF 还是
+未定义"，而这个编码在 NVMe base spec 里，本仓库能交叉检查的参考头文件（`ref/linux_nvme.h`）只给了
+字段名、没给位定义 —— 本项目的规矩是 wire 值只从头文件读、绝不凭记忆写。已记进 ROADMAP A2：
+**如果 Linux 侧在 ONCS 与 NSFEAT 都置上之后仍报没有 discard，下一步就是去规范里把 DLFEAT 的编码
+钉死**（0 是"未报告"，不是"不支持"）。
+
+#### (3) 五个新偏移是"走"出来的，不是记出来的
+
+`NSFEAT/DLFEAT/NPWG/NPWA/NPDG/NPDA/NOWS` 七个字段的偏移由 `ref/linux_nvme.h:438`
+（`struct nvme_id_ns`）的字段顺序逐个累加得到，而**仓库里已有的五个偏移就是这次行走的锚点**：
+`nlbaf 25`、`flbas 26`、`nmic 30`、`nsattr 99`、`lbaf 128` 全部与走出来的结果一致。
+单测把新老偏移**一起**钉住，于是以后想挪动某个字段的人必须先去和那段推导争论。
+
+#### (4) VWC：反方向的错——把"有易失缓存"说成了"没有"
+
+`f3_io.cpp` 当年把 Identify 的 VWC 位设成 0，理由写在注释里并且**对内存命名空间是对的**：
+"命名空间就是本进程的内存，Flush 无事可做"。但 **`f5_interop -nsfile` 的命名空间不是内存**，
+它是"文件 + RAM cache，FLUSH 才写回"——同一轮运行里就能看到：
+
+```
+[io]    q1 FLUSH -> 98304 blocks written to D:\nvmeof\ns48.img
+```
+
+也就是说 VWC = 0 等于告诉主机"写完成即持久，不必 flush"，而我们的字节还压在 RAM 里。**主机会
+相信它**：不带 flush 地卸载，然后丢掉一批被告知已经安全的字节。而且仓库内部本来就不一致——
+`f1_bringup.cpp` 与 `f4_pipeline.cpp` 设 1，`f3/f5/f6/f7` 设 0。
+
+现在按**实际后端**取值，并且这个规则是被门禁住的（target 每次填 Identify 都会自检，用
+`run_all.ps1` 会抓的 `[FAIL]` 标记）：
+
+```c
+id[NVMEOF_ID_CTRL_OFF_VWC] = g_nsFile ? 1 : 0;
+```
+
+两半都实测过：
+
+| 后端 | 自检输出 |
+|---|---|
+| 内存（`-target .2 4421 -serve 0`） | `[ok]   Identify VWC=0, which matches the memory-only namespace` |
+| 文件（同上加 `-nsfile D:\nvmeof\ns48.img`） | `[ok]   Identify VWC=1, which matches the file-backed namespace` |
+
+`f3/f6/f7` 的内存命名空间保持 0（它们的注释本来就说清了理由），`f1/f4` 保持 1。
+
+#### (5) 复现
+
+```powershell
+.\run_iscsi.ps1     # 能力表单测（无硬件）
+.\run_xref.ps1      # 104 个常量对参考头文件，含 NVME_NS_FEAT_THIN
+.\run_f5.ps1        # 本机 initiator→target：ONCS/NSFEAT 三条 [PASS]
+# VWC 两半：起 target（带/不带 -nsfile），连一次，看 target 日志里的 "[ok] Identify VWC="
+```
+
+#### (6) 还差的一步（需要 Linux）
+
+通告位现在是被门禁住的，但"**主机因此真的启用了 discard**"只能在 Linux 侧看到：
+`lsblk -D` 是否列出 discard 能力、`blkdiscard` 之后读回是否全零、`fstrim` 是否真的下发 DSM。
+命令已写进 ROADMAP A2，等对端可用时执行。
+
+#### (7) 顺带抓到的一个环境坑：`0xC0000043` 让 4420 端口"永久"不可用
+
+做这一节的验证时，`run_f5.ps1` 突然开始失败，症状是 **initiator 报 `ND_CONNECTION_REFUSED`
+（"连接被拒绝"）**，看上去像是 target 根本没起来。target 侧真正的原因只有一行：
+
+```
+listener Bind 0xC0000043
+```
+
+`0xC0000043` 是 **NTSTATUS** 的 `STATUS_SHARING_VIOLATION`（注意：不是 HRESULT，
+`HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION)` 是 `0x80070005`，永远匹配不上——这一点我第一版
+写错过），意思是**这个 RDMA-CM 端口还被人占着**。
+
+占它的是谁？**没有进程，`netstat` 里也没有**。它是我自己造成的：这一轮为了反复测量，用
+`Stop-Process -Force` 杀掉了多个"在 4420 上监听过"的 `f5_interop` 后端；状态留在 **provider 里**，
+不在任何进程里，所以进程表和端口表都查不到。表现就是：4420 从此每次 bind 都失败，而**同一轮里
+从没用过的 4421 一切正常**——这个对比就是证据。
+
+清掉它：**重启持有该地址的那块网卡**
+
+```powershell
+Get-NetAdapter -InterfaceIndex 36 | Restart-NetAdapter     # 192.168.100.2 所在的口
+```
+
+重启后 4420 立刻恢复正常，三条新断言全 PASS。target 现在会把这句话直接打出来，因为
+"连接被拒绝"这个症状和真正的原因差得太远：
+
+```
+          the RDMA-CM port is held by a previous process.  Either use
+          another port (-target <ip> <port>), or clear it by restarting
+          the adapter that owns the address, e.g.
+            Get-NetAdapter -InterfaceIndex <idx> | Restart-NetAdapter
+```
+
+**教训**：拿 `-Force` 杀一个持有 ND listener 的进程，代价可能不是"这个进程没了"，而是**那个端口
+在 provider 里一直是脏的**，而症状出现在下一次运行的另一个进程里。测量脚本要换端口，或者正常
+退出（`-serve 0` 的 target 会一直服务，等宿主自己走掉）。这条已记进 ROADMAP 的维护项。
+
 ## 7. 已知风险
 
 | 风险 | 说明 | 缓解 |
 |---|---|---|
-| memory window 在 CX3/WinOF 5.50 上的实际行为未验证 | WinOF 支持 `ND_MR_FLAG_ALLOW_REMOTE_WRITE` 是确定的，但 `CreateMemoryWindow` + `Bind` + `Invalidate` 这条 STag 路径本机从没跑过 | F3 之前先写一个最小 STag 冒烟测试（bind → 远端 Read → invalidate → 确认失效） |
+| ~~memory window 在 CX3/WinOF 5.50 上的实际行为未验证~~ **已解决** | `CreateMemoryWindow` + `Bind` + `Invalidate` 这条 STag 路径当初"本机从没跑过"；`stag_smoketest.cpp` 就是为此写的那个最小冒烟测试（bind → 远端 Read → invalidate → 确认失效），现在是 `run_f1.ps1`/`run_f3.ps1` 的前置步骤，每次都跑 | 保持它在套件里，别再退回"靠人记得先跑" |
 | `max_mb` / 读限额与 in-capsule 空间的关系 | NVMe-oF 要求 host 依 `max_rdma_size` 切分数据 | 从 Connect 的 private data 和 Identify 里读，不猜 |
-| CX3 的 MR 大小上限 | **本轮实测修正**：namespace 512 MiB / region 517 MiB 的单个 MR 注册与传输都正常（F4 命令大小扫描）。旧记录"191 MB 可用、268 MB 挂死"更可能是当时的策略护栏，不是硬件上限 | 暂不设人为上限；大 MR 反而省掉了分块注册的复杂度 |
+| CX3 的 MR 大小上限 | **实测修正**：namespace 512 MiB / region 517 MiB 的单个 MR 注册与传输都正常（F4 命令大小扫描）。旧记录"191 MB 可用、268 MB 挂死"更可能是当时的策略护栏，不是硬件上限 | 暂不设人为上限；大 MR 反而省掉了分块注册的复杂度 |
 | 单机双端点 | 两个端点同主机，数据路径比裸 RDMA 多一层 capsule/Target 块层，吞吐必然低于 2.53 GB/s | 报告里给"占裸 RDMA 的百分比"，不假装它是网络存储的性能 |
-| **远端 STag 失效（SGL subtype 0xf）我们做不到** | `IB_WR_SEND_WITH_INV` 需要"发应答的同时作废对端 STag"；`IND2QueuePair` 只有本地 `Invalidate()`，`SendAndInvalidate` 只在更新的 `IND` 接口里（`ndspi.h:970`） | **本轮修正**：不再拒绝（§8.40(2)）。照做传输 + 普通 SEND，因为 **Linux host 的完成路径在没有收到 invalidation 时会自己本地 `IB_WR_LOCAL_INV`**，不依赖我们。真正做不到的只是"代替 host 作废"，而 host 不需要我们代劳 |
+| ~~远端 STag 失效（SGL subtype 0xf）我们做不到~~ **是误解，已解决** | 当初的判断是"做不到"；实际是**不需要**：`IND2QueuePair` 只有本地 `Invalidate()`，但 Linux host 的完成路径在没收到 invalidation 时会自己本地 `IB_WR_LOCAL_INV`——不依赖我们 | 已按此实现：照做传输 + 普通 SEND，不再拒绝（§8.40(2)）。真正做不到的只是"代替 host 作废"，而 host 不需要 |
+| **通告位与实现漂移**（§8.70、§8.74 各发生一次：ONCS 漏写、VWC 写反） | 一个主机相信的能力位是"它会照着做"的承诺：漏写会让主机用不到已实现的功能（discard 整条路径消失），写反会让主机丢掉它被告知安全的字节 | 位与实现来自同一张表（`kNvmeOfIoCaps` + `nvmeofOncsFromCaps()`），由无硬件单测 + xref + 本机 initiator 端到端三道门禁钉住；VWC 由 target 每次填 Identify 时自检并打 `[FAIL]` |
 
