@@ -334,6 +334,12 @@ struct Queue {
     // Reap one completion, optionally requiring a context.  A wildcard reap is
     // available but every use of it is a place a stray CQE can be swallowed,
     // so callers that use it must say why.
+    //
+    // The yield here was suspected of causing the 12-22 ms completion delay measured
+    // on the serial path (see DESIGN 8.67) and was replaced with a pause-spin: the
+    // delay did not change (33.8 ms median before, 33.8 ms after), so the yield is
+    // NOT the cause and the original is kept.  Recorded because "we tried the obvious
+    // thing and it was not it" is worth as much as a fix.
     HRESULT reap(void* expect, ND2_RESULT* out, DWORD ms) {
         if (!cq) return ND_UNSUCCESSFUL;
         ULONGLONG t0 = GetTickCount64();

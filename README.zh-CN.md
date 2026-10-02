@@ -34,6 +34,7 @@
 | `src/run_f5_auth.ps1` | DH-HMAC-CHAP 六个用例（本机两口直连，不需要 Linux） |
 | `src/nvmeof_iscsi.h` | **用户态 iSCSI target**：三段式 login、SendTargets、NOP/Logout/TaskMgmt、SCSI 命令集（INQUIRY/VPD、MODE SENSE、READ CAPACITY、REPORT LUNS、READ/WRITE(10/16) 走 R2T、SYNCHRONIZE CACHE）。每连接一个对象一个线程，backend（一条队列对）用互斥量串行。装不进命令 PDU 的写按 ITT 挂起成状态（`PendingWrite`，窗口 8），不是在 `handleScsi()` 里阻塞等 Data-Out |
 | `src/tools_iscsi_write.ps1` | 写路径端到端逐字节检查：确定性图案写入 → initiator 读回 → 自建 SCSI pass-through 发 SYNCHRONIZE CACHE → 比对后端 namespace 文件（三条独立证据） |
+| `src/tools_nd_bw.ps1` | 纯链路基线：驱动官方 NetworkDirect `nd_write_bw` / `nd_read_bw` / `nd_send_bw` / `nd_*_lat` 扫消息尺寸，并按数据行解析（各版本列顺序不同，按 "Gb/s" 关键字抓会抓到表头） |
 | `src/tools_login_probe.ps1` | 把 Windows 真实发出的 iSCSI login **逐字节重放**给任意 target（做 LIO 参考实现的 A/B 对比用） |
 | `src/mount_nvmeof.ps1` | 命名空间 → fixed VHD → 盘符，卸载时回推 |
 | `EVIDENCE-1TB.md` | 1 TB 真盘挂到 Windows 的全部实测输出（含拆除记录） |
@@ -104,7 +105,7 @@ F5 的 target 有 8 槽 receive ring 与延迟完成，能扛住队列深度 32 
 | 3 写后读逐字节一致 | ✅ F3 |
 | 4 错误路径有界（含对端消失，双向） | ✅ F3 / F6 / F7 |
 | 5 **我们的 host ↔ Linux `nvmet`** | ✅ **跑通了**：`initiator failures: 0`（36 项检查），含逐字节一致的 WRITE/READ、32 条在飞的流水线，以及 **4 条 I/O 队列各自同时跑一条命令**（DESIGN §8.46、§8.49） |
-| 6 吞吐 vs 裸 RDMA 基线 | ✅ 约 1.17 GB/s ≈ 2.53 GB/s 的 **48%**（DESIGN §8.16） |
+| 6 吞吐 vs 裸 RDMA 基线 | ✅ 最好 **1.81 GB/s**（1722 MiB/s 写、8 条在途、256 KiB 命令）= 重新实测的裸链路天花板的 **61%**：官方 NetworkDirect 工具（同一 provider、同一张卡、单 QP、每档 10 s）跑 **2.97 GB/s = 40G 线速的 59%**，8 MiB 时掉到 2.42 GB/s（源缓冲不再驻留 cache）。数字必须带条件：同一配置 3 次平均是 1.45–1.60 GB/s，所以这层 NVMe-oF 大约吃掉一半链路，而不是旧记录里"2.53 GB/s 基线的 48%"（DESIGN §8.67，取代 §8.16）。**同一条栈在深度 1 时只有 4.8 MiB/s**，那是完成延迟而不是带宽：64 KiB 的数据搬完并被应答只要 **31 µs**，而完成事件到达应用要 **12–22 ms**（两端 QPC 逐跳，768 条命令，§8.67(3)） |
 | 7 **我们的 target ↔ Linux `nvme-cli`** | ✅ **跑通了**：`nvme connect` rc=0，`nvme list` 出现 `NDVMEOF0000000000001`，128 块写入→flush→读回 **`cmp` 逐字节相同**；主机建 **8 条 I/O 队列**、命令分散在 **6 条**上（DESIGN §8.46、§8.49） |
 | 8 **DH-HMAC-CHAP 在带内认证** | ✅ **两个方向都跑通了（Linux 对端实测）**：真 Linux 主机用 `nvme connect -S <key>` 认证到我们的 target（内核日志 `qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048`，单向与**双向**都通过并搬运了数据，**错密钥被拒**，`authRefused=0`）；反向也一样——我们的 host 认证到**要求认证的 nvmet**，`Success2 sent (the controller's own response verified)`，即真 ffdhe2048 DH + 双向（DESIGN §8.51、§8.52） |
 | 9 **Linux 的 1 TB 真盘成为 Windows 的活动盘** | ✅ Linux `/dev/nvme1n1`（CT1000P3PSSD8，1953525168 × 512 B = 931.51 GiB）出现为 `Get-Disk` #3，**Online**、GPT、NTFS `E:` 可读；两次与 Linux 侧的字节级对照；**全程零写入**（DESIGN §8.55、§8.56，[EVIDENCE-1TB.md](EVIDENCE-1TB.md)） |

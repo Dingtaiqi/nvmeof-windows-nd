@@ -1106,14 +1106,21 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
            perPhaseBytes / 1048576.0 / wSecs, wSecs, perPhaseBytes / 1048576.0);
     printf("  read : %7.2f MiB/s  (%.3f s for %.1f MiB)\n",
            perPhaseBytes / 1048576.0 / rSecs, rSecs, perPhaseBytes / 1048576.0);
-    printf("  bare RDMA Write on this card measured 2.53 GB/s = 2413 MiB/s\n");
+    // The ceiling, re-measured: the official nd_write_bw (same ND provider, same card,
+    // one QP, 10 s) does 2.97 GB/s at 64 KiB-4 MiB and 2.42 GB/s at 8 MiB, where the
+    // source buffer stops being cache-resident - see DESIGN 8.67 and RDMA_TOOLBOX.md
+    // section 2.3.  The single 2.53 GB/s constant this used to compare against came
+    // from a different tool on a different workload, and it is size-dependent, so both
+    // ends of the range are printed instead of one number.
+    printf("  bare RDMA (official nd_*_bw, one QP): 2.97 GB/s = 2832 MiB/s at 64 KiB-4 MiB,\n"
+           "                                        2.42 GB/s = 2308 MiB/s at 8 MiB\n");
     if (wSecs > 0) {
-        printf("  => write is %.1f%% of the bare-RDMA ceiling\n",
-               100.0 * (perPhaseBytes / wSecs) / 2.53e9);
+        printf("  => write is %.1f%% of the 2.97 GB/s ceiling\n",
+               100.0 * (perPhaseBytes / wSecs) / 2.97e9);
     }
     if (rSecs > 0) {
-        printf("  => read  is %.1f%% of the bare-RDMA ceiling\n",
-               100.0 * (perPhaseBytes / rSecs) / 2.53e9);
+        printf("  => read  is %.1f%% of the 2.97 GB/s ceiling\n",
+               100.0 * (perPhaseBytes / rSecs) / 2.97e9);
     }
 
     admin.destroy();

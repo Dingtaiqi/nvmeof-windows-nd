@@ -432,8 +432,32 @@ static void buildCompletionDnr(uint8_t* cqe, uint16_t cid, uint16_t sqHead,
 // ---------------------------------------------------------------------------
 struct Completion { uint16_t cid; uint16_t status; uint64_t result; };
 
+// -nvmetiming: split the serial round trip into "capsule send completed" and
+// "target answered".  It exists because the serial path measures ~10 ms per
+// command while the fabric's own 64 KiB read latency is 28 us - a 400x gap that
+// cannot be attributed by looking at the total.  Inert without the switch.
+static bool g_nvmeTiming = false;
+
+// Machine-wide microseconds, from QueryPerformanceCounter.
+//
+// NOT std::chrono::steady_clock: MSVC gives that clock a per-process epoch, so two
+// processes' timestamps cannot be subtracted - the first attempt at this produced
+// hop times of 1.8 million microseconds and negative reply legs.  QPC counts share
+// one epoch across the machine, which is exactly what a two-process hop trace needs.
+static long long nowUs() {
+    static const double invFreq = [] {
+        LARGE_INTEGER f = {};
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart ? (1000000.0 / (double)f.QuadPart) : 1.0;
+    }();
+    LARGE_INTEGER c = {};
+    QueryPerformanceCounter(&c);
+    return (long long)((double)c.QuadPart * invFreq);
+}
+
 static bool submitCommand(Queue& q, Device& d, const uint8_t* capsule64,
                           Completion* out, DWORD timeoutMs) {
+    auto tStart = std::chrono::steady_clock::now();
     memcpy(d.region(kAdminCapOff), capsule64, 64);
     memset(d.region(kRespInOff), 0xFF, 16);
     if (!q.postReceive(d.region(kRespInOff), 16, CTX_RESP)) {
@@ -446,7 +470,17 @@ static bool submitCommand(Queue& q, Device& d, const uint8_t* capsule64,
     if (!ndOk(q.reap(CTX_CAP, &r, kWaitMs))) {
         char b[64]; printf("    capsule send %s\n", ndStr(r.Status, b, sizeof(b))); return false;
     }
+    auto tSent = std::chrono::steady_clock::now();
+    long long nowUs0 = nowUs();
     HRESULT st = q.reap(CTX_RESP, &r, timeoutMs);
+    auto tDone = std::chrono::steady_clock::now();
+    if (g_nvmeTiming) {
+        printf("    [nvme] init send-done qpc=%lld, reply qpc=%lld (send %lld us, answer %lld us)\n",
+               nowUs0,
+               nowUs(),
+               (long long)std::chrono::duration_cast<std::chrono::microseconds>(tSent - tStart).count(),
+               (long long)std::chrono::duration_cast<std::chrono::microseconds>(tDone - tSent).count());
+    }
     if (!ndOk(st)) {
         char b[64];
         printf("    no completion after %u ms (%s) - the target did not answer\n",
@@ -2297,7 +2331,11 @@ struct F5State {
     // by queue as well as slot, because each of the eight queue pairs owns its own
     // ring and its own in-flight commands.
     struct IoSlot { bool used = false; uint16_t cid = 0; bool isWrite = false;
-                    uint32_t bytes = 0; uint64_t slba = 0; };
+                    uint32_t bytes = 0; uint64_t slba = 0;
+                    // -nvmetiming: when this command's capsule was decoded.  t0 for the
+                    // target's own duration, tQpc for cross-process correlation (a
+                    // machine-wide clock; steady_clock's epoch is per process).
+                    std::chrono::steady_clock::time_point t0; long long tQpc = 0; };
     IoSlot io[kMaxIoQueues][kCapSlots];
 
     // Commands served per I/O queue.  This is the evidence that a host really used
@@ -3391,6 +3429,8 @@ static bool targetIo(Queue& q, Device& d, F5State& st, int qi, int slot) {
                 st.io[qi][slot].isWrite = (op == NVMEOF_OPC_WRITE);
                 st.io[qi][slot].bytes = bytes;
                 st.io[qi][slot].slba = slba;
+                st.io[qi][slot].t0 = std::chrono::steady_clock::now();
+                st.io[qi][slot].tQpc = nowUs();
                 if (st.io[qi][slot].isWrite) st.bytesWritten += bytes;
                 else st.bytesRead += bytes;
                 // Note: this slot's receive is NOT re-armed yet.  It is re-armed
@@ -3572,10 +3612,36 @@ static bool targetIoComplete(Queue& q, Device& d, F5State& st, int qi, int slot,
     }
     buildCompletion(d.region(respOff), st.io[qi][slot].cid, 0, 0, sct, sc);
     st.io[qi][slot].used = false;
+    if (g_nvmeTiming) {
+        printf("    [nvme] target got capsule qpc=%lld, %s %u B: %lld us from capsule to answer\n",
+               st.io[qi][slot].tQpc,
+               st.io[qi][slot].isWrite ? "READ(data-in)" : "WRITE(data-out)",
+               st.io[qi][slot].bytes,
+               (long long)std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - st.io[qi][slot].t0).count());
+    }
     // Re-arm this slot BEFORE answering: the host may send the next command the
     // instant it sees the completion (DESIGN 8.10(4)).
     q.postReceive(d.region(capOff), 64, CTX_IO_CAP(qi, slot));
-    return q.send(d.region(respOff), 16, CTX_IO_RESP(qi, slot));
+    auto tPost = std::chrono::steady_clock::now();
+    bool sent = q.send(d.region(respOff), 16, CTX_IO_RESP(qi, slot));
+    if (g_nvmeTiming) {
+        // How long the SEND call itself takes, and how long its own completion takes
+        // to appear locally.  Together they separate "the reply never made it onto the
+        // wire" from "the reply left but the initiator did not see it": the initiator
+        // measured 23-45 ms waiting for this 16-byte reply while this target produced
+        // it 31 us after the capsule.
+        auto tCall = std::chrono::steady_clock::now();
+        ND2_RESULT rr = {};
+        HRESULT sst = q.reap(CTX_IO_RESP(qi, slot), &rr, 2000);
+        auto tDone = std::chrono::steady_clock::now();
+        printf("    [nvme] target reply: send call %lld us, own completion %lld us (%s) qpc=%lld\n",
+               (long long)std::chrono::duration_cast<std::chrono::microseconds>(tCall - tPost).count(),
+               (long long)std::chrono::duration_cast<std::chrono::microseconds>(tDone - tPost).count(),
+               ndOk(sst) ? "ok" : "not seen in 2 s",
+               nowUs());
+    }
+    return sent;
 }
 
 static int runTarget(const char* ip, uint16_t port, int maxControllers) {
@@ -4175,7 +4241,7 @@ int main(int argc, char** argv) {
                "               [-queues <n>] [-blocks <n>] [-discover]\n"
                "               [-authkey <DHHC-1:..>] [-authctrlkey <DHHC-1:..>] [-authskip]\n"
                "               [-iscsi <port> [-iscsiaddr <ip>] [-iscsirw] [-iscsitrace] [-iscsitime] [-iscsimbl <bytes>] [-iscsir2tcfg <file>]]\n"
-               "               [-backendretry <s>]\n"
+               "               [-backendretry <s>] [-nvmetiming]\n"
                "  %s -target    <ip> <port> [-serve <n>] [-authkey <DHHC-1:..>]\n"
                "                          [-authdhgroup 2048|3072|4096] [-reconnectwait <s>]\n"
                "                          (n = 1 by default; 0 = keep serving)\n"
@@ -4192,6 +4258,12 @@ int main(int argc, char** argv) {
                "  authenticates.  The key is the same string `nvme gen-dhchap-key`\n"
                "  prints and nvmet's dhchap_key attribute takes:\n"
                "    nvme connect -a <ip> -t rdma -n <subnqn> -S <key>\n"
+               "\n"
+               "  -nvmetiming splits one serial NVMe-oF round trip into its hops\n"
+               "  (capsule sent, target saw it, reply sent, reply seen), on the\n"
+               "  machine-wide QPC clock so two processes' stamps can be subtracted.\n"
+               "  It is how DESIGN 8.67 found that the data moves in 31 us while the\n"
+               "  completion takes 12-22 ms.\n"
                "\n"
                "  -reconnectwait is how long a target keeps listening for the NEXT\n"
                "  controller after one goes away.  Left at 20 s the self-tests behave\n"
@@ -4280,6 +4352,13 @@ int main(int argc, char** argv) {
         // One line per SCSI READ, so it can stay on during a throughput run.
         else if (strcmp(argv[i], "-iscsitime") == 0) {
             g_iscsiTime = true;
+        }
+        // Split one serial NVMe-oF round trip into "capsule sent" and "target
+        // answered".  Needed because the serial path measured ~10 ms per command
+        // while the same fabric's 64 KiB read latency is 28 us; the total says
+        // nothing about which half is at fault.
+        else if (strcmp(argv[i], "-nvmetiming") == 0) {
+            g_nvmeTiming = true;
         }
         // MaxBurstLength to advertise.  Default 65536, which is what makes writes
         // work: Windows picks its CDB size from this, and a CDB larger than the
