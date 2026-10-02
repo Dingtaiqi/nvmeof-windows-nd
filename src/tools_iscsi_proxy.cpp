@@ -49,7 +49,7 @@ static size_t     g_maxDump = 16384;
 // Everything the target sends, in order, as it arrives.  Two connections can be alive
 // at once (Windows opens a discovery session and then a normal one), so the dump is
 // labelled per connection rather than interleaved silently.
-static void dumpBytes(int connId, const unsigned char* b, size_t n) {
+static void dumpBytes(int connId, const unsigned char* b, size_t n, const char* dir) {
     std::lock_guard<std::mutex> lock(g_dumpMutex);
     if (!g_dump) return;
     // A PDU opcode is the low 6 bits of byte 0; R2T is 0x31 and is what we came for.
@@ -57,7 +57,7 @@ static void dumpBytes(int connId, const unsigned char* b, size_t n) {
         auto rd32 = [](const unsigned char* p) {
             return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
         };
-        fprintf(g_dump, "\n*** conn %d: R2T (opcode 0x31) - 48 bytes ***\n", connId);
+        fprintf(g_dump, "\n*** conn %d [%s]: R2T (opcode 0x31) - 48 bytes ***\n", connId, dir);
         for (int i = 0; i < 48; i += 16) {
             fprintf(g_dump, "  %2d:", i);
             for (int k = 0; k < 16; k++) fprintf(g_dump, " %02X", b[i + k]);
@@ -71,7 +71,7 @@ static void dumpBytes(int connId, const unsigned char* b, size_t n) {
                 rd32(b + 16), rd32(b + 20), rd32(b + 24), rd32(b + 28),
                 rd32(b + 32), rd32(b + 36), rd32(b + 40), rd32(b + 44));
     }
-    fprintf(g_dump, "[conn %d] %zu bytes:", connId, n);
+    fprintf(g_dump, "[conn %d %s] %zu bytes:", connId, dir, n);
     // Up to 512 bytes per chunk, not 64: the login response is a 300+ byte text blob
     // and the negotiated keys in it are the difference this tool exists to find.
     for (size_t i = 0; i < n && i < 512; i++) {
@@ -85,7 +85,7 @@ static void dumpBytes(int connId, const unsigned char* b, size_t n) {
     fflush(g_dump);
 }
 
-static void pump(SOCKET from, SOCKET to, int connId, bool record) {
+static void pump(SOCKET from, SOCKET to, int connId, int record) {
     std::vector<unsigned char> buf(65536);
     size_t recorded = 0;
     for (;;) {
@@ -94,7 +94,7 @@ static void pump(SOCKET from, SOCKET to, int connId, bool record) {
         if (record && recorded < g_maxDump) {
             size_t take = (size_t)n;
             if (recorded + take > g_maxDump) take = g_maxDump - recorded;
-            dumpBytes(connId, buf.data(), take);
+            dumpBytes(connId, buf.data(), take, record == 2 ? "target->init" : "init->target");
             recorded += take;
         }
         int sent = 0;
@@ -169,8 +169,8 @@ int main(int argc, char** argv) {
         printf("[conn %d] connected\n", id);
         fflush(stdout);
 
-        std::thread up([client, upstream, id]() { pump(client, upstream, id, false); });
-        pump(upstream, client, id, true);      // the direction that carries the R2T
+        std::thread up([client, upstream, id]() { pump(client, upstream, id, 2); });
+        pump(upstream, client, id, 1);          // the direction that carries the R2T
         up.join();
         closesocket(client);
         closesocket(upstream);
