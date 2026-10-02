@@ -158,8 +158,11 @@ random file keeps its checksum across a remount.
 | `src/f7_faults.cpp` | F7 — fault injection (peer vanishes, and the reverse) |
 | `src/wire_selftest.c` | Byte-level golden self-test, compiled as both C and C++ |
 | `src/xref_constants.py` | Cross-checks every constant against the two Linux reference headers (97 pairs, 21 of them DH-HMAC-CHAP) |
-| `src/run_all.ps1` | Runs all 11 suites and prints a verdict table (~250 s) |
+| `src/run_all.ps1` | Runs all 12 suites and prints a verdict table (~250 s) |
 | `src/run_f5_auth.ps1` | The six DH-HMAC-CHAP cases (two local ports, no Linux needed) |
+| `src/run_iscsi.ps1` | The iSCSI layer's own tests with **no hardware and no NIC**: 4-byte padding, the BHS accessors, every PDU builder against exact bytes, login-text parsing, the negotiation rules (InitialR2T is OR, ImmediateData is AND, numbers take the smaller value), the R2T burst sizing that protects the backend's staging buffer, and the parked-write table. `-AllToolsets` compiles it with every MSVC toolset on the machine |
+| `src/hygiene.ps1` | The three repository-wide checks CI runs — SPDX headers on every source file, a UTF-8 BOM on every `.ps1`, no mojibake in the three docs — as a script, so the same code gates a push **and** a local run (`run_all.ps1` calls it). The rules used to live only in `ci.yml`, and a push then went red on a BOM its author had no way to check first |
+| `src/tune_initiator.ps1` | Reads, applies or restores Windows' iSCSI initiator tuning (`MaxTransferLength` / `MaxBurstLength` / `MaxRecvDataSegmentLength`), and reloads the driver the way that actually works. `-Show` / `-Apply` / `-Restore` |
 | `src/interop_link.ps1` | Interop link: bridge + address/route move + MTU lowering, with automatic rollback |
 | `src/f5_session.ps1` | **Whole interop session** in one command: link → peer → direction A → discovery → direction B → report file; `-Auth` adds authentication |
 | `src/mount_nvmeof.ps1` | Namespace → fixed VHD → drive letter → push back on unmount |
@@ -212,15 +215,20 @@ cd <repo>\src
 ```
 
 Individually: `run_xref.ps1`, `run_wire.ps1`, `run_auth.ps1`, `run_f1.ps1`, `run_f3.ps1`,
-`run_f4.ps1`, `run_f5.ps1`, `run_f5_auth.ps1`, `run_f6.ps1`, `run_f7.ps1`, `run_stag.ps1`.
+`run_f4.ps1`, `run_f5.ps1`, `run_f5_auth.ps1`, `run_iscsi.ps1`, `run_f6.ps1`, `run_f7.ps1`,
+`run_stag.ps1`.
 
-`run_xref.ps1`, `run_wire.ps1` and `run_auth.ps1` need no NIC and no NetworkDirect SDK, which
-is why CI runs exactly those three (plus three repository-hygiene checks: SPDX headers, UTF-8
-BOMs on every `.ps1`, and no mojibake in the docs). `run_auth.ps1` builds `test_auth.cpp` — the
-DH-HMAC-CHAP primitives and protocol pieces against published vectors — and then hands the same
-exe to `run_authselftest.ps1`, which recomputes the Diffie-Hellman values with
+`run_xref.ps1`, `run_wire.ps1`, `run_auth.ps1` and `run_iscsi.ps1` need no NIC and no
+NetworkDirect SDK, which is why CI runs exactly those four (plus `hygiene.ps1`, the three
+repository-wide checks: SPDX headers, UTF-8 BOMs on every `.ps1`, and no mojibake in the docs —
+the same script `run_all.ps1` runs first). `run_auth.ps1` builds
+`test_auth.cpp` — the DH-HMAC-CHAP primitives and protocol pieces against published vectors — and
+then hands the same exe to `run_authselftest.ps1`, which recomputes the Diffie-Hellman values with
 `System.Numerics.BigInteger` as an independent cross-check. The crypto is therefore verified on
-every push, not only on a machine with the whole stack installed.
+every push, not only on a machine with the whole stack installed. `run_iscsi.ps1` does the same
+for the iSCSI layer: no target, no initiator, no RDMA — it drives the PDU builders, the login
+text, the negotiation rules and the parked-write table directly, so a change to any of them is
+caught before it can reach a session.
 
 Every suite follows the same rule: **delete the old exe → check the compiler's exit code →
 compare source and header timestamps.** A binary that merely *looks* current is never run —
@@ -259,17 +267,31 @@ Get-Disk | Where-Object BusType -eq 'iSCSI'
 Three things worth knowing before you deploy it:
 
 - **Tune both sides or the bridge looks slow for reasons that are not its fault.** Windows' initiator
-  charges a fixed **~16–20 ms per SCSI command and per Data-Out PDU**, so throughput is bought by
+  charges a fixed **~16–20 ms per Data-Out PDU** (write direction), so throughput is bought by
   putting more data behind each one, and both ends must agree or the negotiation takes the smaller
   value:
   1. the initiator's registry — under
      `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4D36E97B-E325-11CE-BFC1-08002BE10318}\0009\Parameters`,
      set `MaxTransferLength=4194304`, `MaxBurstLength=4194304`, `MaxRecvDataSegmentLength=1048576`.
      **These only reload when the device instance is re-enabled**, not on a service restart:
-     `Disable-PnpDevice -InstanceId ROOT\ISCSIPRT\0000 -Confirm:$false` then `Enable-PnpDevice …`;
+     `Disable-PnpDevice -InstanceId ROOT\ISCSIPRT\0000 -Confirm:$false` then `Enable-PnpDevice …`.
+     `src/tune_initiator.ps1` does exactly this — `-Show` to see the current values, `-Apply` to set
+     them, `-Restore` to put the originals back. It finds the device instance itself (by driver
+     description, not by guessing the `0009` suffix), **keeps a one-time backup of the originals in
+     `%ProgramData%\nvmeof-windows-nd\initiator-tuning.json`** that it never overwrites, and
+     `install.ps1` calls it for you (`-NoTuneInitiator` to skip). `uninstall.ps1` restores from that
+     backup, so an uninstall leaves the machine as it found it;
   2. the bridge's burst sizes: `-iscsimbl 4194304 -iscsichunk 1048576` (`install.ps1` passes both,
      `-MaxBurstLength` / `-MaxSegmentLength`). Measured effect: a 4 MiB read **11.9 → 81.9 MB/s**,
      a 4 MiB write **~900 → 69 ms**, all byte-exact (DESIGN §8.68).
+  Note what the second number is *not*: the read direction does **not** get faster with larger
+  Data-In PDUs. Measured across 64 KiB … 1 MiB (DESIGN §8.70), the bridge's Data-In time is flat
+  (~27–34 ms per 4 MiB) because the cost is per byte, and 1 MiB PDUs are the **slowest** of the set
+  (they add 17–25 ms single-PDU window stalls). 256 KiB is the sweet spot and is what Windows offers
+  by default. A single session through this initiator tops out at ~70–80 MB/s whatever the shape,
+  and the queue depth is **always 1** — the bridge's `-iscsitime` prints the measured high-water
+  mark, so "more threads" can be checked rather than assumed (8 concurrent readers measured
+  *slower*, 17.3 MB/s against 77.7).
 - **The service retries instead of dying when the peer is missing.** `install.ps1` passes
   `-backendretry 15`, so if the NVMe-oF target is not up yet the service stays `Running` and
   connects on its own once it appears, rather than exiting and being restarted by the SCM every

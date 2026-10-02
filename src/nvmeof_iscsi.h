@@ -354,6 +354,33 @@ static inline uint32_t iscsiNumberMin(const std::string& offer, uint32_t ours) {
     return ((uint32_t)v < ours) ? (uint32_t)v : ours;
 }
 
+// How much to ask for in one R2T, in bytes.
+//
+//   remaining  bytes of this command still outstanding
+//   maxBurst   MaxBurstLength - the largest burst the wire format allows
+//   maxChunk   the largest single Data-Out PDU (our advertised segment length)
+//   stageMax   what the BACKEND can stage at once; 0 means "no opinion"
+//   bs         block size, because a partial block cannot be written
+//
+// THREE LIMITS, AND THE THIRD ONE IS THE SAFETY ONE.  The burst accumulates in one
+// buffer and is then handed to the backend as ONE command, whose payload is copied
+// into a single registered staging buffer - so a burst larger than that buffer writes
+// past the end of it.  That was reachable: the backend could stage 256 KiB while
+// -iscsimbl (which install.ps1 passes as 4194304, following the initiator's own
+// MaxBurstLength) asked for 4 MiB, and nothing compared the two.  The 64 MiB region
+// has the staging area ~50 MiB into it, so the copy stayed inside registered memory,
+// nothing failed, and the bytes after the buffer were quietly overwritten.  Pure, and
+// unit-tested for exactly that reason (iscsi_selftest.cpp).
+static inline uint32_t iscsiBurstSize(uint32_t remaining, uint32_t maxBurst,
+                                      uint32_t maxChunk, uint32_t stageMax,
+                                      uint32_t bs) {
+    uint32_t burstMax = (maxBurst > maxChunk) ? maxBurst : maxChunk;
+    if (stageMax && burstMax > stageMax) burstMax = stageMax;
+    uint32_t chunk = (remaining < burstMax) ? remaining : burstMax;
+    if (bs && (chunk % bs)) chunk -= chunk % bs;
+    return chunk;
+}
+
 // ---------------------------------------------------------------------------
 //  The BHS: 48 bytes in every PDU.  Accessors are named after the FIELD, so a call
 //  site reads like the RFC table rather than like an offset.
@@ -668,6 +695,14 @@ public:
             // reads 669 us, i.e. no change.  Kept because a larger buffer is the
             // right default for a bulk transport and costs nothing, but it is NOT
             // what limits this path - DESIGN 8.61.
+            // RE-MEASURED with the depth work (DESIGN 8.70), this time from the other
+            // side: a Windows read of 4 MiB is 16 Data-In PDUs and our send() blocks on
+            // them for 25-31 ms.  The obvious reading is "our send buffer is too small
+            // to keep the pipe full", so SO_SNDBUF was raised to 8 MiB - larger than a
+            // whole command - and the blocking did NOT go away (12.7-25.6 ms, one command
+            // at 12.7) while end-to-end throughput did not move (67.3 MB/s against 68.7).
+            // A sender that is never allowed to buffer a command cannot be the limit; the
+            // receiver drains at ~150 MB/s and that is the rate we get to send at.
             int sndbuf = 1 << 20, rcvbuf = 1 << 20;
             setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&sndbuf, sizeof(sndbuf));
             setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
@@ -699,6 +734,14 @@ public:
                 printf("  [iscsi] session ended (%s) %s: %ld command(s), %llu bytes in, "
                        "%llu bytes out\n", t->peer.c_str(), ok ? "logout" : "connection closed", t->cmds,
                        (unsigned long long)t->bytesIn, (unsigned long long)t->bytesOut);
+                // -iscsitime: the depth the initiator really ran at, so "no speedup from
+                // concurrency" can be attributed to the wire or to its own serialisation.
+                if (g_iscsiTime && t->depthSamples) {
+                    printf("  [iscsi] initiator depth: high-water %u over %u command(s); "
+                           "1=%u, 2-4=%u, 5-8=%u, 9+=%u\n",
+                           t->depthHighWater, t->depthSamples,
+                           t->depth1, t->depth2to4, t->depth5to8, t->depth9plus);
+                }
                 t->stop();
                 delete t;
             }).detach();
@@ -776,6 +819,10 @@ private:
     std::chrono::steady_clock::time_point tCmdHr;   // high-resolution command start
     // -iscsitime: when our last SCSI response went out, so the gap to the next
     // command can be attributed to the initiator rather than to this target.
+    // -iscsitime: in-flight depth observed on the wire (CmdSN window usage) and how
+    // often the initiator had more work already queued in our socket.
+    uint32_t maxCmdSnSeen = 0, depthHighWater = 0, depthSamples = 0;
+    uint32_t depth1 = 0, depth2to4 = 0, depth5to8 = 0, depth9plus = 0, queuedSamples = 0;
     std::chrono::steady_clock::time_point tPrevResp;
     bool havePrevResp = false;
     bool loggedIn, discovery;
@@ -1129,7 +1176,9 @@ private:
     bool handleScsi(IscsiBackend& be, const IscsiBhs& bhs, std::vector<uint8_t>& scratch);
     // A WRITE with more data than the command PDU carried is parked in pending_
     // and the R2T goes out from here; the data comes back through handleDataOut.
-    bool sendNextR2T(PendingWrite& pw);
+    // `stageMax` is the backend's staging limit (be.maxTransfer()) and bounds the
+    // burst, because the burst is staged as ONE unit before one NVMe WRITE.
+    bool sendNextR2T(PendingWrite& pw, uint32_t stageMax);
     bool handleDataOut(const IscsiBhs& d, const std::vector<uint8_t>& payload,
                        IscsiBackend& be);
     bool sendInquiry(const IscsiBhs& bhs, IscsiBackend& be, IscsiBackend* be2);
@@ -1674,12 +1723,9 @@ inline bool IscsiTarget::sendInquiry(const IscsiBhs& bhs, IscsiBackend& be, Iscs
 //  replaced asked for 65536 at a time and worked up to one command - but the
 //  whole-burst form is the one the reference uses.
 // ---------------------------------------------------------------------------
-inline bool IscsiTarget::sendNextR2T(PendingWrite& pw) {
+inline bool IscsiTarget::sendNextR2T(PendingWrite& pw, uint32_t stageMax) {
     const uint32_t remaining = pw.bytes - pw.received;
-    uint32_t burstMax = g_iscsiMaxBurst;
-    if (burstMax < maxChunk) burstMax = maxChunk;
-    uint32_t chunk = (remaining < burstMax) ? remaining : burstMax;
-    if (pw.bs && (chunk % pw.bs)) chunk -= chunk % pw.bs;
+    const uint32_t chunk = iscsiBurstSize(remaining, g_iscsiMaxBurst, maxChunk, stageMax, pw.bs);
     if (chunk == 0) {
         printf("  [iscsi] write stalled: %u of %u byte(s) received, no whole block left\n",
                pw.received, pw.bytes);
@@ -1751,7 +1797,7 @@ inline bool IscsiTarget::handleDataOut(const IscsiBhs& d, const std::vector<uint
         curDataOut = total;
         return sendScsiRsp(itt, SCSI_STATUS_GOOD, nullptr, 0, 0, false);
     }
-    return sendNextR2T(pw);
+    return sendNextR2T(pw, be.maxTransfer());
 }
 
 inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
@@ -1762,6 +1808,20 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
     const uint64_t nblocks = be.blocks();
     const uint32_t edtl = bhs.edtl();
     cmds++;
+    // -iscsitime: HOW DEEP IS THE INITIATOR ACTUALLY RUNNING?  CmdSNs are sequential and
+    // each command is acknowledged once, so at the moment this command arrives,
+    // (highest CmdSN seen so far - this one) is the number of commands the initiator has
+    // already sent beyond this one: its real in-flight depth on the wire, as opposed to
+    // the window we advertised.  It is the difference between "Windows is not pipelining"
+    // and "Windows pipelines and its own per-command cost is the limit", which two
+    // measurements 20x apart seemed to contradict (DESIGN 8.68, 8.70).
+    if (g_iscsiTime) {
+        if (bhs.cmdSn() > maxCmdSnSeen) maxCmdSnSeen = bhs.cmdSn();
+        const uint32_t behind = maxCmdSnSeen - bhs.cmdSn();
+        depthHighWater = (behind + 1 > depthHighWater) ? behind + 1 : depthHighWater;
+        depthSamples++;
+        if (behind == 0) depth1++; else if (behind < 4) depth2to4++; else if (behind < 8) depth5to8++; else depth9plus++;
+    }
     expCmdSn = bhs.cmdSn() + 1;              // this command is acknowledged
     curEdtl = edtl;                          // for the automatic residual below
     curDataOut = 0;
@@ -1876,6 +1936,8 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
         auto tCmd = std::chrono::steady_clock::now();
         long long nvmeTotalUs = 0, sendTotalUs = 0;
         uint32_t pduCount = 0;
+        long long pduMaxUs = 0;
+        uint32_t pduMaxPart = 0, pduSlow = 0;
         while (offset < bytes) {
             // ---- one NVMe read per *staging unit*, one Data-In PDU per chunk ----
             //
@@ -1954,9 +2016,19 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
                 auto tSend = std::chrono::steady_clock::now();
                 bool ok = sendDataIn(bhs.itt(), scratch.data() + sent, part, offset + sent,
                                      dataSn++, last);
-                sendTotalUs += std::chrono::duration_cast<std::chrono::microseconds>(
-                                   std::chrono::steady_clock::now() - tSend).count();
+                long long pduUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - tSend).count();
+                sendTotalUs += pduUs;
                 pduCount++;
+                // Is the per-byte cost of a Data-In PDU a smooth rate or a stall?
+                // The two need opposite fixes (fewer/larger PDUs vs. something that
+                // waits on a timer), and the aggregate line cannot tell them apart.
+                if (pduUs > pduMaxUs) { pduMaxUs = pduUs; pduMaxPart = part; }
+                if (pduUs >= 5000) pduSlow++;
+                if (g_iscsiTrace) {
+                    printf("      [iscsi] Data-In %u B -> %lld us%s\n", part, pduUs,
+                           pduUs >= 5000 ? "   <-- STALL" : "");
+                }
                 if (!ok) {
                     return false;
                 }
@@ -1967,9 +2039,10 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
             long long totalUs = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - tCmd).count();
             printf("  [iscsi] time READ %llu B: total %lld us, nvme %lld us, datain %lld us, "
-                   "%u PDU(s), other %lld us\n",
+                   "%u PDU(s), other %lld us; slowest PDU %lld us (%u B), %u PDU(s) >= 5 ms\n",
                    (unsigned long long)bytes, totalUs, nvmeTotalUs, sendTotalUs, pduCount,
-                   totalUs - nvmeTotalUs - sendTotalUs);
+                   totalUs - nvmeTotalUs - sendTotalUs,
+                   pduMaxUs, pduMaxPart, pduSlow);
         }
         return sendScsiRsp(bhs.itt(), SCSI_STATUS_GOOD, nullptr, 0, 0, false);
     }
@@ -2165,7 +2238,7 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
         pw->bytes = (uint32_t)bytes;
         pw->received = offset;
         pw->ttt = nextTtt++;
-        return sendNextR2T(*pw);
+        return sendNextR2T(*pw, be.maxTransfer());
     }
 
     case 0x35:                               // SYNCHRONIZE CACHE(10)

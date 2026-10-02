@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # ===========================================================================
 #  run_all.ps1 - run the whole suite in order and print one summary table.
@@ -20,7 +20,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $src = $PSScriptRoot
-$all = @('run_xref.ps1', 'run_wire.ps1', 'run_iscsi.ps1', 'run_auth.ps1', 'run_f1.ps1', 'run_f3.ps1',
+$all = @('hygiene.ps1', 'run_xref.ps1', 'run_wire.ps1', 'run_iscsi.ps1', 'run_auth.ps1', 'run_f1.ps1', 'run_f3.ps1',
          'run_f4.ps1', 'run_f5.ps1', 'run_f5_auth.ps1', 'run_f6.ps1', 'run_f7.ps1',
          'run_stag.ps1')
 $scripts = if ($Only.Count -gt 0) { $Only } else { $all }

@@ -4327,6 +4327,182 @@ PDU + 后端四次 256 KiB 写；测得 69 ms 里绝大部分是那 4 个 PDU �
 要么让代码在**所有**装得到的工具集上都过，并且让环境信息随日志一起落下来。本机这次的代价是
 21 封失败邮件和一次本可以避免的排查。
 
+---
+
+### 8.70 ✅ 桥的在途深度**恒为 1**；"每 PDU 20 ms"这个假设被自己的 PDU 扫描推翻；以及一个静默写越界
+
+§8.68 结束时留下的问题是：桥侧每条命令 29 ms，而 Windows 侧的客户端测到 50-58 ms，中间那 ~20 ms
+到底在谁那里。当时的假设是"Windows 每条 Data-Out PDU 固定 ~16-20 ms"，**这个假设在本节被推翻**——
+推翻它的是给桥加的在途深度直方图，加上一次 Data-In PDU 尺寸扫描。顺带抓到一个真实的越界写。
+
+#### (0) 先给结论
+
+1. **在途深度恒为 1。** 桥侧直方图在 29 条命令上读到 `high-water 1; 1=29, 2-4=0, 5-8=0, 9+=0`。
+   Windows initiator 从来不会在这个会话上排第二条命令。所以"靠并发提吞吐"这条路**不存在**，
+   而 8 个线程去读同一块盘不但没用，还**更慢**：单线程 77.7 MB/s，8 线程 17.3 MB/s。
+2. **Data-In 的成本是按字节，不是按 PDU。** 4 MiB 命令扫遍 64 KiB…1 MiB 的 PDU 尺寸，
+   `datain` 总时长几乎不动（27-34 ms），PDU 数从 64 降到 4。**1 MiB PDU 反而最慢**，因为出现
+   17-25 ms 的单 PDU 停顿。原来 256 KiB 的形状已经是甜点。
+3. **客户端那 ~20 ms 同样按字节算**，约 13-15 ms/MiB（≈70-80 MB/s），和命令大小无关：
+   64 KiB 命令 0.79 ms（79 MB/s，§8.57 的数据）、4 MiB 命令 54.75 ms（73 MB/s）。
+   也就是说这条路径的上限是"每个会话 ~75 MB/s"，不是"每条命令 N ms"。**§8.68 里"每条命令 16-20 ms"
+   的说法只在读方向上是错的**（写方向按 Data-Out PDU 计的那条仍然成立，见 §8.68(2) 的实测）。
+4. 代码因此动了三处：staging 256 KiB → 4 MiB（**读路径中性**，但让 `-iscsichunk` 这个旋钮不再
+   骗人）、R2T burst 按后端能力夹紧（**真实越界修复**）、每 PDU 计时与 `slowest PDU` 落进 `-iscsitime`。
+
+#### (1) 仪器：在途深度直方图
+
+`-iscsitime` 现在在每个会话结束时打印一行（`nvmeof_iscsi.h`，随 CmdSN 窗口维护）：
+
+```
+[iscsi] initiator depth: high-water 1 over 29 command(s); 1=29, 2-4=0, 5-8=0, 9+=0
+```
+
+深度按"我们已回但 initiator 还没确认"的在途命令数采样：每收到一条 SCSI Command 就更新
+`maxCmdSnSeen`，与已完成的 ITT 数相减。它回答的问题只有一个：**这个会话上到底有没有并发**。
+在 §8.67 那轮"深度 1 只有 4.8 MiB/s"的结论里，深度是靠命令行参数假设的；现在它是量出来的。
+
+#### (2) 深度实测：并发不存在，而且反向生效
+
+同一块桥（`-iscsimbl 4194304 -iscsichunk 1048576`），同一块 48 MiB namespace：
+
+| 客户端形状 | 吞吐 | 每条 4 MiB 命令 |
+|---|---|---|
+| 单线程 QD1（overlapped，深度 1） | 71.0 MB/s | 56.4 ms |
+| 单线程 QD8（overlapped，深度 8） | 71.8 MB/s | 55.7 ms |
+| 1 个线程 | 77.7 MB/s | 50.6 ms |
+| 4 个线程 | 67.0 MB/s | 202.0 ms |
+| **8 个线程** | **17.3 MB/s** | **335.8 ms** |
+
+QD8 和 QD1 同速，就是"深度只有 1"的独立复现：客户端提交 8 条重叠 I/O，桥侧依然一次只看到一条。
+8 线程那条更值得记：**更多的并发让同一条串行管道变慢 4.5 倍**，每条命令的墙钟从 50 ms 涨到 336 ms
+——命令在管道里排队，而线程本身还在加锁/唤醒。对一个 iSCSI 盘，"多开几个线程"是负优化。
+
+#### (3) PDU 尺寸扫描：成本按字节算
+
+4 MiB 命令，staging 4 MiB，只改 `-iscsichunk`（= 我们通告的 MaxRecvDataSegmentLength，
+因而就是 Data-In PDU 上限）：
+
+| Data-In PDU | 数量 | `datain` 总时长 | 单 PDU 均值 | ≥5 ms 的 PDU | 客户端 |
+|---|---|---|---|---|---|
+| 64 KiB | 64 | 31.5-32.3 ms | 0.49 ms | 0 | 62.2 MB/s |
+| 128 KiB | 32 | 27.6-28.6 ms | 0.87 ms | 0 | **69.2 MB/s** |
+| 256 KiB | 16 | 27.0-28.0 ms | 1.73 ms | 0 | 68.7 MB/s |
+| 512 KiB | 8 | 19.8-33.6 ms | 2.5-4.2 ms | 1 | 67.4 MB/s |
+| 1 MiB | 4 | 33.4-34.1 ms | 8.4 ms | 2 | 63.7 MB/s |
+
+读法：**总时长对 PDU 数不敏感**（64 个 PDU 和 4 个 PDU 差不多），所以不是"每 PDU 一次固定开销"。
+同时 512 KiB/1 MiB 档出现 17-25 ms 的**单个** PDU 停顿——这是典型的窗口/延迟 ACK 形状：一次发得太多，
+发送方要等窗口更新。两个方向的结论一致：**每字节 ~150 MB/s 的接收速率**才是这一侧的极限，
+把 PDU 做大只会把"平滑限速"变成"限速 + 停顿"。256 KiB 是甜点，而它正是 Windows 自己开出来的值。
+
+顺带把 `-iscsichunk` 的**上限**接上了：PDU 尺寸是 `min(staging 单元, chunk)`，所以当 staging 只有
+256 KiB 时，`-iscsichunk 1048576` 是**不可能生效**的——它却一直默默接受。现在超限会打印一行说明。
+
+#### (4) 发送缓冲不是限制（再确认一次）
+
+§8.61 已经从"64 KiB PDU 正好填满默认发送缓冲"这个角度否过一次。这次从反方向再否一次：把
+`SO_SNDBUF` 提到 8 MiB（大于一整条 4 MiB 命令），让 `send()` 理论上永远不阻塞——
+
+- 阻塞**没有消失**：`datain` 仍是 12.7-25.6 ms（其中一条 12.7 ms，其余 ~25 ms）；
+- 端到端吞吐**没有变化**：67.3 MB/s（对照 68.7）。
+
+一个连一条命令都缓冲得下的发送方不可能是瓶颈。瓶颈在接收侧，而我们只是被它按住的发送方。
+代码回到 1 MiB，并把这次测量写进了那行注释。
+
+#### (5) 一个静默的越界写（R2T burst vs staging 缓冲）
+
+写路径把**整个 burst** 攒在 `pw.buf` 里，然后作为**一条** NVMe 命令交给后端；后端的 `xfer()`
+把这段字节 `memcpy` 进**唯一一块**注册过的 staging 缓冲（`kIscsiBytes`，在 64 MiB region 里）。
+而 burst 上限算的是 `max(g_iscsiMaxBurst, maxChunk)`：`install.ps1` 按 initiator 的
+MaxBurstLength 传 `-iscsimbl 4194304`，所以 burst = 4 MiB，**而缓冲只有 256 KiB**。没有任何代码
+比较过这两个数。
+
+后果不会崩：region 有 64 MiB，staging 区在 ~50 MiB 处，4 MiB 的拷贝仍然落在注册内存里。
+它只是安静地覆盖了缓冲区**后面**的字节。这类 bug 不会报错，只会在某个未来版本里表现成
+"没有明显原因的损坏"。
+
+修法是把规则抽成纯函数并由自检门禁（`iscsiBurstSize`，`iscsi_selftest.cpp` 7 项检查）：
+
+```c
+static inline uint32_t iscsiBurstSize(uint32_t remaining, uint32_t maxBurst,
+                                      uint32_t maxChunk, uint32_t stageMax, uint32_t bs);
+```
+
+**写自检的时候顺手抓到的是我自己写错的预期值**：`iscsiBurstSize(1000000, …, bs=512)`
+我写的是 1000000，实际 999936（`1000000 % 512 = 64`）。函数是对的，检查是错的——
+这正是"检查必须能失败"的一个实例。
+
+#### (6) staging 256 KiB → 4 MiB：**读路径中性**，但旋钮和写路径都因此正确
+
+诚实记账，因为这处改动最初是带着"1 MiB PDU 会更快"的假设做的：
+
+- **读路径没有变快。** 4 MiB 读在 256 KiB staging（16 条 NVMe 读 + 16 个 256 KiB PDU）下是
+  29.1 ms（datain 26.2 ms）；在 4 MiB staging（1 条 NVMe 读 + 16 个 PDU）下是 30.1 ms
+  （nvme 2.5 ms，datain 27.6 ms）。差别在噪声里——因为 PDU 形状根本没变（见 (3)）。
+- **NVMe 命令数从 16 降到 1**（4 MiB 读）。在 loopback 上只值 2.5 ms 里的一小部分，但在真实
+  fabric 上，每条 NVMe 命令都要一次 RDMA 往返：16 次 × 5 µs 对 1 次 × 5 µs 是 80 µs 对 5 µs。
+- **它让 `-iscsichunk` 不再是空头支票**，并且让 (5) 的夹紧有意义（缓冲 ≥ 一整个 Windows 传输）。
+
+#### (7) 现在的天花板，以及"还能怎么快"
+
+单会话读 ≈ 68-70 MB/s（4 MiB 命令）、写 4 MiB 127 ms / 16 MiB 253 ms（含 `FlushFileBuffers`，
+两处见证逐字节一致）。这个数字由**两段串联的 per-byte 成本**决定：桥侧把 4 MiB 推进 socket 要
+27 ms（≈150 MB/s，被接收端按住），客户端自己还要 ~28 ms（≈140 MB/s）。
+
+- **MC/S（多连接）在当前深度下没用。** initiator 开了 `MaxConnections=32`，但命令是一条一条发的，
+  一条命令的 Data-In 又必须走同一条连接，所以多连接只会多出几套握手的开销。
+- **我们这侧已经不再是限制。** 数据路径的每一段都量过：NVMe 2.5 ms、socket 写入按接收速率被按住、
+  其它 <20 µs。要再往上走，得改的是 Windows initiator 的接收路径，那不是本仓库的东西。
+- 这也是 §8.67 那个"深度 1 只有 4.8 MiB/s"的完整答案：**深度锁死 1 + 每字节 ~13-15 ms/MiB**，
+  两条都是 Windows 侧的性质，桥只能把每条命令做到接近 100% 的传输效率。
+
+#### (8) 复现
+
+```powershell
+# 后端 + 桥（-iscsitime 打开深度直方图与每 PDU 计时）
+.\run_f5.ps1 -BuildOnly
+f5_interop.exe -target 192.168.100.2 4420 -serve 0 -nsfile D:\nvmeof\ns48.img
+f5_interop.exe -initiator 192.168.100.2 4420 192.168.100.3 -iscsi 3260 `
+               -iscsirw -iscsitime -iscsimbl 4194304 -iscsichunk 1048576
+# 挂载后 4 MiB 顺序读，然后注销会话，读那一行 depth
+iscsicli LogoutTarget <sid>   # -> "initiator depth: high-water 1 over N command(s)"
+```
+
+改 PDU 尺寸就改 `-iscsichunk`（256 KiB 是最优档）；写路径的越界由 `run_iscsi.ps1` 门禁。
+
+---
+
+### 8.71 ✅ CI 又红了一次——这次是 BOM，而且是我自己的写入工具造成的；规则因此从 CI 里搬了出来
+
+上一轮（§8.69）刚把三条仓库级卫生检查加进 CI，下一轮 push 就被它抓住了：
+
+```
+no UTF-8 BOM: src/install.ps1
+no UTF-8 BOM: src/run_all.ps1
+no UTF-8 BOM: src/tune_initiator.ps1
+no UTF-8 BOM: src/uninstall.ps1
+```
+
+四个文件都是那一轮刚改过的（`-iscsimbl`/`-iscsichunk` 参数、调优接入安装、从备份还原）。
+根因不在编辑器：**任何按"无 BOM UTF-8"写文件的工具都会静默剥掉 BOM**，而 PowerShell 7 照样
+执行、diff 里也看不出来——只有 Windows PowerShell 5.1 会把它当 ANSI 读，那时脚本里每一处
+非 ASCII 字符串比较都会悄悄失效。也就是说：**这个错误在开发机上完全不可见，只在 CI 上变红。**
+
+两个动作：
+
+1. **规则从 `ci.yml` 搬进 `src/hygiene.ps1`。** 在这之前，CI 是唯一能执行这三条检查的地方——
+   一次 push 因此变成一次"用 red X 换自查"，而那是可以避免的间接代价。现在同一份实现被两个
+   调用者使用：CI 的 hygiene 步骤，以及 `run_all.ps1` 的第一项（本地全量门禁）。脚本自己发
+   `::error::` annotation，所以失败原因不需要 job log 的 admin 权限就能看到。
+2. **反向验证过它真的会失败**：临时去掉 `run_stag.ps1` 的 BOM，脚本退出 1 并打印那条
+   annotation；字节还原后退回 0 且 `git diff` 为空。**一个不会失败的检查不是检查**（§8.6 的同一条
+   教训，只是这次用在了脚本自己身上）。
+
+顺带修掉一个真 bug 式的写法：这类脚本里必须用**绝对路径**。第一版复现用的是相对路径，而 .NET 的
+静态文件方法按**进程工作目录**解析（不是 PowerShell 的当前位置），于是从别处运行时每个文件都报
+"missing"，输出一片假红。**假失败比没有检查更糟**——它训练读者忽略输出。
+
 ## 7. 已知风险
 
 | 风险 | 说明 | 缓解 |

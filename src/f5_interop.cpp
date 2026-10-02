@@ -155,7 +155,16 @@ static const size_t kDsmOff       = kAuthOff + kAuthBytes;
 // are handed to the NVMe queue (and vice versa).  It has to be inside the registered
 // region - the SGL names this address - and 64 KiB of it is what the R2T loop asks
 // for at a time.  256 KiB leaves room for the text/sense payloads that share it.
-static const size_t kIscsiBytes   = 256u * 1024;
+// IT WAS 256 KiB, AND THAT WAS THE CEILING ON READ THROUGHPUT.  Measured with
+// -iscsitime through a 4 MiB Windows read: 16 NVMe reads and 16 Data-In PDUs of
+// 256 KiB, 29.1 ms total, of which the socket writes were 26.2 ms and the NVMe side
+// only 2.6 ms.  The initiator had offered MaxRecvDataSegmentLength=1048576 and the
+// bridge had negotiated it (-iscsichunk 1048576), but a 1 MiB PDU cannot exist while
+// the staging unit is 256 KiB: PDU size is min(unit, chunk), so the buffer silently
+// overrode the knob.  One Windows transfer (MaxTransferLength) is 4 MiB, so that is
+// the size that makes a 4 MiB read ONE NVMe read plus four 1 MiB Data-In PDUs.
+// DESIGN 8.70 has the before/after.
+static const size_t kIscsiBytes   = 4u * 1024 * 1024;
 static const size_t kIscsiOff     = (kDsmOff + kDsmBytes + 511) & ~(size_t)511;
 static_assert(kIscsiOff + kIscsiBytes <= kRegionBytes,
               "the iSCSI chunk buffer must be inside the registered region, or every "
@@ -1569,7 +1578,7 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
     //   * 0x07 and 0x0f -> SUCCESS (Number of Queues and Keep Alive Timeout)
     //
     // ON A DISCOVERY CONTROLLER THE EXPECTATION FLIPS, and getting that wrong is a
-    // mistake this project has now made three times (閹?.50(4), then the log pages,
+    // mistake this project has now made three times (DESIGN 8.50(4), then the log pages,
     // then here): a discovery controller has no write cache, no namespaces and no
     // event mask, so nvmet refuses all four.  The discovery session against Linux
     // reported three FAILs on a perfectly good peer because of it - the checks below
@@ -4429,6 +4438,16 @@ int main(int argc, char** argv) {
         // service restart (DESIGN 8.68).
         else if (strcmp(argv[i], "-iscsichunk") == 0 && i + 1 < argc) {
             long v = atol(argv[++i]);
+            // Clamped to the staging buffer, not just to the wire format.  The PDU
+            // size is min(staging unit, this value), so a larger value cannot take
+            // effect - and it silently did not for as long as the buffer was 256 KiB
+            // while this knob accepted 1 MiB without complaint (DESIGN 8.70).
+            if (v > (long)kIscsiBytes) {
+                printf("  -iscsichunk: %ld exceeds the %llu-byte staging buffer; "
+                       "using %llu\n", v, (unsigned long long)kIscsiBytes,
+                       (unsigned long long)kIscsiBytes);
+                v = (long)kIscsiBytes;
+            }
             if (v >= 512 && v <= 16777215) g_iscsiChunk = (uint32_t)v;
             else printf("  -iscsichunk: %ld is outside 512..16777215, ignored\n", v);
         }

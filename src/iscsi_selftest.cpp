@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // ---------------------------------------------------------------------------
 //  iSCSI/SCSI protocol self-test.  NO HARDWARE, NO INITIATOR, NO RDMA CARD.
@@ -242,6 +242,45 @@ static void test_negotiation(void) {
 }
 
 // ---------------------------------------------------------------------------
+//  5b. The R2T burst size, including the limit that protects the backend buffer
+// ---------------------------------------------------------------------------
+static void test_burst_size(void) {
+    // The regression: MaxBurstLength 4 MiB (what install.ps1 pushes, mirroring the
+    // initiator's own value) against a backend that can stage 256 KiB.  Before the
+    // clamp this returned 4194304 and the backend copied 4 MiB into a 256 KiB buffer.
+    CHECK_EQ_U32(iscsiBurstSize(4194304u, 4194304u, 262144u, 262144u, 512u), 262144u,
+                 "a 4 MiB burst is clamped to what the backend can stage");
+    CHECK_EQ_U32(iscsiBurstSize(4194304u, 4194304u, 262144u, 4194304u, 512u), 4194304u,
+                 "with a 4 MiB staging buffer the whole 4 MiB burst goes out in one R2T");
+    // stageMax == 0 is "the backend has no opinion", which must NOT mean "zero bytes".
+    CHECK_EQ_U32(iscsiBurstSize(4194304u, 4194304u, 262144u, 0u, 512u), 4194304u,
+                 "a backend with no staging preference does not veto the burst");
+    // The burst is never larger than the PDU size when the PDU size is the bigger of
+    // the two: asking for more than one PDU in a single R2T would still be legal, but
+    // this is the rule sendNextR2T has always used, so it is pinned here.
+    CHECK_EQ_U32(iscsiBurstSize(1048576u, 262144u, 1048576u, 4194304u, 512u), 1048576u,
+                 "the larger of MaxBurstLength and our segment length is the burst");
+    // The tail: a burst never exceeds what is still outstanding, so the last R2T of a
+    // command asks for the remainder only.  bs = 1 here so that the block rounding
+    // below cannot be what the check is measuring - the first draft of this check
+    // used bs = 512 and expected 1000000, and 1000000 is not a multiple of 512.
+    CHECK_EQ_U32(iscsiBurstSize(1000000u, 4194304u, 262144u, 4194304u, 1u), 1000000u,
+                 "the last burst is the remainder, not a full burst");
+    CHECK_EQ_U32(iscsiBurstSize(1000000u, 4194304u, 262144u, 4194304u, 512u), 999936u,
+                 "the same remainder rounds down to a whole number of blocks");
+    // Whole blocks only: a burst that is not a multiple of the block size would make
+    // the backend write a partial block, and the residual arithmetic would be wrong.
+    CHECK_EQ_U32(iscsiBurstSize(1000000u, 4194304u, 262144u, 4194304u, 4096u), 999424u,
+                 "the burst is truncated to whole blocks");
+    CHECK_EQ_U32(iscsiBurstSize(4096u, 4194304u, 262144u, 4194304u, 4096u), 4096u,
+                 "a single block still asks for a whole block");
+    // A remainder smaller than one block has no whole block left; 0 is the caller's
+    // signal to refuse, and it must not be confused with a valid small burst.
+    CHECK_EQ_U32(iscsiBurstSize(2048u, 4194304u, 262144u, 4194304u, 4096u), 0u,
+                 "less than one block left yields 0, the caller's refusal signal");
+}
+
+// ---------------------------------------------------------------------------
 //  6. The parked-write table: the rules that keep a write state machine bounded
 // ---------------------------------------------------------------------------
 static void test_pending_table(void) {
@@ -396,12 +435,13 @@ int main(void) {
     test_builders();
     test_login_text();
     test_negotiation();
+    test_burst_size();
     test_pending_table();
     test_write_flow();
 
     if (g_failures == 0) {
         printf("  iscsi self-test: PASS (padding, BHS, PDU builders, login text, "
-               "negotiation rules, parked-write table)\n");
+               "negotiation rules, R2T burst sizing, parked-write table)\n");
         return 0;
     }
     printf("  iscsi self-test: %d FAILURE(S)\n", g_failures);

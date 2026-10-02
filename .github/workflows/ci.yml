@@ -183,37 +183,15 @@ jobs:
       #   * a .ps1 rewritten as ASCII, losing its BOM (Windows PowerShell 5.1 then
       #     reads it as ANSI and every non-ASCII string comparison breaks)
       #   * a doc re-encoded from BOM-less UTF-8, so Chinese text became mojibake
+      #
+      # THE CHECKS THEMSELVES LIVE IN src/hygiene.ps1, not here.  They used to be
+      # inline in this file, which meant the only way to run them was to push - and a
+      # push went red on a BOM whose author had no way to check it first (four .ps1
+      # files written by a tool that does not emit BOMs).  One implementation, two
+      # callers: this step and run_all.ps1, i.e. the same code gates a push and a
+      # local full run.  The script emits ::error:: annotations itself, so a failure
+      # is readable without admin rights on the job log.
       - name: Repository hygiene (SPDX headers, .ps1 BOMs, doc encoding)
+        working-directory: src
         shell: pwsh
-        run: |
-          $bad = @()
-
-          foreach ($f in (git ls-files)) {
-            if ($f -notmatch '\.(c|cpp|h|ps1|sh|py)$') { continue }
-            $head = (Get-Content -LiteralPath $f -TotalCount 5 -ErrorAction SilentlyContinue) -join "`n"
-            if ($head -notmatch 'SPDX-License-Identifier') { $bad += "SPDX missing: $f" }
-          }
-
-          foreach ($f in (git ls-files '*.ps1')) {
-            $bytes = [System.IO.File]::ReadAllBytes($f)
-            if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
-              $bad += "no UTF-8 BOM: $f"
-            }
-          }
-
-          $mojibake = $false
-          foreach ($f in @('README.md', 'README.zh-CN.md', 'DESIGN.md')) {
-            if (-not (Test-Path $f)) { continue }
-            $text = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8)
-            if ($text -match '[\u00C2-\u00C3][\u0080-\u00BF]' -or
-                $text -match '[\u00E0-\u00EF][\u0080-\u00BF][\u0080-\u00BF]') {
-              $bad += "mojibake (UTF-8 read as ANSI and re-encoded): $f"
-            }
-          }
-
-          if ($bad.Count -gt 0) {
-            $bad | ForEach-Object { Write-Host "  $_" }
-            $bad | Select-Object -First 10 | ForEach-Object { Write-Host "::error::$_" }
-            throw "$($bad.Count) hygiene check(s) failed"
-          }
-          Write-Host "SPDX headers, .ps1 BOMs and doc encoding all check out"
+        run: .\hygiene.ps1

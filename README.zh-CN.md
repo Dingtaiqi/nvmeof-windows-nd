@@ -28,10 +28,13 @@
 | `src/nvmeof_dhchap.h` | DH-HMAC-CHAP 协议：密钥解析（DHHC-1 + CRC32）、`Kt` 变换、target 半边、host 半边、环回自检 |
 | `src/wire_selftest.c` | 字节级 golden 自检，C 与 C++ 双份编译 |
 | `src/xref_constants.py` | 常量与两份 Linux 参考头文件**逐值比对**（97 对，含 DH-HMAC-CHAP 的 21 个） |
-| `src/run_all.ps1` | 一次跑完全部 10 套并给结论表（约 220 秒） |
+| `src/run_all.ps1` | 一次跑完全部 12 套并给结论表（约 180 秒） |
 | `src/interop_link.ps1` | 互操作链路：桥接 + 搬 IP/路由 + 降 MTU，失败自动回滚 |
 | `src/f5_session.ps1` | **互操作整场**：链路 → 对端 → 方向 A → discovery → 方向 B → 一份报告文件；`-Auth` 换成带认证的版本 |
 | `src/run_f5_auth.ps1` | DH-HMAC-CHAP 六个用例（本机两口直连，不需要 Linux） |
+| `src/run_iscsi.ps1` | iSCSI 层自己的测试，**不需要硬件也不需要网卡**：4 字节 padding、BHS 取值器、每个 PDU 构造器对精确字节、login 文本解析、协商规则（InitialR2T 取 OR、ImmediateData 取 AND、数字键取小值）、保护后端 staging 缓冲的 R2T burst 尺寸、挂起写表。`-AllToolsets` 用机器上每个 MSVC 工具集各编一遍 |
+| `src/hygiene.ps1` | CI 的三条仓库级检查——每个源文件有 SPDX 头、每个 `.ps1` 有 UTF-8 BOM、三份文档无乱码——做成脚本，于是**同一份代码既门禁 push 也门禁本地全量**（`run_all.ps1` 第一项就是它）。这些规则原先只写在 `ci.yml` 里，结果一次 push 因为 BOM 变红，而写它的人当时没有任何办法先自查 |
+| `src/tune_initiator.ps1` | 读 / 应用 / 还原 Windows iSCSI initiator 的调优（`MaxTransferLength` / `MaxBurstLength` / `MaxRecvDataSegmentLength`），并用**真正有效**的方式重载驱动。`-Show` / `-Apply` / `-Restore` |
 | `src/nvmeof_iscsi.h` | **用户态 iSCSI target**：三段式 login、SendTargets、NOP/Logout/TaskMgmt、SCSI 命令集（INQUIRY/VPD、MODE SENSE、READ CAPACITY、REPORT LUNS、READ/WRITE(10/16) 走 R2T、SYNCHRONIZE CACHE）。每连接一个对象一个线程，backend（一条队列对）用互斥量串行。装不进命令 PDU 的写按 ITT 挂起成状态（`PendingWrite`，窗口 8），不是在 `handleScsi()` 里阻塞等 Data-Out |
 | `src/tools_iscsi_write.ps1` | 写路径端到端逐字节检查：确定性图案写入 → initiator 读回 → 自建 SCSI pass-through 发 SYNCHRONIZE CACHE → 比对后端 namespace 文件（三条独立证据） |
 | `src/tools_iscsi_perf.ps1` | 经 Windows 自带 initiator 量桥吞吐：自己起后端与桥、登录、按块大小扫 QD1 与 N 个并发读者，并打印桥自己的每条命令耗时分解 |
@@ -79,8 +82,15 @@ cd <仓库>\src
 .\run_all.ps1
 ```
 
-单独跑某一套：`run_xref.ps1`、`run_wire.ps1`、`run_f1.ps1`、`run_f3.ps1`、
-`run_f4.ps1`、`run_f5.ps1`、`run_f5_auth.ps1`、`run_f6.ps1`、`run_f7.ps1`。
+单独跑某一套：`run_xref.ps1`、`run_wire.ps1`、`run_auth.ps1`、`run_f1.ps1`、`run_f3.ps1`、
+`run_f4.ps1`、`run_f5.ps1`、`run_f5_auth.ps1`、`run_iscsi.ps1`、`run_f6.ps1`、`run_f7.ps1`、
+`run_stag.ps1`。
+
+`run_xref.ps1`、`run_wire.ps1`、`run_auth.ps1` 和 `run_iscsi.ps1` 不需要网卡也不需要
+NetworkDirect SDK，所以 CI 跑的正是这四套（外加 `hygiene.ps1` 这三条仓库级检查：SPDX 头、
+每个 `.ps1` 的 UTF-8 BOM、三份文档无乱码——它也是 `run_all.ps1` 的第一项）。
+`run_iscsi.ps1` 把 iSCSI 层按同样方式钉住：没有 target、没有 initiator、
+没有 RDMA，直接驱动 PDU 构造器、login 文本、协商规则与挂起写表。
 
 每套的规则都一样：**删掉旧 exe → 看编译退出码 → 比对源码与头文件时间戳**，
 绝不运行"看起来还在"的旧二进制（这条是从一次真实事故里来的，见 DESIGN §8.6）。
@@ -260,16 +270,26 @@ Get-Disk | Where-Object BusType -eq 'iSCSI'
 
 四点部署前要知道：
 
-- **两端都要调，否则桥会显得很慢，而那不是它的错**：Windows 的 initiator 每条 SCSI 命令、每个
-  Data-Out PDU 都收 **~16-20 ms 固定开销**，所以"每条多搬点"就是唯一的提速方向，而且两端必须
+- **两端都要调，否则桥会显得很慢，而那不是它的错**：Windows 的 initiator 在**写方向**每个
+  Data-Out PDU 收 **~16-20 ms 固定开销**，所以"每条多搬点"就是唯一的提速方向，而且两端必须
   同时放大，否则协商取小值：
   1. initiator 注册表 `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4D36E97B-E325-11CE-BFC1-08002BE10318}\0009\Parameters`：
      `MaxTransferLength=4194304`、`MaxBurstLength=4194304`、`MaxRecvDataSegmentLength=1048576`。
      **这些值只在设备实例重新启用时才会重新加载**，`Restart-Service msiscsi` 不够：
-     `Disable-PnpDevice -InstanceId ROOT\ISCSIPRT\0000 -Confirm:$false` 再 `Enable-PnpDevice …`；
+     `Disable-PnpDevice -InstanceId ROOT\ISCSIPRT\0000 -Confirm:$false` 再 `Enable-PnpDevice …`。
+     这些 `src/tune_initiator.ps1` 都替你做了：`-Show` 看当前值、`-Apply` 写入、`-Restore` 还原。
+     它自己按驱动描述找设备实例（不去猜 `0009` 这个后缀），把原始值**一次性备份**到
+     `%ProgramData%\nvmeof-windows-nd\initiator-tuning.json`（已存在就永不覆盖），`install.ps1`
+     会直接调用它（`-NoTuneInitiator` 可跳过）；`uninstall.ps1` 从备份还原，所以卸载后机器回到原样；
   2. 桥侧突发尺寸：`-iscsimbl 4194304 -iscsichunk 1048576`（`install.ps1` 已默认传，
      参数名 `-MaxBurstLength` / `-MaxSegmentLength`）。实测效果：4 MiB 读 **11.9 → 81.9 MB/s**，
      4 MiB 写 **约 900 → 69 ms**，全部逐字节验证（DESIGN §8.68）。
+  第二项**不等于**读方向也会变快：扫遍 64 KiB…1 MiB（DESIGN §8.70）后，桥的 Data-In 总时长
+  基本不动（每个 4 MiB 约 27-34 ms），因为成本是按字节算的；而 1 MiB PDU 是这一组里**最慢**的
+  （多出 17-25 ms 的单 PDU 窗口停顿）。256 KiB 才是甜点，而它正是 Windows 默认开出来的值。
+  经这个 initiator 的单个会话上限约 **70-80 MB/s**，与命令形状无关；而且队列深度**恒为 1**——
+  桥的 `-iscsitime` 会打印实测高水位，所以"多开几个线程"可以查证而不必假设
+  （实测 8 个并发读者**更慢**：17.3 MB/s 对 77.7 MB/s）。
 - **对端不在时服务会重试而不是退出**：`install.ps1` 会带上 `-backendretry 15`，所以 NVMe-oF
   target 还没起来时服务保持 `Running`，等它出现后自己连上，而不是退出后被 SCM 每 5 秒重启一次。
   已验证：连续三次失败（每次都会释放它占用的设备、队列与注册内存），随后对端出现，桥**无需重启**
