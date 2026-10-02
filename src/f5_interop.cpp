@@ -241,6 +241,13 @@ struct Payload {
 };
 static Payload g_pl;
 
+// Set when the NVMe-oF backend behind the bridge is gone for good (see
+// NvmeIscsiBackend::lost).  It reaches main so the bridge can EXIT instead of
+// holding a mounted disk that fails every command: running as a service, a
+// non-zero exit is what makes the SCM restart it, and the -backendretry loop
+// then reconnects to a backend that has come back.
+static bool g_backendLost = false;
+
 static bool          g_serviceMode = false;
 static std::string   g_svcName = "nvmeofNdBridge";
 static std::string   g_svcLog;
@@ -739,6 +746,23 @@ public:
     const char* serial() const override { return ser; }
     const char* model() const override { return g_foreignModel; }
     bool writable() const override { return rw; }
+    // Three consecutive failures with no success in between is the line between "this
+    // command failed" and "this queue pair is dead".  Measured, after the backend
+    // process exited: every later submit returned ND_CANCELED, so the FIRST failure
+    // here is already permanent in practice - the threshold is only there so that a
+    // transient, retryable error cannot tear a healthy session down.
+    static const int kLostAfter = 3;
+    bool lost() const override { return consecFail >= kLostAfter; }
+    void noteOk() { consecFail = 0; }
+    void noteFail(const char* what) {
+        if (++consecFail == kLostAfter) {
+            printf("\n  [iscsi] BACKEND LOST: %d consecutive NVMe failures (last: %s)\n"
+                   "          this namespace can no longer be served; ending the session so\n"
+                   "          the process exits and the service restarts into -backendretry\n",
+                   consecFail, what);
+            g_backendLost = true;
+        }
+    }
     // The staging region is what the NVMe READ is sized against (see kIscsiOff).
     uint32_t maxTransfer() const override { return (uint32_t)kIscsiBytes; }
 
@@ -754,7 +778,9 @@ public:
         fabricHeader(cap, NVMEOF_OPC_FLUSH, ++(*cid), 0);
         nvmeof_wr32(cap + 4, nsid);
         nvmeof_sgl_set_null((nvmeof_sgl*)(cap + 24));
-        return submitCommand(q, d, cap, c, kWaitMs) && statusOk(c->status);
+        bool ok = submitCommand(q, d, cap, c, kWaitMs) && statusOk(c->status);
+        if (ok) noteOk(); else noteFail("FLUSH");
+        return ok;
     }
     // Between SCSI commands: feed the far end's keep-alive timer.  Linux nvmet
     // disconnects a controller that goes quiet for KATO, and an iSCSI session can
@@ -773,11 +799,25 @@ public:
     void tick() override {
         if (katoMs <= 0) return;
         ULONGLONG now = GetTickCount64();
-        if (now - lastKa < (ULONGLONG)(katoMs / 2)) return;
+        // Normally one keep-alive per KATO/6 (20 s for the 120 s this bridge asks for),
+        // not per KATO/2.  Both satisfy the contract - the target only requires one per
+        // KATO - but this is also the ONLY probe that runs on an idle session, and
+        // "idle" is exactly how a dead backend looks from here.  Measured with KATO/2:
+        // the backend was killed 9 s into a session and the bridge took 59 s to notice
+        // (the first probe came at +60 s, then two fast retries).  At KATO/6 the same
+        // event is detected in about 25 s.  A keep-alive is a 64-byte capsule and a
+        // 16-byte completion; the cost is not worth optimising.
+        //
+        // While the last one FAILED the interval drops to the socket's idle wake-up, so
+        // three consecutive failures accumulate in a few seconds.
+        ULONGLONG gap = lastKaFailed ? 2000 : (ULONGLONG)(katoMs / 6);
+        if (now - lastKa < gap) return;
         lastKa = now;
         fabricHeader(cap, NVMEOF_OPC_KEEP_ALIVE, ++(*cid), 0);
         nvmeof_sgl_set_null((nvmeof_sgl*)(cap + 24));
         bool ok = submitCommand(adm, d, cap, c, kWaitMs) && statusOk(c->status);
+        lastKaFailed = !ok;
+        if (ok) noteOk(); else noteFail("KEEP ALIVE");
         if (!ok) printf("  [iscsi] keep-alive to the NVMe target failed\n");
     }
 
@@ -806,8 +846,10 @@ private:
                    opcode == NVMEOF_OPC_READ ? "READ" : "WRITE",
                    (unsigned long long)lba, nblocks, nvmeof_status_sct(c->status),
                    nvmeof_status_sc(c->status), ndStr(c->status, b, sizeof(b)));
+            noteFail(opcode == NVMEOF_OPC_READ ? "READ" : "WRITE");
             return false;
         }
+        noteOk();
         if (opcode == NVMEOF_OPC_READ && p && p != stage) memcpy(p, stage, bytes);
         return true;
     }
@@ -819,6 +861,8 @@ private:
     uint8_t* buf;
     bool rw;
     int katoMs;
+    int consecFail = 0;
+    bool lastKaFailed = false;
     ULONGLONG lastKa;
     char ser[40];
 };
@@ -1733,6 +1777,18 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
             g_svcBridge = &target;
             rc = target.run(backend, scratch);
             g_svcBridge = nullptr;
+        }
+        // A LOST BACKEND IS AN EXIT, not a log line.  Measured before this: with the
+        // NVMe-oF target gone, the bridge kept the iSCSI session alive and answered
+        // every SCSI command with a hard error forever, and a restart of the backend
+        // changed nothing (the queue pairs are dead - ND_CANCELED on every submit), so
+        // the disk never came back without restarting the bridge.  Exit non-zero so the
+        // SCM restarts the service, which reconnects through -backendretry; a
+        // user-requested stop must still exit 0, or the restart policy would fight it.
+        if (g_backendLost && !InterlockedCompareExchange(&g_svcStopRequested, 0, 0)) {
+            printf("\n  [iscsi] exiting because the backend is gone (the service will restart "
+                   "and reconnect)\n");
+            rc = 1;
         }
         for (uint16_t q = 0; q < kMaxIoQueues; q++) io[q].destroy();
         dev.close(nullptr, nullptr, 0);

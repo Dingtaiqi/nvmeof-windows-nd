@@ -358,6 +358,14 @@ public:
     // keep-alive timer fed: a long iSCSI session can easily outlive KATO, and a
     // Linux nvmet that stops hearing from us tears the controller down mid-session.
     virtual void tick() {}
+    // True when the backend behind this session is gone for good - the queue pairs
+    // are dead, not merely busy.  It exists so the bridge can END a session instead of
+    // answering it with hard errors forever: measured, after the NVMe-oF target
+    // process exited, every following SCSI command failed on the NVMe side (Windows
+    // surfaced "Data error (cyclic redundancy check)" and "fatal device hardware
+    // error") and the bridge stayed up with a live iSCSI session attached to a dead
+    // backend.  A service in that state is worse than a stopped one: it looks healthy.
+    virtual bool lost() const { return false; }
 };
 
 // ---------------------------------------------------------------------------
@@ -407,6 +415,17 @@ public:
             return false;
         }
         if (::listen(listenSock, 4) != 0) return false;
+        // The ACCEPT has to wake up too.  It used to block forever, which meant that
+        // once a session had ended the accept loop was the only thing still running and
+        // nothing could ever end it: measured, after BACKEND LOST the bridge kept
+        // accepting, answered every new session by ending it immediately, and never
+        // exited - so the service was never restarted and the disk never came back.
+        //
+        // A non-blocking listener plus select() in run(), NOT SO_RCVTIMEO: the timeout
+        // was tried first and did not wake a blocking accept() on Windows (the process
+        // stayed parked with the backend long gone, which is how that was found).
+        u_long nb = 1;
+        ioctlsocket(listenSock, FIONBIO, &nb);
         printf("  [iscsi] listening on %s:%u, IQN %s, %u-byte chunks\n",
                bindAddr.c_str(), port, targetIqn.c_str(), maxChunk);
         return true;
@@ -447,8 +466,38 @@ public:
         for (;;) {
             sockaddr_in from = {};
             int fl = sizeof(from);
+            // select() with a 2 s timeout instead of a blocking accept(): this is the
+            // only place that runs when no session exists, and it has to be able to end
+            // itself.  A service stop closes the listener, which makes select() fail and
+            // this return 0; a lost backend returns 1 so main exits non-zero.
+            fd_set rd;
+            FD_ZERO(&rd);
+            FD_SET(listenSock, &rd);
+            timeval tv = { 2, 0 };
+            int n = select(0, &rd, nullptr, nullptr, &tv);
+            if (n == SOCKET_ERROR) return 0;               // listener closed (stop())
+            if (n == 0) {
+                if (be.lost()) {
+                    printf("\n  [iscsi] the NVMe-oF backend is gone - stopping the listener "
+                           "so the process exits and can be restarted\n");
+                    return 1;
+                }
+                continue;
+            }
             SOCKET s = accept(listenSock, (sockaddr*)&from, &fl);
-            if (s == INVALID_SOCKET) return 0;
+            if (s == INVALID_SOCKET) {
+                int e = WSAGetLastError();
+                if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) continue;
+                return 0;                   // listener closed (stop()) or a real error
+            }
+            // The listener is non-blocking; the SESSION socket must not be.  Its receive
+            // path relies on blocking recv() with a 2 s SO_RCVTIMEO (see below), and an
+            // inherited non-blocking mode there would turn every receive into
+            // WSAEWOULDBLOCK and tear the session down.
+            {
+                u_long blocking = 0;
+                ioctlsocket(s, FIONBIO, &blocking);
+            }
             // TCP_NODELAY, and this one line is worth ~250x on the data path.
             //
             // Every PDU goes out as two writes: the 48-byte BHS, then the payload.
@@ -486,6 +535,16 @@ public:
             int sndbuf = 1 << 20, rcvbuf = 1 << 20;
             setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&sndbuf, sizeof(sndbuf));
             setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
+            // Wake an idle session up every two seconds.  An idle mounted disk is the
+            // normal state of this bridge, and two things have to happen while it is
+            // idle: the NVMe side's keep-alive must keep going out (nvmet disables a
+            // controller that goes KATO without one), and a backend that has died must
+            // be noticed without waiting for the next SCSI command.  Neither can happen
+            // if the session thread is parked in recv() forever, which is exactly what
+            // it used to do.  Receives that time out with nothing read are reported as
+            // "idle" by recvAll(); a timeout in the middle of a PDU is not.
+            DWORD rcvto = 2000;
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvto, sizeof(rcvto));
             char who[64];
             sprintf_s(who, "%s:%u", inet_ntoa(from.sin_addr), ntohs(from.sin_port));
             printf("\n  [iscsi] session from %s\n", who);
@@ -583,14 +642,29 @@ private:
     unsigned long long bytesIn, bytesOut;
 
     // ---- TCP plumbing ----
-    bool recvAll(void* buf, size_t n) {
+    // Idle-aware receive.  Returns 1 = the bytes arrived, 0 = the socket was quiet
+    // for SO_RCVTIMEO and NOT ONE byte of this read had arrived, -1 = closed or
+    // failed.
+    //
+    // The distinction matters because a silent initiator and a dead connection used to
+    // look the same (both were `recv() <= 0`, both ended the session), and the quiet
+    // case is the normal state of a mounted-but-idle disk - which is exactly when the
+    // NVMe side's keep-alive has to keep going out (see session()).  A timeout in the
+    // MIDDLE of a PDU does not report idle: the peer is mid-send, and giving up there
+    // would put the byte stream out of step.
+    int recvAll(void* buf, size_t n, bool idleOk = false) {
         uint8_t* p = (uint8_t*)buf;
+        bool started = false;
         while (n) {
             int got = recv(conn, (char*)p, (int)(n > (1u << 20) ? (1u << 20) : n), 0);
-            if (got <= 0) return false;
-            p += got; n -= (size_t)got;
+            if (got > 0) { started = true; p += got; n -= (size_t)got; continue; }
+            if (got == SOCKET_ERROR && WSAGetLastError() == WSAETIMEDOUT) {
+                if (idleOk && !started) return 0;
+                continue;
+            }
+            return -1;
         }
-        return true;
+        return 1;
     }
     // Scatter/gather send: ONE syscall for a PDU that goes out as several pieces.
     // Every PDU here used to leave as two or three send() calls (BHS, payload, pad),
@@ -632,20 +706,22 @@ private:
         }
         return true;
     }
-    bool readPdu(IscsiBhs& bhs, std::vector<uint8_t>& data) {
-        if (!recvAll(bhs.raw, 48)) return false;
+    // 1 = a PDU, 0 = idle on an empty socket (only when `idleOk`), -1 = closed/failed.
+    int readPdu(IscsiBhs& bhs, std::vector<uint8_t>& data, bool idleOk = false) {
+        int r = recvAll(bhs.raw, 48, idleOk);
+        if (r != 1) return r;
         uint32_t dl = bhs.dataLen(), ahs = (uint32_t)bhs.ahsLen() * 4;
         data.clear();
-        if (ahs) { std::vector<uint8_t> skip(ahs); if (!recvAll(skip.data(), ahs)) return false; }
+        if (ahs) { std::vector<uint8_t> skip(ahs); if (recvAll(skip.data(), ahs) != 1) return -1; }
         // 1 MiB is the largest thing this bridge ever needs (a 64 KiB chunk plus
         // iSCSI text); anything larger is a client we do not understand, and
         // allocating it would be the bug rather than the fix.
         if (dl > (1u << 20)) {
             printf("  [iscsi] refusing a %u-byte data segment\n", dl);
-            return false;
+            return -1;
         }
         data.resize(dl);
-        if (dl && !recvAll(data.data(), dl)) return false;
+        if (dl && recvAll(data.data(), dl) != 1) return -1;
         // TRAILING PADDING, and this single line was the whole normal-session
         // failure.  An iSCSI PDU's data segment is padded to a 4-byte boundary and
         // DataSegmentLength does NOT include that padding (RFC 7143 section 11.7),
@@ -662,9 +738,9 @@ private:
         uint32_t pad = (4 - (dl & 3)) & 3;
         if (pad) {
             std::vector<uint8_t> skip(pad);
-            if (!recvAll(skip.data(), pad)) return false;
+            if (recvAll(skip.data(), pad) != 1) return -1;
         }
-        return true;
+        return 1;
     }
 
     // ---- PDU senders ----
@@ -974,8 +1050,26 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
             data.swap(deferred_.front().second);
             deferred_.erase(deferred_.begin());
             if (g_iscsiTrace) printf("    [iscsi] (deferred) opcode 0x%02X\n", bhs.opcode());
-        } else if (!readPdu(bhs, data)) {
-            return false;
+        } else {
+            int r = readPdu(bhs, data, /*idleOk=*/true);
+            if (r == 0) {
+                // SO_RCVTIMEO expired with the initiator silent - the normal state of
+                // a mounted but idle disk.  The loop goes round again rather than
+                // returning, so the tick() at the top keeps feeding the NVMe side's
+                // keep-alive timer.  Before this, the ONLY thing that ever sent a Keep
+                // Alive was the arrival of a SCSI command: an idle session sent none at
+                // all, and nvmet disables a controller that goes KATO (=120 s here)
+                // without one, which would have taken the disk away from a user who
+                // simply stopped touching it.  Local backends do not enforce KATO,
+                // which is why no local test ever showed it.
+                //
+                // It is also where a dead backend is noticed without waiting for the
+                // next command.
+                std::lock_guard<std::mutex> lock(backendMutex());
+                if (be.lost()) return false;
+                continue;
+            }
+            if (r < 0) return false;
         }
 
         // Every PDU, as it arrives, with the connection that carried it.  Without
@@ -1299,6 +1393,17 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
             printf("  [iscsi] unsupported opcode 0x%02X -> reject\n", bhs.opcode());
             if (!sendReject(bhs, 0x01)) return false;   // 0x01 = command not supported
             break;
+        }
+
+        // A backend that is gone stays gone.  Ending the session here is what lets the
+        // process exit and the service restart into its -backendretry loop, instead of
+        // holding a mounted disk that fails every read and write (see IscsiBackend::lost).
+        {
+            std::lock_guard<std::mutex> lock(backendMutex());
+            if (be.lost()) {
+                printf("  [iscsi] ending the session: the NVMe-oF backend is lost\n");
+                return false;
+            }
         }
     }
 }

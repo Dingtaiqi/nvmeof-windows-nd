@@ -3991,6 +3991,78 @@ Linux target 会在 KATO 到期后拆掉控制器，而且是在第一次长时�
 实测：后端日志 `[admin] Keep Alive #1/#2/#3 (kato=120000 ms)`，`UNHANDLED opcode=0x18` 计数 0，
 桥侧 keep-alive 失败 0 次。
 
+### 8.66 ✅ 服务化的两个洞：空闲时根本不发 Keep Alive；后端死后桥既不退出也不恢复
+
+这两条都是"把桥装成常驻服务"（§8.62）真正要成立就必须有的东西，都是这次把桥放着不动才暴露出来的。
+
+#### (1) 空闲的会话一条 Keep Alive 都不发
+
+`NvmeIscsiBackend::tick()` 是唯一发 Keep Alive 的地方，而它过去只在**收到 PDU 时**被调用：
+会话一静下来（用户没在读写那块盘），就一条都不发了。于是对端计时器到 KATO 就把控制器拆掉——
+本机 KATO 是 120 s，也就是说"挂上一块盘然后两分钟不碰它"就会掉盘。
+
+本机后端不校验 KATO（只计数），所以本地怎么测都测不出来；这是**照规范读出来的**：NVMe 要求
+host 每个 KATO 至少发一次 Keep Alive，nvmet 到期就 disable 控制器。实测证据是修完之后的：
+
+    静置 210 s，initiator 一个 PDU 都没发（桥日志 0 行增长），后端收到
+    [admin] Keep Alive #3 / #4 / #5   ← 每 20 s 一次，KATO=120 s
+
+做法：会话 socket 设 `SO_RCVTIMEO` 2 s，`recvAll()` 把"空 socket 上超时"和"连接断了"分开
+（中途超时不算空闲——对端正处于一个 PDU 中间，这时候放弃会把字节流搞错位），session 循环收到
+"空闲"就 `continue`，循环顶部的 `tick()` 因此每 2 s 跑一次。
+
+顺带把 Keep Alive 的间隔从 KATO/2 改成 **KATO/6**（20 s）：它同时也是"后端还活着吗"的唯一探针，
+KATO/2 时实测杀后端后要 59 s 才被发现。
+
+#### (2) 后端死了，桥既不退出，也不恢复
+
+实测（杀后端进程，桥继续跑）：
+
+    [iscsi] NVMe WRITE lba=0 blocks=1 -> sct=0 sc=0x00 (0x00000001)
+    [iscsi] WRITE (immediate data) lba=0 blocks=1 failed on the NVMe side
+    Windows: 写 -> "Data error (cyclic redundancy check)"
+             读 -> "The request failed due to a fatal device hardware error."
+
+两条结论：
+
+- **不会静默丢数据**：后端没了的时候每条 SCSI 命令都变成 CHECK CONDITION，Windows 看见的是
+  硬错误。这一点先确认，因为它决定了后面要不要紧急修。
+- **但它也不会好**：队列对已经死了（之后每次提交都 `ND_CANCELED`），**把后端重新起来一点用都
+  没有**——盘永远报错，而桥自己认为一切正常。常驻服务最糟的状态就是这个：看起来活着。
+
+修法分两半，缺一不可：
+
+**(a) 判定"后端没了"并结束会话。** `IscsiBackend::lost()`（新接口），`NvmeIscsiBackend` 里连续
+三次 NVMe 失败（成功即清零；阈值存在的意义只是不让一次可重试的错误掀掉健康会话）就置位并打印
+`BACKEND LOST`。session 循环在空闲分支和每条命令之后各查一次，命中就关会话——Windows 立刻看到
+盘掉了，而不是继续对着一个"能应答但每条都错"的盘。
+
+**(b) 让进程真的退出。** 这一半第一次做错了：会话都结束了，但 `run()` 的 `accept()` 还在阻塞，
+`be.lost()` 永远没机会被检查，进程不退 → 服务不会被 SCM 重启 → 盘永远回不来。日志里能直接看到
+这个形状：桥不停地接受新会话、每个都立刻结束、就是不退。
+
+    第一次尝试用监听 socket 的 SO_RCVTIMEO 唤醒 accept —— **实测无效**，进程照样停在那里；
+    改成非阻塞监听 socket + `select()` 2 s 超时才对。接受后的 socket 必须显式改回阻塞
+    （`ioctlsocket(FIONBIO, 0)`），否则继承来的非阻塞模式会把会话里每次 recv 变成
+    WSAEWOULDBLOCK。
+
+退出码也是设计的一部分：后端丢失 → 非零退出（SCM 按失败重启 → `-backendretry` 重连）；用户
+`Stop-Service` → 退出 0（否则重启策略会跟用户打架）。用 `g_svcStopRequested` 区分。
+
+#### (3) 端到端实测（真实退出码 + 恢复）
+
+    阶段 1  后端在，会话已建立，盘可读 OK
+            杀后端 → 桥 18 s 后自己退出，EXITCODE=1
+    阶段 2  重启后端 + 重启桥（模拟 SCM 重启 + -backendretry 重连）
+            会话回来、盘 Online、2 MiB 写三条证据逐字节一致
+            （initiator 读回 = 后端 namespace 文件，sha256 f7b55fd8…2756）
+
+配套建议写进了 README：常驻服务要用 `-IsPersistent $true` 的 iSCSI 会话，这样桥重启后
+Windows 会自己重新登录，盘自己回来。
+
+回归：`run_f5.ps1` 仍 **40 PASS / 0 FAIL**；最终二进制上 4 MiB 首写三条证据依旧 PASS
+（1796 ms，sha256 `d842fcb1…0a85`）。
+
 ## 7. 已知风险
 
 | 风险 | 说明 | 缓解 |

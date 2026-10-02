@@ -236,9 +236,16 @@ Number FriendlyName        PartitionStyle OperationalStatus SizeGB IsReadOnly
 
 ```powershell
 cd <repo>\src
-# 默认只读；要允许写就加 -ReadWrite（目前 64 KiB 以内的写可用）
+# 默认只读；要允许写就加 -ReadWrite
 .\install.ps1 -Target 192.168.100.5 -Subnqn nqn.2024-01.local.rdma:linux-nvmet `
               -RdmaLocal 192.168.100.3 -IscsiPort 3260
+
+iscsicli AddTargetPortal 127.0.0.1 3260
+# 配服务用 -IsPersistent $true：后端消失时桥会退出并被重启，持久会话才能让
+# Windows 在桥重新监听之后自己登录回来。
+Connect-IscsiTarget -NodeAddress iqn.2024-01.com.nvmeof:bridge0 -IsPersistent $true
+Get-Disk | Where-Object BusType -eq 'iSCSI'
+
 .\uninstall.ps1
 ```
 
@@ -249,12 +256,19 @@ cd <repo>\src
 | 服务名 | `nvmeofNdBridge`（可用 `-ServiceName` 改） |
 | 命令行 | 整条桥的命令行放在服务的 ImagePath 里，`sc qc nvmeofNdBridge` 可查 |
 
-两点部署前要知道：
+三点部署前要知道：
 
 - **对端不在时服务会重试而不是退出**：`install.ps1` 会带上 `-backendretry 15`，所以 NVMe-oF
   target 还没起来时服务保持 `Running`，等它出现后自己连上，而不是退出后被 SCM 每 5 秒重启一次。
   已验证：连续三次失败（每次都会释放它占用的设备、队列与注册内存），随后对端出现，桥**无需重启**
   就接上了。
+- **中途消失的后端会让桥主动退出，这是有意的**：实测 NVMe-oF target 进程一没，之后每次提交都是
+  `ND_CANCELED`，队列对等于永久损坏——把 target 重新起来也没用，盘会一直报错（写
+  `Data error (cyclic redundancy check)`，读 `fatal device hardware error`），而桥看上去一切正常。
+  现在桥连续三次 NVMe 失败就结束会话并**非零退出**，SCM 因此会重启它、`-backendretry` 会重连
+  （DESIGN §8.66）。实测：杀后端 → 18 s 后桥自己退出 `EXITCODE=1`；重启后端与桥 → 会话回来、
+  盘 Online、2 MiB 写三条证据逐字节一致。配 `-IsPersistent $true` 的 iSCSI 会话，Windows 会自己
+  重新登录，盘自己回来。
 - **服务运行时日志文件是被占用的**（`Get-Content` 会报 "used by another process"）。要读就先
   `Stop-Service`，或者把 `-log` 指到别处再拷贝。这是已记录的局限，不是疏忽——见 DESIGN §8.62(2)。
 - 服务只跑**桥**，它仍然需要一个 NVMe-oF target：那台 Linux，或者同一个 exe 再开一个 `-target`

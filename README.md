@@ -74,7 +74,11 @@ cd <repo>\src
   with 8 commands in flight) rather than waited for in a blocking read loop, so an initiator
   that answers an R2T with something else — or with nothing — no longer kills the session
   (DESIGN §8.64). Keep-alives go to the NVMe target's **admin** queue, where opcode 0x18
-  belongs (§8.65).
+  belongs, and they go out every 20 s **even while the session is idle** — an idle mounted
+  disk used to send none at all, which a KATO-enforcing nvmet answers by disabling the
+  controller (§8.65, §8.66). A backend that dies ends the session immediately (hard errors,
+  never silent success) and then the process exits non-zero so a service restart can
+  reconnect (§8.66).
 
 ## The drive-letter path
 
@@ -229,12 +233,15 @@ removes both directories:
 
 ```powershell
 cd <repo>\src
-# read-only by default; add -ReadWrite to allow writes (up to 64 KiB writes work today)
+# read-only by default; add -ReadWrite to allow writes
 .\install.ps1 -Target 192.168.100.5 -Subnqn nqn.2024-01.local.rdma:linux-nvmet `
               -RdmaLocal 192.168.100.3 -IscsiPort 3260
 
 iscsicli AddTargetPortal 127.0.0.1 3260
-Connect-IscsiTarget -NodeAddress iqn.2024-01.com.nvmeof:bridge0 -IsPersistent $false
+# -IsPersistent $true is the one to use with the service: the bridge exits (and is
+# restarted) when its backend goes away, and a persistent session is what makes
+# Windows log back in on its own once the bridge is listening again.
+Connect-IscsiTarget -NodeAddress iqn.2024-01.com.nvmeof:bridge0 -IsPersistent $true
 Get-Disk | Where-Object BusType -eq 'iSCSI'
 
 .\uninstall.ps1
@@ -247,7 +254,7 @@ Get-Disk | Where-Object BusType -eq 'iSCSI'
 | service name | `nvmeofNdBridge` (`-ServiceName` to change it) |
 | command line | the whole bridge command sits in the service's ImagePath; `sc qc nvmeofNdBridge` shows it |
 
-Two things worth knowing before you deploy it:
+Three things worth knowing before you deploy it:
 
 - **The service retries instead of dying when the peer is missing.** `install.ps1` passes
   `-backendretry 15`, so if the NVMe-oF target is not up yet the service stays `Running` and
@@ -255,6 +262,13 @@ Two things worth knowing before you deploy it:
   five seconds. Verified: three failed attempts (each one now also releases the device, queues
   and registered region it had taken), then the peer appeared and the bridge connected without a
   restart.
+- **A backend that goes away mid-session ends the bridge, on purpose.** Measured: with the
+  NVMe-oF target process gone, every later submit returns `ND_CANCELED`, so the queue pairs are
+  dead for good — restarting the target changed nothing and the disk kept failing (`Data error
+  (cyclic redundancy check)` on writes, `fatal device hardware error` on reads) while the bridge
+  looked healthy. The bridge now counts three consecutive NVMe failures, ends the session and
+  **exits non-zero**, which is what makes the SCM restart it into `-backendretry` and reconnect
+  (DESIGN §8.66). Combine that with a persistent iSCSI session and the disk comes back by itself.
 - **The log is locked while the service runs** (`Get-Content` reports "used by another
   process"). Stop the service to read it, or point `-log` at a path you can copy afterwards.
   This is a recorded limitation, not an oversight — see DESIGN §8.62(2).
