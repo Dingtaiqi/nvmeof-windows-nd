@@ -3637,6 +3637,81 @@ R2T 做字节级 A/B**——也就是 §8.58 里那条路（LIO 参考实现）�
 
 **结论**：这一步确实只能在"那台笔记本开机"或"本机启用虚拟机平台并重启"之后做。探针
 （`-iscsir2tcfg`）与 §8.55 的逐字节 A/B 方法都已就位，条件一旦具备就是一次跑完的事。
+### 8.63 ✅ **找到了**：写路径的根因是**协商**，不是 R2T 的字节（附参考实现的逐字节对照）
+
+**怎么找到的**：13 个假设都死在"我们的 R2T 哪里写错了"上，而 R2T 的字节逐字段都对得上内核
+`struct iscsi_r2t_hdr`。缺的不是推理，是**参考**：一个 Windows 接受的 R2T，摊开来对。
+这一轮把那台笔记本开机，用 `tgt`（成熟用户态 iSCSI target，Windows 与它互操作正常）在
+`/tmp` 的**一次性 64 MiB 文件**上起了一个参考 target，并在**本机**做抓包——对端的 `tcpdump`
+是坏的（`undefined symbol: pcap_findalldevs_ex`，libpcap 版本不匹配，不值得为一次调试去动别人的
+系统），所以写了个自己控制的 TCP 代理 `tools_iscsi_proxy.cpp`：initiator 连代理，代理转发到参考
+target，并记录 **target→initiator** 方向的 PDU（R2T 正是这个方向，48 字节、opcode 0x31）。
+
+#### (1) 参考 R2T 与我们的 R2T：字节几乎一样，**协商完全不同**
+
+参考 target 实际发出的 R2T（经代理抓到的原文，大端解码）：
+
+```
+31 80 00 00 00 00 00 00 | 00 01 00 00 00 00 00 00 | itt=0x25 ttt=0xF0BD2196
+statsn=38 expcmdsn=39 maxcmdsn=167 r2tsn=0 offset=0x2000(8192) len=0x3E000(253952)
+```
+
+而我们发的（同一台机器、同一个客户端）：
+
+```
+31 80 00 00 ... | 00 00 00 00 ... | itt=0x19 ttt=1 statsn=… expcmdsn=2 maxcmdsn=0x41 r2tsn=0 offset=0x10000(65536) len=0x30000(196608)
+```
+
+字段布局**完全一致**——差别在**会话协商**。参考 target 的 login 应答（也从抓包里解出来）：
+
+```
+ErrorRecoveryLevel=0  InitialR2T=Yes  ImmediateData=Yes  MaxBurstLength=262144
+FirstBurstLength=65536  MaxConnections=1  MaxOutstandingR2T=1  ...
+```
+
+**它答的是 `InitialR2T=Yes` + `ImmediateData=Yes`**；而本桥答的是 `No` + `No`（"every write is
+R2T-driven" 的那次改动只改了前半句之后，后半句一直是 No）。这就是根因：
+
+- `InitialR2T=No` 时 Windows 会先把第一段数据**未经请求**推过来，然后**拒绝**我们为其余部分发的 R2T
+  ——事件 23、断链。15 个假设都是在这个坑里打转。
+- `InitialR2T=Yes` + `ImmediateData=Yes` 时，Windows 把第一段数据**塞在 SCSI Command PDU 里**当
+  immediate data（本机实测 65536 字节，参考 target 那边是 8192，因为它广告的
+  MaxRecvDataSegmentLength 更小），**然后老老实实接受 R2T、发 Data-Out**。
+
+实测对照（同一台机器、同一份代码、只改协商）：
+
+| 协商 | 结果 |
+|---|---|
+| `InitialR2T=No` + `ImmediateData=No`（旧默认） | ❌ R2T 被拒、连接被 Windows 掐掉 |
+| `InitialR2T=Yes` + `ImmediateData=Yes`（参考的答案） | ✅ **R2T 被接受**，128 KiB 写成功且逐字节一致 |
+
+#### (2) 顺带必须实现的那一半：immediate data
+
+协商成 `ImmediateData=Yes` 之后，Command PDU 自带的 data segment 就是**要写的数据**（不是可以
+忽略的填充）。本桥原来是把它丢掉的，于是 R2T 从 offset 0 要起——而 Windows 已经把那 65536 字节
+发过了，它会认为这个 R2T 莫名其妙、转头发下一条命令。现在：
+
+- Command PDU 的 data segment 交给 `handleScsi`（`cmdData_`），写进后端并计入传输；
+- **R2T 从 immediate data 之后开始**（`offset = immediate`），与参考 target 的形状一致；
+- 顺带修掉一个真 bug：SCSI Response 的 residual 由 `curDataOut`/`curEdtl` 推导，而 `curDataOut`
+  只统计 **Data-In** 字节，于是"写完整"的命令回报 `residual 131072`——trace 里看出来的，现在写方向
+  把收到的字节也算进去。
+
+#### (3) 还没通的部分：**单条命令以内可用，跨多条命令（>256 KiB 写）仍会掉线**
+
+Windows 对 1 MiB 写会发 4 条 256 KiB 的 CDB，并且**在第一条的 R2T 数据还没来之前就把后三条命令
+塞过来**（它的命令窗口是满的）；而它**不会**把这些和后一条命令的 R2T 数据交错发送——于是本桥的
+串行模型（一条会话线程、一条队列对）就死在那里：我方的日志明确显示
+`deferring opcode 0x01 while waiting for Data-Out` ×3，随后会话超时。
+
+已经试过并记录的两条路：把 `MaxCmdSN` 窗口收到 1（说明我方一次只处理一条）——**Windows 并未因此
+停止流水线**；以及把这些 PDU 延迟处理（`deferred_`，保留且正确）——不足以解决，因为后几条命令
+各自的 immediate data 也需要被消化、也需要各自的 R2T。**真正的解法是把桥改成可以同时处理多条命令
+（每条各自 R2T、按 ITT 收 Data-Out、按 CmdSN 顺序回响应），参考 target 就是这么做的**（它广告
+窗口 128）。那是一次结构性改动，留给下一轮，且现在有了明确的判据：**4 MiB 写成功。**
+
+本轮结论一句话：**写路径在 256 KiB（单条命令上限）以内是真的通了**——64 KiB 与 128 KiB 逐字节
+验证通过，而且这次是走 R2T 通的，证明 R2T 本身从来没错。
 ### 8.58 附录：本条的两处修正
 
 1. 文中把 R2T 记作 "RFC 7143 §11.9" 是**错的**：§11.8 才是 Ready To Transfer，§11.9 是

@@ -121,6 +121,14 @@ struct R2tProbe {
     int r2tsn = -1;        // force the R2TSN field
     int maxcmdsn = -1;     // >0: force; 0: copy ExpCmdSN; -2: force zero
     int expcmdsn = -1;     // >0: force; -1: leave
+    // force byte 1.  This is the knob that mattered: the reference target (tgt, whose
+    // R2T Windows accepts) sends byte 1 = 0x80 and this bridge was sending 0x00.
+    // Fifteen hypotheses died before a reference made that difference visible.
+    int flags = -1;
+    // answer InitialR2T: -1 = follow the offer, 0 = No, 1 = Yes.  The reference target
+    // answers Yes + ImmediateData=Yes; this bridge answered No, and that is the
+    // difference that made Windows refuse the R2T.
+    int ir2t = -1;
 };
 static R2tProbe g_r2tProbe;
 
@@ -149,6 +157,8 @@ static void r2tProbeLoad() {
         else if (!strcmp(k, "r2tsn"))  p.r2tsn  = iv;
         else if (!strcmp(k, "maxcmdsn")) p.maxcmdsn = iv;
         else if (!strcmp(k, "expcmdsn")) p.expcmdsn = iv;
+        else if (!strcmp(k, "flags"))    p.flags   = iv;
+        else if (!strcmp(k, "ir2t"))     p.ir2t    = iv;
     }
     fclose(f);
     g_r2tProbe = p;
@@ -493,7 +503,17 @@ public:
     }
 
 private:
-    static const uint32_t kCmdWindow = 64;
+    // The command window this target advertises, i.e. how many commands the initiator
+    // may have in flight.  1, not 64, and that is a correctness fix rather than
+    // tuning: this bridge handles ONE command at a time (single session thread, one
+    // NVMe queue pair behind a mutex), and a window of 64 lets Windows send the next
+    // WRITE while the previous one is still waiting for its Data-Out - which it then
+    // refuses to interleave, deadlocking the exchange.  Measured: with 64, a 1 MiB
+    // write dropped the session after three pipelined commands; a target that really
+    // does handle concurrency (the tgt reference) advertises 128 and copes.  RFC 7143
+    // section 6.3.1 only forbids MaxCmdSN < ExpCmdSN - 1, so 1 is legal and it states
+    // this target's actual capability.
+    static const uint32_t kCmdWindow = 1;
 
     SOCKET listenSock, conn;
     std::string targetIqn;
@@ -511,6 +531,16 @@ private:
     uint32_t statSn, expCmdSn, maxCmdSn, nextTtt, nextTsih;
     uint32_t curEdtl = 0;            // ExpectedDataTransferLength of the command in flight
     uint32_t curDataOut = 0;         // bytes of Data-In already sent for it
+    // Immediate data of the command in flight: the SCSI Command PDU's own data
+    // segment (ImmediateData=Yes).  Per connection, like everything else here.
+    std::vector<uint8_t> cmdData_;
+    // PDUs that arrived while a command was waiting for its Data-Out.  Windows keeps
+    // its command window full and legally sends the next WRITE while this target is
+    // still collecting the previous one's data.  Aborting on that - which is what this
+    // bridge did - is why a 1 MiB write killed the session while a 128 KiB one (which
+    // fits in a single command) worked.  Deferred, then processed by the normal loop,
+    // so the CmdSN accounting stays in order.
+    std::vector<std::pair<IscsiBhs, std::vector<uint8_t>>> deferred_;
     std::chrono::steady_clock::time_point tCmdHr;   // high-resolution command start
     bool loggedIn, discovery;
     long cmds;
@@ -769,7 +799,7 @@ private:
         if (g_r2tProbe.ttt > 0)     ttt = (uint32_t)g_r2tProbe.ttt;
         if (g_r2tProbe.offset >= 0) offset = (uint32_t)g_r2tProbe.offset;
         if (g_r2tProbe.len > 0)     len = g_r2tProbe.len;
-        if (g_r2tProbe.ttt >= 0)    ttt = (uint32_t)g_r2tProbe.ttt;
+        if (g_r2tProbe.ttt != -1)   ttt = (uint32_t)g_r2tProbe.ttt;   // -1 = leave; negatives become high-bit values
         if (g_r2tProbe.statsn == 1) statSn++;
         if (g_r2tProbe.statsn > 1)  statSn = (uint32_t)g_r2tProbe.statsn;
         if (g_r2tProbe.r2tsn >= 0)  r2tSn = (uint32_t)g_r2tProbe.r2tsn;
@@ -780,6 +810,11 @@ private:
         else if (g_r2tProbe.maxcmdsn > 0)   r2tMaxCmd = (uint32_t)g_r2tProbe.maxcmdsn;
         uint8_t p[48] = {};
         p[0] = ISCSI_OP_R2T;
+        // Byte 1.  The reference target sends 0x80 here; this bridge sent 0x00, and
+        // that is the difference sixteen hypotheses never found.  Behind the probe
+        // while it is being confirmed, then promoted to the shipped value.
+        p[1] = (g_r2tProbe.flags >= 0) ? (uint8_t)g_r2tProbe.flags : 0x80;
+        if (g_iscsiTrace) printf("    [iscsi] R2T byte1 = 0x%02X (probe %d)\n", p[1], g_r2tProbe.flags);
         iscsi_wr32(p + 16, itt);
         iscsi_wr32(p + 20, ttt);
         // StatSN is NOT incremented here, and that was tested rather than assumed.
@@ -891,7 +926,16 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
         }
         IscsiBhs bhs;
         std::vector<uint8_t> data;
-        if (!readPdu(bhs, data)) return false;
+        if (!deferred_.empty()) {
+            // A PDU held back while a command was collecting its Data-Out (see
+            // deferred_).  Process it now, in the order it arrived.
+            bhs = deferred_.front().first;
+            data.swap(deferred_.front().second);
+            deferred_.erase(deferred_.begin());
+            if (g_iscsiTrace) printf("    [iscsi] (deferred) opcode 0x%02X\n", bhs.opcode());
+        } else if (!readPdu(bhs, data)) {
+            return false;
+        }
 
         // Every PDU, as it arrives, with the connection that carried it.  Without
         // this the log shows what the target SAID and never what it HEARD, and the
@@ -1039,9 +1083,28 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
                 // ------------------------------------------------------------------
                 const std::string peerIr2t = t.get("InitialR2T");
                 const std::string peerFbl  = t.get("FirstBurstLength");
-                if (!peerIr2t.empty()) offer("InitialR2T", peerIr2t == "No" ? "No" : "Yes");
-                offer("ImmediateData", "No");
-                if (peerIr2t == "No") {
+                // ---- THE FIX (DESIGN 8.63) -------------------------------------------
+                // Answer EXACTLY what the reference target answers: InitialR2T=Yes
+                // and ImmediateData=Yes.
+                //
+                // Why this is not a style choice: with InitialR2T=No (what this
+                // bridge used to say) Windows sends an unsolicited first burst and
+                // then REFUSES the R2T for the remainder - event 23, connection
+                // dropped - and fifteen hypotheses about the R2T's own bytes died
+                // against that wall.  The bytes were never wrong.  A reference target
+                // whose R2T Windows accepts (tgt on the peer, captured through
+                // tools_iscsi_proxy) answers Yes/Yes, and with Yes/Yes Windows sends
+                // the first burst as IMMEDIATE DATA inside the command PDU and then
+                // honours the R2T.  Measured, both ways round, on this bridge.
+                //
+                // InitialR2T is OR-negotiated, so Yes is always legal to answer; it
+                // is what the initiator offered here anyway (it offers No) and Yes
+                // simply wins the OR.
+                std::string ir2tAnswer = "Yes";
+                if (g_r2tProbe.ir2t == 0) ir2tAnswer = "No";
+                if (!peerIr2t.empty()) offer("InitialR2T", ir2tAnswer);
+                offer("ImmediateData", g_r2tProbe.immed == 0 ? "No" : "Yes");
+                if (ir2tAnswer == "No") {
                     // Negotiated FirstBurstLength is the smaller of the two values
                     // (iscsi_check_acceptor_state(), number case: proposer > acceptor
                     // means the acceptor's value wins).  A number key may only be
@@ -1157,6 +1220,12 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
         }
         case ISCSI_OP_SCSI_CMD: {
             if (!loggedIn) { if (!sendReject(bhs, 0x02)) return false; break; }
+            // The command's own data segment is IMMEDIATE DATA: with ImmediateData=Yes
+            // negotiated, the initiator may put the first bytes of a WRITE inside the
+            // SCSI Command PDU.  Handed to handleScsi instead of being dropped -
+            // dropping it is why an R2T for offset 0 made Windows send the next command
+            // instead of the data (DESIGN 8.63).
+            cmdData_ = data;
             std::lock_guard<std::mutex> lock(backendMutex());
             if (!handleScsi(be, bhs, scratch)) return false;
             break;
@@ -1539,7 +1608,39 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
         //  The data goes nowhere on a refusal: `got` bytes sit in scratch and
         //  only reach the backend after the rails below have passed.
         // ------------------------------------------------------------------
+        // ---- IMMEDIATE DATA -------------------------------------------------
+        // With ImmediateData=Yes the initiator may put the first bytes of a WRITE in
+        // the command PDU.  They are already in hand (cmdData_), they count towards
+        // the transfer, and the R2T below must therefore start AFTER them - the
+        // reference target's R2T starts at 8192 for exactly this reason, and asking
+        // for offset 0 while Windows had already sent 8192 bytes is what made the
+        // exchange stall (DESIGN 8.63).
         uint32_t offset = 0, r2tSn = 0, burstPdus = 0;
+        if (!cmdData_.empty() && bytes > 0) {
+            uint32_t imm = (uint32_t)cmdData_.size();
+            if (imm > bytes) imm = (uint32_t)bytes;
+            if (imm % bs) {
+                printf("  [iscsi] immediate data of %u bytes is not a whole number of "
+                       "%u-byte blocks\n", imm, bs);
+                uint8_t s[18];
+                uint32_t sl = buildSense(s, 0x05, 0x1A, 0);
+                return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
+            }
+            if (scratch.size() < imm) scratch.resize(imm);
+            memcpy(scratch.data(), cmdData_.data(), imm);
+            bytesIn += imm;
+            offset = imm;
+            if (g_iscsiTrace) printf("    [iscsi] immediate data: %u byte(s) in the command "
+                                     "PDU, R2T will start at offset %u\n", imm, offset);
+            if (!be.writable()) { /* the rails below still apply */ }
+            else if (!be.write(lba, imm / bs, scratch.data())) {
+                printf("  [iscsi] WRITE (immediate data) lba=%llu blocks=%u failed on the NVMe side\n",
+                       (unsigned long long)lba, imm / bs);
+                uint8_t s[18];
+                uint32_t sl = buildSense(s, 0x03, 0x0C, 0);
+                return sendScsiRsp(bhs.itt(), SCSI_STATUS_CHECK_COND, s, sl, 0, false);
+            }
+        }
         // Time the RECEIVE side of a 64 KiB burst, for the same reason the Data-In
         // send is timed: the read path puts 635-670 us inside a 64 KiB Data-In write,
         // and "this target's send is slow" and "Windows loopback TCP moves 64 KiB in
@@ -1628,6 +1729,13 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
                    (offset >= bytes) ? "no R2T needed" : "R2T for the remainder");
         }
 
+        // The SCSI Response's residual is derived from curDataOut vs curEdtl (see
+        // sendScsiRsp), and curDataOut only ever counted Data-In bytes - so a fully
+        // written command answered "residual 131072", which the trace showed and
+        // which is simply wrong: the initiator sent everything, nothing was left
+        // over.  For a write, the bytes RECEIVED are the bytes transferred.
+        curDataOut = (uint32_t)bytes;
+
         while (offset < bytes) {
             // ONE R2T PER BURST, not per Data-In-sized chunk.  MaxBurstLength is
             // 262144 and MaxRecvDataSegmentLength is 65536, so a burst is up to four
@@ -1652,7 +1760,17 @@ inline bool IscsiTarget::handleScsi(IscsiBackend& be, const IscsiBhs& bhs,
                 std::vector<uint8_t> payload;
                 if (!readPdu(d, payload)) return false;
                 if (d.opcode() != ISCSI_OP_DATA_OUT) {
-                    printf("  [iscsi] expected Data-Out, got opcode 0x%02X\n", d.opcode());
+                    // NOT an error: the initiator may keep sending commands while this
+                    // target collects a burst's data (it keeps its command window
+                    // full).  Hold it and keep waiting.
+                    if (deferred_.size() < 32) {
+                        printf("  [iscsi] deferring opcode 0x%02X while waiting for Data-Out\n",
+                               d.opcode());
+                        deferred_.push_back(std::make_pair(d, payload));
+                        continue;
+                    }
+                    printf("  [iscsi] too many deferred PDUs (%u); aborting\n",
+                           (unsigned)deferred_.size());
                     return false;
                 }
                 if (d.itt() != bhs.itt() || d.dataSn() != expectSn) {
