@@ -90,9 +90,15 @@ C 中，D、E 低（见 §6）。**每个里程碑与合计的人日都由 §3 �
 
 ### E. 传输种类
 
+**E1 要拆成两半，理由见 §9 的调研结论**：Windows 侧没有可采用的成熟实现，但 **Linux 侧有**
+（内核 `nvme-tcp`/`nvmet-tcp`、SPDK、libnvme 都是成熟的）。所以先做 **target 侧**——那才是能立刻
+被现成 initiator 用上、也才有强对照可验证的一半；initiator 侧等 target 侧跑通、且 D2/D1 的定位
+清楚之后再定。
+
 | 编号 | 任务 | 工作量 | 对端 | 验收判据 |
 |---|---|---|---|---|
-| E1 | NVMe/TCP：PDU 编解码（H2C/C2H）、digest、队头阻塞处理、（可选）TLS | XL (20–35) | Linux | 对 Linux `nvmet` 的 TCP transport 完成方向 A/B 全部用例；与 RDMA 路径共用同一套自测与互操作脚本 |
+| E1a | **NVMe/TCP target 侧**：PDU 编解码（ICReq/ICResp、H2C/C2H）、数据 digest、（可选）TLS | L (10–18) | Linux | Linux `nvme-cli` 用 TCP transport 连上我们的 target，方向 B 全部用例通过；与 RDMA 路径共用同一套互操作脚本 |
+| E1b | **NVMe/TCP initiator 侧**（我们自己的 Windows initiator 走 TCP，去掉 RDMA 网卡依赖） | L (10–17) | Linux | 对 Linux `nvmet` 的 TCP transport 完成方向 A 全部用例；同一机器上无 RDMA 网卡也能跑通 |
 | E2 | FC-NVMe | 0 | 外部 | **不做**：没有硬件，写下来是为了不偷偷省略 |
 
 ### F. 验证与质量
@@ -124,7 +130,7 @@ C 中，D、E 低（见 §6）。**每个里程碑与合计的人日都由 §3 �
 | **M1 · target 协议完备（单路径）** | B1–B6 | 19–31 | 26–45 | Linux 侧能对这块盘做 format / 多命名空间 / 保留，且每条都有报告 |
 | **M2 · 可用性与质量** | C1–C3 + F1、F2 | 22–37 | 48–82 | 拔路径不断流；长跑无泄漏；fuzz 能挡住已知 bug |
 | **M3 · Windows 原生磁盘** | D0 → D1a → D1b → D1c | 35–64 | 83–146 | Windows 把它当本机磁盘，队列深度 >1，有签名与升级路径 |
-| **M4 · 第二条传输**（可与 M3 并行） | E1 | 20–35 | — | NVMe/TCP 对 Linux 跑通全部用例 |
+| **M4 · 第二条传输**（可与 M3 并行） | E1a →（再定 E1b） | 10–18 | — | NVMe/TCP 的 target 侧被 Linux `nvme-cli` 用 TCP 连上并跑通方向 B |
 
 **关键路径**：`D0（NDKPI 可行性）` 是所有 Windows 原生方案的咽喉；它不成立，M3 就只剩 D2 路线。
 **可并行的**：M4 与 M3 互不依赖；A、B、F1/F2 全程可在本机推进。
@@ -138,14 +144,15 @@ C 中，D、E 低（见 §6）。**每个里程碑与合计的人日都由 §3 �
 | C 多路径与恢复 | 16–27 | 需 Linux（最好两口） |
 | D Windows 集成（D1 路线） | 36–66 | 否（内核驱动需测试签名环境） |
 | D Windows 集成（D2 路线） | 9–14 | 否 |
-| E NVMe/TCP | 20–35 | 验证需 Linux |
+| E NVMe/TCP（E1a target 10–18 + E1b initiator 10–17） | 20–35 | 验证需 Linux |
 | F 验证与质量（不含 F3/F4） | 9–15 | F3/F4 另需外部环境 |
 | G 性能 | 6–12 | 否 |
 
 | 路线 | 合计（不含 E、不含 F3/F4） | 折合 |
 |---|---|---|
 | **D1（协议完备 + 内核驱动）** | **92–163 人日** | 约 4.5–8 人月 |
-| 　同上 + E1（NVMe/TCP） | 112–198 人日 | 约 5.5–10 人月 |
+| 　同上 + E1a（只做 TCP target 侧） | 102–181 人日 | 约 5–9 人月 |
+| 　同上 + E1a + E1b（TCP 双向） | 112–198 人日 | 约 5.5–10 人月 |
 | **D2（产品可用，不做内核驱动）** | **65–111 人日** | 约 3–5.5 人月 |
 
 按 20 人日/人月折算；F3/F4 各自 6–12 人日，且由外部环境决定能否开工。
@@ -159,18 +166,73 @@ C 中，D、E 低（见 §6）。**每个里程碑与合计的人日都由 §3 �
 | D/E 的工作量置信度低 | 排期不准 | 把 D/E 拆成探针先做：D0；E1 先只做一个 PDU 编解码 + 一个用例 |
 | Linux 对端与第二台机器/交换机不确定 | C、F3、F4 卡住 | 不需要它们的 A、B、F1、F2、G 排在前面 |
 | 通告位与实现不一致（G-3/G-4 已经发生过一次） | 主机用不到已实现的功能 | A2 的自检把"通告位 ↔ 实现"钉住 |
-| Windows 是否已有自带 NVMe-oF initiator | 会改变 D 的优先级 | D3 调研（S，已排进 M0） |
+| **Windows 自带 NVMe-oF initiator**（只在某些 SKU） | 会改变 D 的优先级：Server 有，客户端没有 | **已部分查实，见 §9**：本机（Windows 11 专业工作站版 build 26200）**没有任何** NVMe-oF initiator；Windows Server 2025 据说有，但传输种类未能核实 |
 
-## 7. 需要你决定的事
+## 7. 决定与仍然开放的事
 
-1. **目标定位**：产品可用（走 **D2**，全表 **65–111 人日**）还是协议完备（走 **D1**，**92–163 人日**）？
-2. **是否投入 NVMe/TCP**（E1，20–35 人日）：它是第二条完整传输，也是"没有 RDMA 网卡也能用"的唯一路径。
-3. **外部环境**：有没有第二台机器、可配置交换机、或 ESXi/SPDK 环境？决定 F3/F4 是否排进计划。
-4. **是否愿意做内核驱动**：签名、调试、蓝屏风险都由它带来。
-5. **优先级**：先把 B 做完（单机可测的协议完备），还是先做 D（Windows 原生盘）？
+**2026-10 已定**（用户拍板）：
+
+1. **目标两个都要**：先按 D2 把产品可用的部分做扎实，同时推进 D1；**D1 以 D0 的探针结果为前提**，
+   D0 不成立就只剩 D2。
+2. **NVMe/TCP 按 §9 的调研结论办**：可采用的成熟实现只在 Linux 侧，Windows 侧没有 →
+   **做，但先做 target 侧（E1a）**，initiator 侧（E1b）等 E1a 跑通再定。
+3. **外部环境**：以后最多有一台带 RDMA 的笔记本 → **F3/F4 暂时移出计划**，等那台机器到位再排。
+4. **内核驱动看情况**：先做 D0（2–4 人日），用它决定 D1 是否值得开工。
+
+**仍然开放**：D1 与 B/C 的先后（先协议完备还是先 Windows 原生盘）由 D0 的结果和你的排期共同决定。
 
 ## 8. 不等决定也能开始的（建议第一批）
 
 **A1–A5 + D3 + F1**（小计 **10–19 人日**），全部在本机完成、全部有验收判据、都不依赖 Linux 或外部环境。
 其中 **A2** 是本表里性价比最高的一项：改动很小，但它把"已经实现却用不到"的功能真正交给主机
 （Linux 侧 discard / thin-provisioning 立刻可用），而且前后差异可以当场测出来。
+**注**：D3 的大部分已经在本轮做完（见 §9），剩下的是"Windows Server 2025 的 initiator 支持哪些传输"
+这一个问题——它不影响本机（客户端 SKU）的结论。
+
+## 9. 两项调研结论（E1 与 D3）
+
+### 9.1 NVMe/TCP：现成的成熟实现都在 Linux 侧，Windows 侧没有
+
+| 实现 | 平台 | 可被我们采用吗 |
+|---|---|---|
+| Linux 内核 `nvme-tcp` / `nvmet-tcp` | Linux | 不能（内核代码，且不在 Windows 上跑） |
+| SPDK（含 NVMe/TCP initiator 与 target） | Linux / FreeBSD；Windows 移植是实验性质 | 不能（Windows 侧没有可用的成熟移植） |
+| libnvme / `nvme-cli`（含 TCP transport） | Linux/Unix 用户态 | 不能（同前） |
+
+**结论：做，但先做 target 侧（E1a）。** 理由不是"没人做过"，而是**能用的那一半正好相反**：
+target 侧的对方是 Linux `nvme-cli`——**成熟、现成、可以当强对照**，我们写完立刻能被它验证，
+而且这条路让"任何 Linux 机器 + 普通网卡"就能用上我们的 target（不需要 RDMA 网卡）。
+initiator 侧（E1b）的对方才是我们自己，价值取决于 D2/D1 怎么定位，所以留到 E1a 之后。
+
+### 9.2 Windows 自带的 NVMe-oF initiator：Server 有，客户端没有（本机已实测）
+
+**本机实测**（Windows 11 专业工作站版，build 10.0.26200）：
+
+```
+与本机 NVMe-oF 相关的服务/驱动/命令
+  服务 : 无（只有一个无关的 WSAIFabricSvc）
+  驱动 : nvmedisk(running)、stornvme(running)   <- 这两个是 LOCAL NVMe 栈，不是 fabrics
+  命令 : 无
+对照 : msiscsi = Running（Microsoft iSCSI Initiator Service）
+```
+
+即：**这台机器有内置 iSCSI initiator，没有任何 NVMe-oF initiator**——这正是 iSCSI 桥存在的理由，
+也说明 G-8 在本机依然成立。可选功能列表需要管理员权限，本轮没能枚举（诚实记账）。
+
+**Windows Server 2025 则 reportedly 带了 NVMe-oF initiator**，来源：
+[4sysops 的 Server 2025 存储新特性](https://4sysops.com/archives/new-storage-features-in-windows-server-2025-nvme-of-initiator-update-for-s2d-deduplication-for-refs/)、
+[NetApp 的 ONTAP SAN host 文档（NVMe/FC for Windows Server 2025）](https://docs.netapp.com/us-en/ontap-sanhost/nvme-windows-2025.html)、
+[Pure Storage 的 Windows Server Initiator 实践](https://blog.purestorage.com/purely-technical/nvme-over-fabrics-nvme-of-with-windows-server-initiator-and-everpure/)。
+其中 NetApp 那篇给出了两条**值得记住的细节**：
+
+- 它需要厂商 HBA 与驱动参数（`EnableNVMe=1`、`NVMEMode=0`）——**不是纯软件就能用**；
+- **Broadcom 在 Windows 上的 "NVMe/FC" 是一个 SCSI ⇄ NVMe 转译驱动**，不是真正的 NVMe/FC 驱动；
+  其后果是 NVMe/FC 与 FCP 在 Windows 上性能相同（不如 Linux 上差距那么大），而且命名空间在系统里
+  表现为 SCSI LUN（`nvme-list-ns` 输出里带 SCSI Bus/Target/OS LUN）。
+
+**没能核实的**（页面被 403 或 PDF 不支持，如实记账）：Server 2025 的 initiator 支持 **哪些传输**
+（FC / TCP / RDMA），以及 **Windows 11 24H2+ 客户端 SKU** 是否也带。
+
+**对本计划的影响**：不动 G-8 在本机的结论，也不影响我们的 **target 侧**；但它意味着"Windows 没有
+NVMe-oF initiator"这句话是 **SKU 相关**的，如果将来要在 Server 上部署，D1 的 StorPort 驱动必要性
+需要重新评估——那时 D3 的剩余那一问必须先有答案。
