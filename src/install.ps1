@@ -57,6 +57,14 @@ param(
     # own rather than restart every 5 s until the timing happens to be right.
     [int] $BackendRetrySeconds = 15,
 
+    # Burst sizes advertised to Windows' initiator.  Measured values: the initiator
+    # charges a fixed ~16-20 ms per command and per Data-Out PDU, so bigger is faster
+    # until the initiator's own caps apply (DESIGN 8.68).  It also has to agree with the
+    # initiator's registry (MaxBurstLength / MaxRecvDataSegmentLength under the
+    # Microsoft iSCSI Initiator class key) or the negotiation takes the smaller value.
+    [int] $MaxBurstLength = 4194304,      # -iscsimbl: one R2T burst / CDB size
+    [int] $MaxSegmentLength = 1048576,    # -iscsichunk: one Data-In / Data-Out PDU
+
     [string] $ExeSource = (Join-Path $PSScriptRoot 'f5_interop.exe')
 )
 
@@ -91,6 +99,13 @@ $args = @(
 )
 if ($ReadWrite) { $args += '-iscsirw' }
 if ($BackendRetrySeconds -gt 0) { $args += @('-backendretry', "$BackendRetrySeconds") }
+# The two burst-size levers, and the values are the measured ones (DESIGN 8.68):
+# through Windows' initiator each SCSI command and each Data-Out PDU costs a fixed
+# ~16-20 ms, so throughput is bought by putting more data behind each one.  A 4 MiB
+# read went 11.9 -> 81.9 MB/s and a 4 MiB write 900 -> 69 ms with these.  Both are
+# capped by the INITIATOR's own registry values, which only reload when the
+# ROOT\ISCSIPRT device instance is re-enabled - see the README's tuning section.
+$args += @('-iscsimbl', "$MaxBurstLength", '-iscsichunk', "$MaxSegmentLength")
 $args += $ExtraArgs
 
 $conf = Join-Path $InstallDir 'bridge.conf'

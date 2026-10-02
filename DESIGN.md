@@ -4152,6 +4152,11 @@ Windows 会自己重新登录，盘自己回来。
 **这条没查完，不装作查完了**：下一步应该用官方工具同样的 QP 参数复现，或者把接收深度从 1 加深
 再量。它是目前关于桥性能最有价值的一条线索。
 
+> **撤回（§8.68）：这条线索是错的。** 那 12-22 ms 不是 RDMA 完成延迟，而是**我们自己 target 的
+> per-command `printf`**（未缓冲 stdout，通常重定向到文件）。同样的串行读，把 target 的 stdout
+> 指向 NUL 就从 4.9 MiB/s 变成 255.3 MiB/s（52 倍）。`-nvmetiming` 的逐跳数字本身也被这个日志
+> 污染了——见 §8.68(0)。保留原文是因为"我们查过什么、怎么错的"和结论一样值钱。
+
 #### (4) 这条延迟怎么传到 iSCSI 桥
 
 桥的 `-iscsitime` 分解（256 KiB 读，每条命令一行）：
@@ -4180,6 +4185,102 @@ Windows 路径实测（同一块 48 MiB namespace，QD1，一次读完）：
     .\tools_nd_bw.ps1 -Ops write,read,send -Sizes 64KB,256KB,1MB,4MB,8MB -Seconds 10   # 纯链路
     .\run_f4.ps1 -xfer 262144 -rounds 64                                               # 我们的栈（流水）
     f5_interop.exe -initiator 192.168.100.2 4420 192.168.100.3 -nvmetiming -dump out.bin  # 深度 1 + 逐跳
+
+### 8.68 ✅ "NVMe-oF 慢"的答案是**我们自己 target 的日志**（52 倍）；以及 Windows initiator 侧那 ~16 ms 的两条真正杠杆
+
+#### (0) 先撤回 §8.67(3) 的结论
+
+§8.67 里我写：串行路径 4.8 MiB/s 的原因是"完成事件晚到 12-22 ms，嫌疑在 QP 接收侧（RNR）"。
+**这个结论是错的。** 真正的原因是**我们自己的 `-target` 每条 I/O 命令都往一个未缓冲的 stdout 打一行
+日志**（`setvbuf(stdout, nullptr, _IONBF, 0)`，而 stdout 通常被重定向到文件）：每一次 `printf` 都是
+轮询循环里的一次同步写。证据是一个干净的 A/B，条件完全相同：
+
+    目标端 stdout -> 文件 :  48 MiB 串行读 9.83 s =   4.9 MiB/s
+    目标端 stdout -> NUL  :  48 MiB 串行读 0.19 s = 255.3 MiB/s     (52 倍)
+
+`-nvmetiming` 那次逐跳测量之所以指向"完成延迟"，是因为**测量本身被日志污染了**：目标端每条命令
+打印 + 内联 reap 把每条命令从 ~13 ms 推到 ~34 ms，而"31 µs 处理完、12-22 ms 才回来"这个形状，
+其实是"打印占住了轮询循环"。第 4 条排除项（"数据通路没问题"）是对的，第 3 条（"慢的是完成事件"）
+只是把一个自己造成的问题换了个说法。
+
+修法：把那条 per-command 打印加开关 `-iotrace`（默认关，错误/拒绝类打印保持无条件，它们稀有且有用）。
+`src/f5_interop.cpp` 的 `[io] cmd ...`。同一条修正在桥侧的效果：
+
+| 指标 | 修前 | 修后 |
+|---|---|---|
+| 后端往返（`-iscsitime` 的 nvme 段，256 KiB 读） | 13,500 µs | **39-205 µs** |
+| 桥服务一条命令（中位） | 15,500 µs | **207 µs** |
+| 写路径 first-burst 段 | 12,513 µs | **45 µs** |
+
+教训（比数字重要）：**热路径上的日志不是"顺手加的"，它是一个按命令计费的同步 I/O**；而这个项目
+已经因为同一个错误赔过一次（§8.57 的 50 倍自我伤害），这次的代价是整个 §8.67 的调查方向。
+
+#### (1) 修完之后：瓶颈换到了 Windows initiator 侧，而且不在我们这边
+
+修完日志后，桥自己的服务时间降到 207 µs，但 Windows 应用层读一条命令仍然要 ~19-21 ms
+（8 KiB 到 256 KiB 都一样，与块大小无关）。逐项排除：
+
+| 假设 | 证据 | 结论 |
+|---|---|---|
+| 桥太慢 | 桥服务中位 207 µs；8 并发读者时命令间隔中位 14 µs，桥 94% 时间空闲 | 否 |
+| 环回 TCP | 同机环回 TCP 往返：64 B 0.078 ms、64 KiB 0.74 ms、256 KiB 4.3 ms | 否 |
+| 应用侧测量夹具 | 同一段 PowerShell 循环读本机 NVMe：210 MB/s、1.19 ms/命令 | 否 |
+| 缓存管理器 | 用 `IOCTL_SCSI_PASS_THROUGH_DIRECT` 直接发 READ(10)（绕过 disk.sys 读路径）：256 KiB 仍 24.14 ms | 否 |
+| 队列深度不够 | 重叠 I/O：深度 1 -> 22.1 ms/IO (11.3 MB/s)，深度 64 -> 13.0 ms/IO (19.3 MB/s) | 基本不随深度扩展 |
+| 我们延迟 ACK 让对端 Nagle 卡住 | 给 `SIO_TCP_SET_ACK_FREQUENCY=1`（逐段 ACK）：19.2/20.8 ms，与默认 19.3/21.0 ms 无差别（已回退） | 否 |
+
+结论：**这是 Microsoft iSCSI initiator 自己的每条命令 ~16-20 ms 固定开销**，与本桥、与 RDMA、
+与环回 TCP 都无关。它是这次"把桥做快"的天花板。
+
+#### (2) 两条真正有效的杠杆（都实测）
+
+既然是"每条命令固定开销"，那就让每条命令多搬点数据。两个值必须**同时**放大，否则协商取小值：
+
+1. **initiator 侧注册表**（`HKLM\SYSTEM\CurrentControlSet\Control\Class\{4D36E97B-...}\0009\Parameters`）：
+   `MaxTransferLength` 262144 -> **4194304**、`MaxBurstLength` 262144 -> **4194304**、
+   `MaxRecvDataSegmentLength` 65536 -> **1048576**。
+   **注意：改完必须重新启用 `ROOT\ISCSIPRT\0000` 设备实例**（`Disable-PnpDevice` / `Enable-PnpDevice`），
+   `Restart-Service msiscsi` 不够——这一点实测确认：只重启服务时 CDB 仍是 256 KiB，重载设备后
+   立刻变成 4 MiB。
+2. **桥侧**：`-iscsimbl 4194304`（MaxBurstLength / 一次 R2T 的突发）与
+   `-iscsichunk 1048576`（MaxRecvDataSegmentLength / 单个 Data-In、Data-Out PDU）。
+
+实测（同一块 48 MiB namespace，QD1，逐字节验证）：
+
+| 项目 | 修前 | 修后 |
+|---|---|---|
+| 4 MiB 读 | 11.9 MB/s（256 KiB CDB） | **75-82 MB/s**（4 MiB CDB） |
+| 4 MiB 写（真实耗时，见 (3)） | ~900 ms | **69 ms** |
+| 16 MiB 写 | - | **275 ms（61 MB/s）** |
+
+16 MiB 的 CDB 没有生效（仍停在 4 MiB），所以 4 MiB 是目前实测的天花板；`-iscsichunk` 加大后写
+没有再快，说明写的剩余成本在别处（4 MiB 写 = 一次 immediate data + 一个 R2T + 4 个 Data-Out
+PDU + 后端四次 256 KiB 写；测得 69 ms 里绝大部分是那 4 个 PDU 的 ~16 ms）。
+
+#### (3) 顺手抓到的一个测量 bug：工具自己把 900 ms 算进了写时间
+
+`tools_iscsi_write.ps1` 里 `New-DetPattern` 用 `return $out` 返回数组，PowerShell 会**把数组展开**
+进管道，调用方拿到的是 `Object[]` 而不是 `byte[]`；于是被计时的 `FileStream.Write()` 每次都要
+逐元素转换四百万个对象。4 MiB 写因此虚报 **约 900-1000 ms**，而真实写入是 **69 ms**。
+修法 `return , $out`（把数组当一个对象返回），并在注释里写清楚为什么。
+**§8.64 里所有写路径的绝对耗时都受这个 bug 影响**：那些数字里约 900 ms 是 PowerShell 的封送，
+不是 I/O（当时的结论"写能通、逐字节一致"不受影响，受影响的只是时间）。
+
+#### (4) 复现
+
+    # 1) 目标端（注意：不要开 -iotrace）
+    f5_interop.exe -target 192.168.100.2 4420 -serve 0 -nsfile D:\nvmeof\ns48.img
+    # 2) 桥（两个突发尺寸按 (2) 放大）
+    f5_interop.exe -initiator 192.168.100.2 4420 192.168.100.3 -iscsi 3260 -iscsirw `
+                   -iscsimbl 4194304 -iscsichunk 1048576 -iscsitime
+    # 3) Windows 侧（改注册表后必须重载设备实例）
+    Disable-PnpDevice -InstanceId ROOT\ISCSIPRT\0000 -Confirm:$false
+    Enable-PnpDevice  -InstanceId ROOT\ISCSIPRT\0000 -Confirm:$false
+    iscsicli AddTargetPortal 127.0.0.1 3260
+    Connect-IscsiTarget -NodeAddress iqn.2024-01.com.nvmeof:bridge0 -IsPersistent $false
+    # 4) 量
+    .\tools_iscsi_perf.ps1 -Concurrent 8        # 吞吐 + 桥内分解
+    .\tools_iscsi_write.ps1 -Drive 3 -Offset 0 -Size 4MB   # 三条证据逐字节
 
 ## 7. 已知风险
 

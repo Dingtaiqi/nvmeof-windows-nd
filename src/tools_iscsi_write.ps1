@@ -107,7 +107,12 @@ function New-DetPattern([int]$n) {
         [Array]::Copy($h, 0, $out, $k * 32, $copy)
     }
     $sha.Dispose()
-    return $out
+    # Return the array as ONE object.  A bare `return $out` unrolls it into the
+    # pipeline, the caller ends up with an Object[] instead of a byte[], and the timed
+    # FileStream.Write() then converts four million elements one at a time: measured
+    # 900-1000 ms for 4 MiB, i.e. this tool's "write" number was mostly PowerShell
+    # marshalling and said nothing about the bridge.
+    return , $out
 }
 
 function Get-Sha256Hex([byte[]]$bytes) {
@@ -136,9 +141,9 @@ try {
     $null = $fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $fs.Write($pat, 0, $pat.Length)
-    $fs.Flush($true)          # FlushFileBuffers -> SYNCHRONIZE CACHE on the wire
+    $fs.Flush($true)          # FlushFileBuffers - does NOT reach the wire; see below
     $sw.Stop()
-    Write-Host "write      : $Size B in $($sw.ElapsedMilliseconds) ms (WriteThrough + FlushFileBuffers)"
+    Write-Host "write      : $Size B in $($sw.ElapsedMilliseconds) ms (buffered handle + FlushFileBuffers)"
 
     $null = $fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
     $back = New-Object byte[] ([int]$Size)

@@ -34,6 +34,7 @@
 | `src/run_f5_auth.ps1` | DH-HMAC-CHAP 六个用例（本机两口直连，不需要 Linux） |
 | `src/nvmeof_iscsi.h` | **用户态 iSCSI target**：三段式 login、SendTargets、NOP/Logout/TaskMgmt、SCSI 命令集（INQUIRY/VPD、MODE SENSE、READ CAPACITY、REPORT LUNS、READ/WRITE(10/16) 走 R2T、SYNCHRONIZE CACHE）。每连接一个对象一个线程，backend（一条队列对）用互斥量串行。装不进命令 PDU 的写按 ITT 挂起成状态（`PendingWrite`，窗口 8），不是在 `handleScsi()` 里阻塞等 Data-Out |
 | `src/tools_iscsi_write.ps1` | 写路径端到端逐字节检查：确定性图案写入 → initiator 读回 → 自建 SCSI pass-through 发 SYNCHRONIZE CACHE → 比对后端 namespace 文件（三条独立证据） |
+| `src/tools_iscsi_perf.ps1` | 经 Windows 自带 initiator 量桥吞吐：自己起后端与桥、登录、按块大小扫 QD1 与 N 个并发读者，并打印桥自己的每条命令耗时分解 |
 | `src/tools_nd_bw.ps1` | 纯链路基线：驱动官方 NetworkDirect `nd_write_bw` / `nd_read_bw` / `nd_send_bw` / `nd_*_lat` 扫消息尺寸，并按数据行解析（各版本列顺序不同，按 "Gb/s" 关键字抓会抓到表头） |
 | `src/tools_login_probe.ps1` | 把 Windows 真实发出的 iSCSI login **逐字节重放**给任意 target（做 LIO 参考实现的 A/B 对比用） |
 | `src/mount_nvmeof.ps1` | 命名空间 → fixed VHD → 盘符，卸载时回推 |
@@ -109,7 +110,7 @@ F5 的 target 有 8 槽 receive ring 与延迟完成，能扛住队列深度 32 
 | 7 **我们的 target ↔ Linux `nvme-cli`** | ✅ **跑通了**：`nvme connect` rc=0，`nvme list` 出现 `NDVMEOF0000000000001`，128 块写入→flush→读回 **`cmp` 逐字节相同**；主机建 **8 条 I/O 队列**、命令分散在 **6 条**上（DESIGN §8.46、§8.49） |
 | 8 **DH-HMAC-CHAP 在带内认证** | ✅ **两个方向都跑通了（Linux 对端实测）**：真 Linux 主机用 `nvme connect -S <key>` 认证到我们的 target（内核日志 `qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048`，单向与**双向**都通过并搬运了数据，**错密钥被拒**，`authRefused=0`）；反向也一样——我们的 host 认证到**要求认证的 nvmet**，`Success2 sent (the controller's own response verified)`，即真 ffdhe2048 DH + 双向（DESIGN §8.51、§8.52） |
 | 9 **Linux 的 1 TB 真盘成为 Windows 的活动盘** | ✅ Linux `/dev/nvme1n1`（CT1000P3PSSD8，1953525168 × 512 B = 931.51 GiB）出现为 `Get-Disk` #3，**Online**、GPT、NTFS `E:` 可读；两次与 Linux 侧的字节级对照；**全程零写入**（DESIGN §8.55、§8.56，[EVIDENCE-1TB.md](EVIDENCE-1TB.md)） |
-| 10 **持续串流压测** | ⚠️ 读：整条 Windows 路径在**队列深度 1** 时 **79 MB/s**（64 KiB 块、单线程同步读；每条命令 0.755 ms，其中 Data-In socket 写 0.635 ms、NVMe 暂存 0.115 ms），**8 个并发读者时 230.6 MB/s**；1 MiB 读在深度 1 达 **119.7 MB/s**（Windows 会把 CDB 放大到 256 KiB，于是一条命令 = 一次 256 KiB 的 NVMe 读 + 4 个 Data-In PDU，见 DESIGN §8.59）。**报这个桥的吞吐必须带上队列深度**：早先的"73–102 MB/s"是单线程夹具的数字，不是天花板。单命令开销的大头在 **initiator 的 Data-In 路径**而不在本桥：发 64 KiB 给它要 669 µs，而从它那收同样的 64 KiB 只要 306 µs；两个 target 侧优化（BHS+数据合并为一次 `WSASend`、1 MiB socket 缓冲）实测都无效（§8.61）。全程零错误；数据路径 trace 默认关闭（打开慢约 20 倍），调试用 `-iscsitrace`，要每条命令的耗时分解用 `-iscsitime`。裸栈 **1230 / 1179 MiB/s**（写/读，20 轮）。**桥的写路径现在任意尺寸都可用，包括"新会话第一条就写 4 MiB"**，三条独立证据逐字节一致：① Windows initiator 自己读回；② 后端 namespace 文件（显式发 SYNCHRONIZE CACHE → NVMe FLUSH 之后）；③ 目标端 PDU 轨迹。实测 4 MiB @ 0（首写）、8 MiB @ 8 MiB、一个会话内 64 KiB → 128 KiB → 1 MiB → 4 MiB 爬坡、以及 1 MiB + 512 B（非整 burst 尾块，@32 MiB）全部通过。每条 256 KiB 写命令的线形是"即时数据 65536 + 一个 R2T 要剩下的 + 三个 64 KiB Data-Out + `GOOD`/残差 0"，窗口 8 条命令流水——与参考实现（tgt）产生的形状一致。这取代了老的"必须按尺寸爬坡"和"4 MiB 首写撕会话"：装不进命令 PDU 的写现在是**按 ITT 挂起的状态**，不是 `readPdu()` 阻塞循环（§8.64）；老的根因（**协商**，不是 R2T 字节）见 §8.63。两个值得知道的坑：裸磁盘句柄上的 `FlushFileBuffers` **到不了线上**（实测），所以"读回来对"不等于持久化——`src/tools_iscsi_write.ps1` 自己发 SYNCHRONIZE CACHE；`-iscsitrace` 会让墙钟时间变成 2.6 倍，别开着它测吞吐。桥默认只读（拒绝写入前会先把第一段数据排空，会话不会因此被撕开），故第 9 项不受影响 |
+| 10 **持续串流压测** | ⚠️ 读：整条 Windows 路径在**队列深度 1** 时 **79 MB/s**（64 KiB 块、单线程同步读；每条命令 0.755 ms，其中 Data-In socket 写 0.635 ms、NVMe 暂存 0.115 ms），**8 个并发读者时 230.6 MB/s**；1 MiB 读在深度 1 达 **119.7 MB/s**（Windows 会把 CDB 放大到 256 KiB，于是一条命令 = 一次 256 KiB 的 NVMe 读 + 4 个 Data-In PDU，见 DESIGN §8.59）。**报这个桥的吞吐必须带上队列深度**：早先的"73–102 MB/s"是单线程夹具的数字，不是天花板。单命令开销的大头在 **initiator 的 Data-In 路径**而不在本桥：发 64 KiB 给它要 669 µs，而从它那收同样的 64 KiB 只要 306 µs；两个 target 侧优化（BHS+数据合并为一次 `WSASend`、1 MiB socket 缓冲）实测都无效（§8.61）。全程零错误；数据路径 trace 默认关闭（打开慢约 20 倍），调试用 `-iscsitrace`，要每条命令的耗时分解用 `-iscsitime`。裸栈 **1230 / 1179 MiB/s**（写/读，20 轮）。**桥的写路径任意尺寸都可用，包括"新会话第一条就写 4 MiB"，** 三条独立证据（initiator 读回、显式 SYNCHRONIZE CACHE 之后的后端 namespace 文件、PDU 轨迹）逐字节一致。把突发尺寸按"调 Windows 侧"一节调好之后实测：**4 MiB 读 75-82 MB/s、4 MiB 写 69 ms、16 MiB 写 275 ms（61 MB/s）**，全部逐字节验证。调之前同一个桥的 4 MiB 读只有 11.9 MB/s——因为 Windows initiator 每条命令发 256 KiB，而且每条命令、每个 Data-Out PDU 收 ~16-20 ms 固定开销（DESIGN §8.68）。这就是当前的天花板：不是链路（2.97 GB/s 在那儿闲着）、不是 RDMA 栈（流水 1.5-1.8 GB/s），也不是这个桥（中位 207 µs 答完，8 个并发读者时仍有 94% 时间空闲）。桥默认只读（拒绝写入前会先把第一段数据排空，会话不会因此被撕开），故第 9 项不受影响 |
 
 第 5、7 项是唯一能发现"我们两端一起写错"的测试——第一次真跑，
 它们一共抓出 **11 个缺陷**，其中 7 个是我们两端对同一字段的理解与规范不一致，
@@ -257,8 +258,18 @@ Get-Disk | Where-Object BusType -eq 'iSCSI'
 | 服务名 | `nvmeofNdBridge`（可用 `-ServiceName` 改） |
 | 命令行 | 整条桥的命令行放在服务的 ImagePath 里，`sc qc nvmeofNdBridge` 可查 |
 
-三点部署前要知道：
+四点部署前要知道：
 
+- **两端都要调，否则桥会显得很慢，而那不是它的错**：Windows 的 initiator 每条 SCSI 命令、每个
+  Data-Out PDU 都收 **~16-20 ms 固定开销**，所以"每条多搬点"就是唯一的提速方向，而且两端必须
+  同时放大，否则协商取小值：
+  1. initiator 注册表 `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4D36E97B-E325-11CE-BFC1-08002BE10318}\0009\Parameters`：
+     `MaxTransferLength=4194304`、`MaxBurstLength=4194304`、`MaxRecvDataSegmentLength=1048576`。
+     **这些值只在设备实例重新启用时才会重新加载**，`Restart-Service msiscsi` 不够：
+     `Disable-PnpDevice -InstanceId ROOT\ISCSIPRT\0000 -Confirm:$false` 再 `Enable-PnpDevice …`；
+  2. 桥侧突发尺寸：`-iscsimbl 4194304 -iscsichunk 1048576`（`install.ps1` 已默认传，
+     参数名 `-MaxBurstLength` / `-MaxSegmentLength`）。实测效果：4 MiB 读 **11.9 → 81.9 MB/s**，
+     4 MiB 写 **约 900 → 69 ms**，全部逐字节验证（DESIGN §8.68）。
 - **对端不在时服务会重试而不是退出**：`install.ps1` 会带上 `-backendretry 15`，所以 NVMe-oF
   target 还没起来时服务保持 `Running`，等它出现后自己连上，而不是退出后被 SCM 每 5 秒重启一次。
   已验证：连续三次失败（每次都会释放它占用的设备、队列与注册内存），随后对端出现，桥**无需重启**

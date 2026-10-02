@@ -438,6 +438,11 @@ struct Completion { uint16_t cid; uint16_t status; uint64_t result; };
 // cannot be attributed by looking at the total.  Inert without the switch.
 static bool g_nvmeTiming = false;
 
+// Per-I/O-command trace on the target, OFF by default.  See the note at its single
+// use site: printing per command into an unbuffered stdout cost 52x on a serial
+// read, and that cost was mistaken for RDMA completion latency (DESIGN 8.68).
+static bool g_ioTrace = false;
+
 // Machine-wide microseconds, from QueryPerformanceCounter.
 //
 // NOT std::chrono::steady_clock: MSVC gives that clock a per-process epoch, so two
@@ -1790,7 +1795,7 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
         IscsiTarget target;
         char iqn[160];
         snprintf(iqn, sizeof(iqn), "iqn.2024-01.com.nvmeof:bridge0");
-        if (!target.listenLoopback((uint16_t)g_iscsiPort, iqn, 65536, g_iscsiBind)) {
+        if (!target.listenLoopback((uint16_t)g_iscsiPort, iqn, g_iscsiChunk, g_iscsiBind)) {
             printf("    cannot listen; stopping\n");
             dev.close(nullptr, nullptr, 0);
             return 1;
@@ -3400,10 +3405,24 @@ static bool targetIo(Queue& q, Device& d, F5State& st, int qi, int slot) {
         st.ioCommands++;
         st.ioPerQueue[qi]++;
         if (sgl.invalidate) st.invalidates++;
-        printf("  [io]    cmd %d q%d %s nsid=%u slba=%llu blocks=%u sgl(addr=0x%llX key=0x%08X len=%u%s)\n",
-               st.ioCommands, qi + 1, op == NVMEOF_OPC_WRITE ? "WRITE" : "READ", nsid,
-               (unsigned long long)slba, blocks, (unsigned long long)sgl.addr, sgl.key,
-               sgl.len, sgl.invalidate ? " INVALIDATE" : "");
+        // PER-COMMAND I/O PRINT, OFF BY DEFAULT, and the measurement is why: this
+        // one line used to run on every READ and WRITE, into an UNBUFFERED stdout
+        // (setvbuf _IONBF in main) that a caller usually redirects to a file.  Each
+        // printf is then a synchronous write in the middle of the poll loop.
+        //
+        // Measured (DESIGN 8.68): the same serial 48 MiB read took 9.83 s with the
+        // target's stdout going to a file and 0.19 s with it going to NUL - 4.9 MiB/s
+        // against 255 MiB/s, a 52x difference from LOGGING, which had been misread as
+        // "12-22 ms of completion latency in the RDMA provider" for a whole
+        // investigation.  A target that prints per command cannot be benchmarked, and
+        // a bridge whose backend prints per command inherits it: the iSCSI bridge's
+        // "-iscsitime nvme" was 13.5 ms per command for exactly this reason.
+        if (g_ioTrace) {
+            printf("  [io]    cmd %d q%d %s nsid=%u slba=%llu blocks=%u sgl(addr=0x%llX key=0x%08X len=%u%s)\n",
+                   st.ioCommands, qi + 1, op == NVMEOF_OPC_WRITE ? "WRITE" : "READ", nsid,
+                   (unsigned long long)slba, blocks, (unsigned long long)sgl.addr, sgl.key,
+                   sgl.len, sgl.invalidate ? " INVALIDATE" : "");
+        }
         if (nsid != 1) { sc = NVMEOF_SC_INVALID_NS; }
         else if (slba + blocks > g_nsBlocks) { sc = NVMEOF_SC_LBA_RANGE; }
         else if (!sgl.present) { sc = NVMEOF_SC_SGL_INVALID_TYPE; }
@@ -4243,7 +4262,7 @@ int main(int argc, char** argv) {
                "               [-iscsi <port> [-iscsiaddr <ip>] [-iscsirw] [-iscsitrace] [-iscsitime] [-iscsimbl <bytes>] [-iscsir2tcfg <file>]]\n"
                "               [-backendretry <s>] [-nvmetiming]\n"
                "  %s -target    <ip> <port> [-serve <n>] [-authkey <DHHC-1:..>]\n"
-               "                          [-authdhgroup 2048|3072|4096] [-reconnectwait <s>]\n"
+               "                          [-authdhgroup 2048|3072|4096] [-reconnectwait <s>] [-iotrace]\n"
                "                          (n = 1 by default; 0 = keep serving)\n"
                "\n"
                "  %s -genkey    [sha256|sha384|sha512]     print a fresh DHHC-1 key\n"
@@ -4360,6 +4379,12 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "-nvmetiming") == 0) {
             g_nvmeTiming = true;
         }
+        // One line per I/O command on the target.  Off by default because it costs
+        // 52x on a serial workload (DESIGN 8.68) - turn it on when the question is
+        // "which LBA did the host ask for", not when it is "how fast is this".
+        else if (strcmp(argv[i], "-iotrace") == 0) {
+            g_ioTrace = true;
+        }
         // MaxBurstLength to advertise.  Default 65536, which is what makes writes
         // work: Windows picks its CDB size from this, and a CDB larger than the
         // first burst forces an R2T it then rejects.  262144 makes Windows choose
@@ -4392,6 +4417,20 @@ int main(int argc, char** argv) {
             long v = atol(argv[++i]);
             if (v >= 512 && v <= 16777215) g_iscsiMaxBurst = (uint32_t)v;
             else printf("  -iscsimbl: %ld is outside 512..16777215, ignored\n", v);
+        }
+        // MaxRecvDataSegmentLength this target advertises, i.e. the largest single
+        // Data-In PDU we send AND the largest Data-Out PDU we accept.  Default 65536
+        // (one page of iSCSI), and raising it is worth real throughput: measured through
+        // Windows' initiator, a 4 MiB write costs ~16 ms PER DATA-OUT PDU, so at 64 KiB
+        // per PDU a 4 MiB write takes a second.  The initiator's own
+        // MaxRecvDataSegmentLength (registry, under the Microsoft iSCSI Initiator class
+        // key) caps the read direction, so raise that too - and note that its parameters
+        // only reload when the ROOT\ISCSIPRT device instance is re-enabled, not on a
+        // service restart (DESIGN 8.68).
+        else if (strcmp(argv[i], "-iscsichunk") == 0 && i + 1 < argc) {
+            long v = atol(argv[++i]);
+            if (v >= 512 && v <= 16777215) g_iscsiChunk = (uint32_t)v;
+            else printf("  -iscsichunk: %ld is outside 512..16777215, ignored\n", v);
         }
         else if (strcmp(argv[i], "-iscsirw") == 0) {
             g_iscsiReadWrite = true;

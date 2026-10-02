@@ -83,6 +83,14 @@ static bool g_iscsiTime = false;
 //  may ask for; it stays at 262144, which is also what Windows offers.
 static uint32_t g_iscsiMaxBurst = 262144;
 
+// MaxRecvDataSegmentLength this target advertises (-iscsichunk), i.e. both the
+// largest Data-In PDU it sends and the largest Data-Out PDU it accepts.  65536 is the
+// iSCSI default and what this bridge shipped with.  Raising it is one of the two
+// levers that actually move throughput through Windows' initiator, because that
+// initiator charges ~16 ms per Data-Out PDU: a 4 MiB write at 64 KiB per PDU is 63
+// PDUs and takes about a second, while at 1 MiB per PDU it is 4 (DESIGN 8.68).
+static uint32_t g_iscsiChunk = 65536;
+
 // ---------------------------------------------------------------------------
 //  R2T PROBE (-iscsir2tcfg <file>): a runtime A/B harness for the one PDU
 //  Windows refuses.
@@ -545,6 +553,10 @@ public:
             // "idle" by recvAll(); a timeout in the middle of a PDU is not.
             DWORD rcvto = 2000;
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvto, sizeof(rcvto));
+            // NOT setting SIO_TCP_SET_ACK_FREQUENCY here: it was tried (ACK every
+            // segment instead of every second one, the usual suspect when an iSCSI
+            // round trip stalls by a timer quantum) and changed nothing - 19.2/20.8 ms
+            // per command against 19.3/21.0 with the default.  DESIGN 8.68.
             char who[64];
             sprintf_s(who, "%s:%u", inet_ntoa(from.sin_addr), ntohs(from.sin_port));
             printf("\n  [iscsi] session from %s\n", who);
@@ -637,6 +649,10 @@ private:
     // so the CmdSN accounting stays in order.
     std::vector<std::pair<IscsiBhs, std::vector<uint8_t>>> deferred_;
     std::chrono::steady_clock::time_point tCmdHr;   // high-resolution command start
+    // -iscsitime: when our last SCSI response went out, so the gap to the next
+    // command can be attributed to the initiator rather than to this target.
+    std::chrono::steady_clock::time_point tPrevResp;
+    bool havePrevResp = false;
     bool loggedIn, discovery;
     long cmds;
     unsigned long long bytesIn, bytesOut;
@@ -1355,6 +1371,19 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
         }
         case ISCSI_OP_SCSI_CMD: {
             if (!loggedIn) { if (!sendReject(bhs, 0x02)) return false; break; }
+            // -iscsitime: WHO is waiting.  The gap between our last response and this
+            // command is time the INITIATOR spent; without it, a "13 ms per command"
+            // number cannot be attributed to this bridge or to Windows - and that cost
+            // a whole wrong conclusion once already (DESIGN 8.68).
+            if (g_iscsiTime) {
+                auto now = std::chrono::steady_clock::now();
+                if (havePrevResp) {
+                    printf("  [iscsi] %.0f us between our last response and this command\n",
+                           (double)std::chrono::duration_cast<std::chrono::microseconds>(
+                               now - tPrevResp).count());
+                }
+                tPrevResp = now;
+            }
             // The command's own data segment is IMMEDIATE DATA: with ImmediateData=Yes
             // negotiated, the initiator may put the first bytes of a WRITE inside the
             // SCSI Command PDU.  Handed to handleScsi instead of being dropped -
@@ -1363,6 +1392,8 @@ inline bool IscsiTarget::session(IscsiBackend& be, std::vector<uint8_t>& scratch
             cmdData_ = data;
             std::lock_guard<std::mutex> lock(backendMutex());
             if (!handleScsi(be, bhs, scratch)) return false;
+            tPrevResp = std::chrono::steady_clock::now();   // our answer just went out
+            havePrevResp = true;
             break;
         }
         case ISCSI_OP_NOP_OUT:
