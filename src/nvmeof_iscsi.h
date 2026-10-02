@@ -116,6 +116,11 @@ struct R2tProbe {
     uint32_t len = 0;      // 0 = no override
     int ttt = -1, statsn = -1, offset = -1;
     int maxout = -1, erl = -1, immed = -1;
+    // Second-generation knobs, added when the one-variable-at-a-time sweep failed:
+    // the fields whose *semantics* rather than whose layout could still be wrong.
+    int r2tsn = -1;        // force the R2TSN field
+    int maxcmdsn = -1;     // >0: force; 0: copy ExpCmdSN; -2: force zero
+    int expcmdsn = -1;     // >0: force; -1: leave
 };
 static R2tProbe g_r2tProbe;
 
@@ -141,6 +146,9 @@ static void r2tProbeLoad() {
         else if (!strcmp(k, "maxout")) p.maxout = iv;
         else if (!strcmp(k, "erl"))    p.erl    = iv;
         else if (!strcmp(k, "immed"))  p.immed  = iv;
+        else if (!strcmp(k, "r2tsn"))  p.r2tsn  = iv;
+        else if (!strcmp(k, "maxcmdsn")) p.maxcmdsn = iv;
+        else if (!strcmp(k, "expcmdsn")) p.expcmdsn = iv;
     }
     fclose(f);
     g_r2tProbe = p;
@@ -761,7 +769,15 @@ private:
         if (g_r2tProbe.ttt > 0)     ttt = (uint32_t)g_r2tProbe.ttt;
         if (g_r2tProbe.offset >= 0) offset = (uint32_t)g_r2tProbe.offset;
         if (g_r2tProbe.len > 0)     len = g_r2tProbe.len;
+        if (g_r2tProbe.ttt >= 0)    ttt = (uint32_t)g_r2tProbe.ttt;
         if (g_r2tProbe.statsn == 1) statSn++;
+        if (g_r2tProbe.statsn > 1)  statSn = (uint32_t)g_r2tProbe.statsn;
+        if (g_r2tProbe.r2tsn >= 0)  r2tSn = (uint32_t)g_r2tProbe.r2tsn;
+        if (g_r2tProbe.expcmdsn > 0) expCmdSn = (uint32_t)g_r2tProbe.expcmdsn;
+        uint32_t r2tMaxCmd = maxCmdSn;
+        if (g_r2tProbe.maxcmdsn == 0)       r2tMaxCmd = expCmdSn;   // equal, not windowed
+        else if (g_r2tProbe.maxcmdsn == -2) r2tMaxCmd = 0;
+        else if (g_r2tProbe.maxcmdsn > 0)   r2tMaxCmd = (uint32_t)g_r2tProbe.maxcmdsn;
         uint8_t p[48] = {};
         p[0] = ISCSI_OP_R2T;
         iscsi_wr32(p + 16, itt);
@@ -783,7 +799,7 @@ private:
         // the current StatSN) is what this code does.
         iscsi_wr32(p + 24, statSn);
         iscsi_wr32(p + 28, expCmdSn);
-        iscsi_wr32(p + 32, maxCmdSn);
+        iscsi_wr32(p + 32, r2tMaxCmd);
         iscsi_wr32(p + 36, r2tSn);
         iscsi_wr32(p + 40, offset);
         iscsi_wr32(p + 44, len);
