@@ -80,3 +80,9 @@ id_ed25519*
 __pycache__/
 *.pyc
 .claude/
+# capture/debug artifacts from the iSCSI A/B runs (never deliverables)
+proxy_dump.txt
+ref_capture.txt
+ref_capture*.txt
+*.log
+regression*.log
