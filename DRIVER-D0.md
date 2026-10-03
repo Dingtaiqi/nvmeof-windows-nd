@@ -145,3 +145,55 @@ bcdedit /set testsigning on          # 持久化测试签名（需要 Secure Boo
 那需要先把 `ndkpi.h` 读完并列出准确的函数名与调用顺序（本文件 §2 只写了**确认过**的几个，
 `NdkOpenAdapter` 之类的名字尚未确认）。步骤 4 的判据仍然是一次 **RDMA Read 并逐字节比对** ——
 "适配器打开成功"说明不了数据路径可用。
+
+---
+
+## 8. D0 步骤 1 实测：WSK 在，**NDK 扩展不在**（2026-10，未签名的驱动已能加载）
+
+`src/driver/ndkprobe.c` 是真正的探针：它以 **WSK 客户端**身份注册，取到提供程序 NPI，然后用控制码
+`WSKNDK_GET_WSK_PROVIDER_NDK_DISPATCH`（`((ULONG)'NDKD')`）去要 **NDK 扩展派发表**，拿到就
+`WskOpenNdkAdapter`。结果写文件（不需要内核调试器）。
+
+### 实测输出
+
+```
+WskRegister                        = 0x00000000
+WskCaptureProviderNPI              = 0x00000000   client=FFFFD58E08558D70 dispatch=FFFFF8015D1181A0
+WskControlClient('NDKD')           = 0xC000000D   ndk dispatch=0000000000000000 (0 bytes)
+```
+
+`0xC000000D` = **STATUS_INVALID_PARAMETER**。第一次跑时我把 `OutputSizeReturned` 传了 NULL，而
+`wsk.h` 明确写着查询式调用要求它非空 —— 那是我自己的 bug，修掉之后**结果不变**，所以它不是参数问题。
+
+### 这条路径是"从头文件读出来"的，不是猜的
+
+| 头文件 | 提供什么 |
+|---|---|
+| `ndkpi.h` | **只有提供程序侧**：`NDK_FN_*` 派发表、`NDK_ADAPTER`/`NDK_CQ`/`NDK_QP`/`NDK_MR`/`NDK_SGE`。**没有任何客户端入口** —— 这就是为什么第一次找 `NdkOpenAdapter` 什么也没找到 |
+| `ndisNDK.h` | 微型端口侧：`NDIS_NDK_PROVIDER_CHARACTERISTICS`，网卡驱动注册 `OpenNDKAdapterHandler` |
+| **`wskndk.h`** | **客户端侧**：NDK 是 **WSK 的扩展** —— `WSK_PROVIDER_NDK_DISPATCH { WskOpenNdkAdapter, WskCloseNdkAdapter }`，控制码 `((ULONG)'NDKD')` |
+
+### 构建这两个坑值得记（省下一次重复）
+
+1. **WDK 里没有 `wsk.lib`。** `WskRegister`/`WskCaptureProviderNPI`/`WskReleaseProviderNPI`/`WskDeregister`
+   的导入库是 **`netio.lib`**（符号由 `netio.sys` 导出；`ndis.sys` 不含）。在整个 Kits 目录里
+   3550 个 `.lib` 中搜符号才找到这一条。
+2. `RtlStringCbVPrintfA` 会落到 CRT 的 `__stdio_common_vsprintf`，在内核里链接不上 —— 定义
+   **`NTSTRSAFE_LIB`** 并链接 `ntstrsafe.lib` 即可。
+3. `sc delete` 一个**仍在运行**的驱动只把它标记为删除，**`.sys` 文件直到重启才会解锁**（再链接会
+   `LNK1104`）。换个输出名即可绕开。
+
+### 怎么读这个结果（**不要**读成"内核这条路死了"）
+
+症状是"WSK 提供程序在，但它不认 `NDKD`"。有两种解释，而且第二种现在很可疑：
+
+1. NDK 的 WSK 扩展在这个提供程序上确实不提供；
+2. **ND/NDK 提供程序此刻是不健康的** —— 而这是已知事实：同一台机器的**用户态** RDMA 端点也是坏的
+   （`stag_smoketest` 连两进程连接都建不起来，DESIGN §8.75(8)）。**两个症状可能同一个根因**：WinOF 的
+   ND 提供程序状态不对，于是它既不接受用户态连接，也不向外提供 NDK 扩展。
+
+**下一个实验就是区分这两者**：等 RDMA 提供程序恢复（重启，清掉我这一轮用强杀弄脏的状态）之后，
+**立刻再跑一次这个探针**。如果 `NDKD` 那时回答了，两个症状同源，D0 的答案是"要提供程序健康才行"；
+如果仍然 `0xC000000D`，那才是"内核这条路在这张卡上不成立"。
+
+探针不需要重新编译：`sc create ndkprobe3 type= kernel binPath= <...>\ndkprobe2.sys` 即可重跑。
