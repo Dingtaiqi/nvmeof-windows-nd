@@ -592,3 +592,39 @@ client: NdkCompleteConnect   = 0x00000000
    —— 目前我全用 NULL 通知回调，这对 accept 完成是否有影响**必须用实验回答**，而不是推理；
 4. 若对齐示例后 accept 仍不完成，则问题在提供程序（`mlx4eth63`）一侧，届时应把它记录为**该卡/photon
    驱动的限制**，并据此调整 D1 的路线（例如改用 `NdkConnect` 主动连接 + 内核侧不依赖 accept 的拓扑）。
+
+---
+
+## 19. ★ 步骤 3 的阻塞点找到依据：**NDKPI 的端点是按 (本地地址, 端口) 引用计数的**
+
+微软官方文档
+[NDKPI Listeners, Connectors, and Endpoints](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/ndkpi-listeners--connectors--and-endpoints)
+里有一句直接命中今天全部症状的话：
+
+> "Simply closing the listener does not release the endpoint as long as there are previously accepted
+> connectors that are not yet closed. **This means that new NdkListen, NdkConnect and
+> NdkConnectWithSharedEndpoint requests for the same local address and port will fail until all such
+> connections are closed.**"
+
+**读法**：端点是**按 (本地地址, 端口) 做引用计数**的；只要还有**未关闭的连接**（包括列表器接受过的
+connector），同一本地地址+端口上的**新 `NdkListen` / `NdkConnect` 一律失败**。而失败状态正是我反复
+见到的 **`0xC0000236` = `STATUS_CONNECTION_REFUSED`**。
+
+**这与今天的内核侧现实完全吻合**：我加载了 **8 个驱动实例**（`ndkstep3*`），几乎每一个都创建过
+connector，而**没有一个关闭过**（尤其那个卡在 `START_PENDING` 的实例，它的 connector 和挂起的
+accept 永远没被清理）。也就是说 —— **我用自己的残留把自己越锁越死**，而且这一次是在内核侧、`sc stop`
+又清不掉。
+
+这与上午用户态那条教训是**同一类错误**：上午是"强杀 target 污染用户态 RDMA 栈"，现在是"未关闭的
+connector 占住端点，让后续 connect 全被拒"。**凡是"用一次就占住资源"的东西，测试框架必须保证释放**，
+否则后面测到的是自己的脚印。
+
+### 下一步（明确、只差一次干净启动）
+
+1. **重启**（清掉 8 个实例持有的全部端点）；
+2. **干净启动后只跑一次** `ndkstep3`（新端口），观察 `NdkConnect`：
+   - 若**成功** → 结论是"端点残留导致"，随后要立刻验证 accept 与私有数据（步骤 3 完成）；
+   - 若**仍被拒** → 那就不是端点残留，下一步对比 `NDKPing.sys`（已知可工作的内核客户端）的
+     `NdkConnect` 调用，必要时反汇编它的调用点看确切参数。
+3. 无论哪种结果，**驱动必须做到"跑完即释放"**（已在源码里：清理放在 `DriverUnload` + 成功后主动
+   close connector），并且 D1 必须让服务可停 —— 否则每轮实验都要重启一次。

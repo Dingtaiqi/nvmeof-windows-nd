@@ -180,7 +180,8 @@ typedef struct _STEP3_END {
     ULONG              IfIndex;
     NDK_ADAPTER*       Adapter;
     NDK_PD*            Pd;
-    NDK_CQ*            Cq;
+    NDK_CQ*            Cq;          // receive completions
+    NDK_CQ*            SendCq;      // initiator completions - SEPARATE, as in the working L2 probe
     NDK_QP*            Qp;
     NDK_LISTENER*      Listener;
     NDK_CONNECTOR*     Connector;
@@ -359,7 +360,10 @@ static NTSTATUS Step3ClientConnect(void) {
     RtlZeroMemory(&local, sizeof(local));
     RtlZeroMemory(&remote, sizeof(remote));
     local.sin_family = AF_INET;
-    local.sin_port = RtlUshortByteSwap((USHORT)(kPort + 1));   // NOT the listener port: two endpoints of the same host on the same port is what the CM refused
+    // SAME PORT as the listener, which is what the working user-mode pair does: there the client
+    // binds 192.168.100.3:<server port> and the server listens on 192.168.100.2:<same port>.  Tried
+    // with a separate port first; that is now eliminated, and every other variable has been too.
+    local.sin_port = RtlUshortByteSwap(kPort);
     local.sin_addr.s_addr = RtlUlongByteSwap(0x0A64C6A3);      // placeholder, set by caller
     remote.sin_family = AF_INET;
     remote.sin_port = RtlUshortByteSwap(kPort);
@@ -406,6 +410,7 @@ static void Step3Cleanup(void) {
         STEP3_END* e = ends[i];
         if (e->Qp)  { e->Qp->Dispatch->NdkCloseQp(&e->Qp->Header, Step3DoNothing, NULL); e->Qp = NULL; }
         if (e->Cq)  { e->Cq->Dispatch->NdkCloseCq(&e->Cq->Header, Step3DoNothing, NULL); e->Cq = NULL; }
+        if (e->SendCq) { e->SendCq->Dispatch->NdkCloseCq(&e->SendCq->Header, Step3DoNothing, NULL); e->SendCq = NULL; }
         if (e->Pd)  { e->Pd->Dispatch->NdkClosePd(&e->Pd->Header, Step3DoNothing, NULL); e->Pd = NULL; }
         if (e->Adapter) { g_ndk.WskCloseNdkAdapter(g_wskProvider.Client, e->Adapter); e->Adapter = NULL; }
     }
