@@ -63,13 +63,34 @@ Start-Sleep -Milliseconds 500
 $srvOut = "$src\f1_srv.txt"; $cliOut = "$src\f1_cli.txt"
 Remove-Item $srvOut, $cliOut -ErrorAction SilentlyContinue
 
-$srv = Start-Process -FilePath $exe -ArgumentList @("-target", $serverIp, "$port") `
+$srv = Start-Process -FilePath $exe -ArgumentList @("-target", $serverIp, "$port", "-serve", "1", "-runfor", "45") `
         -PassThru -RedirectStandardOutput $srvOut
-Start-Sleep -Seconds 2
+# Wait for READINESS, not a fixed two seconds.  The measured failure mode of a fixed sleep is
+# an INITIATOR-side CONNECTION_REFUSED whose target log stops at the banner - i.e. the listener
+# never armed - which reads like a protocol bug and is a race.  The target flushes this line
+# (f5_interop.cpp, "listener armed"), so polling the file is reliable.  -runfor is the other
+# half: it bounds the target's life so it can ALWAYS end by itself, even if it never served a
+# controller, because killing it is what leaves the next suite unable to connect (DESIGN 8.78).
+$ready = $false
+for ($i = 0; $i -lt 60; $i++) {
+    Start-Sleep -Milliseconds 250
+    if ((Test-Path $srvOut) -and (Select-String -Path $srvOut -Pattern "listener armed" -Quiet)) { $ready = $true; break }
+}
+if (-not $ready) {
+    Write-Host "  [TARGET NEVER ARMED within 15 s - the listener is in the target log]"
+    Get-Content $srvOut -ErrorAction SilentlyContinue | ForEach-Object { "    $_" }
+}
 $cli = Start-Process -FilePath $exe -ArgumentList @("-initiator", $serverIp, "$port", $clientLocalIp) `
         -PassThru -RedirectStandardOutput $cliOut
 if (-not $cli.WaitForExit($timeoutSec * 1000)) { $cli.Kill(); Write-Host "  [INITIATOR HUNG - killed]" }
-if (-not $srv.WaitForExit(15000))              { $srv.Kill(); Write-Host "  [TARGET HUNG - killed]" }
+# Let the target end on its own.  If it has to be killed, say so AND settle: the measurement in
+# DESIGN 8.78 is that the stack refuses new connections for tens of seconds afterwards, so
+# starting the next suite immediately measures the previous kill, not the next suite.
+if (-not $srv.WaitForExit(60000)) {
+    $srv.Kill()
+    Write-Host "  [TARGET KILLED - waiting 20 s for the stack to settle before the next suite]"
+    Start-Sleep -Seconds 20
+}
 Start-Sleep -Milliseconds 300
 
 Write-Host "===== f1_bringup  $clientLocalIp -> $serverIp`:$port"

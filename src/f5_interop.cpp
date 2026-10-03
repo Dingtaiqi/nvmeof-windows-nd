@@ -232,6 +232,8 @@ static uint32_t    g_reconnectWaitMs = 5000;
 // has to exist before its first use.
 static const char* g_statusFile    = nullptr;
 static const char* g_configPath    = nullptr;   // -config <path>, applied at startup
+static int         g_runForSec     = 0;         // -runfor <s>: the target bounds its own lifetime
+static ULONGLONG   g_startTick     = 0;         // GetTickCount64() when the process started
 static uint64_t    g_statusStarted = 0;
 static uint32_t    g_statusWrites  = 0;
 // ---- file-backed namespace (-nsfile) ----
@@ -3910,6 +3912,20 @@ static int runTarget(const char* ip, uint16_t port, int maxControllers) {
 
         hr = listener->GetConnectionRequest(admin.conn, &admin.ov);
         if (hr == ND_PENDING) hr = admin.waitOverlapped(listener, (DWORD)g_reconnectWaitMs);
+        // -runfor: the target gives ITSELF a deadline.  Added because of the cascade measured
+        // in DESIGN 8.78 - a suite that force-kills a target which never served a controller
+        // leaves the user-mode ND provider REFUSING connections for tens of seconds
+        // (0xC0000236, STATUS_CONNECTION_REFUSED), and because that target never served, it
+        // would never exit on its own either: the graceful path was unreachable in exactly
+        // the case that needed it.  With a deadline a suite can always wait for the exit
+        // instead of killing, which is the whole fix.  Checked here, at the top of one
+        // controller's turn, so the worst-case overshoot is one reconnect wait.
+        if (g_runForSec > 0 && (GetTickCount64() - g_startTick) / 1000 >= (ULONGLONG)g_runForSec) {
+            printf("[runfor] %u s deadline reached without a controller to serve; exiting "
+                   "cleanly so nothing has to be killed\n", g_runForSec);
+            fflush(stdout);
+            break;
+        }
         if (!ndOk(hr)) {
             if (ctrlIndex == 1) {
                 // THE HRESULT, ALWAYS.  This line used to say only "admin connection
@@ -4354,6 +4370,7 @@ static void WINAPI svcMain(DWORD, LPSTR*) {
 }
 
 int main(int argc, char** argv) {
+    g_startTick = GetTickCount64();
     // -checkconfig <path>: validate a config file and stop.  Handled HERE, before the mode
     // is looked at, because it is a mode-less diagnostic: the option parser rejects anything
     // whose argv[1] is not -target/-initiator/-genkey/..., so an option placed there never
@@ -4392,6 +4409,11 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "-svcname") == 0) g_svcName = argv[i + 1];
         else if (strcmp(argv[i], "-log")     == 0) g_svcLog  = argv[i + 1];
         else if (strcmp(argv[i], "-config")  == 0) g_configPath = argv[i + 1];
+        else if (strcmp(argv[i], "-runfor")  == 0 && i + 1 < argc) {
+            int s = atoi(argv[i + 1]);
+            if (s < 1 || s > 86400) { printf("-runfor %d: 1..86400 seconds\n", s); return 2; }
+            g_runForSec = s;
+        }
     }
 
     // ---- -config <path>: APPLY the file ------------------------------------------
