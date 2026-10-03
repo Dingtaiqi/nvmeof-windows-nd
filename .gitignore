@@ -86,3 +86,7 @@ ref_capture.txt
 ref_capture*.txt
 *.log
 regression*.log
+
+# Kernel drivers are build products: derived from src/driver/*.c by the commands in
+# DRIVER-D0.md, and a committed binary would be a stale copy nobody rebuilds.
+*.sys
