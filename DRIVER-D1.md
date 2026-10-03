@@ -161,3 +161,62 @@ SCSIPORT 那样在 `StorPortInitialize` 里直接回调 `HwFindAdapter`。**裸 
    用与 INF 匹配的硬件 ID 创建软件设备节点 —— 这是现代 Windows 上创建无硬件设备的文档化方式。
 
 两条路都需要 **INF 包**（驱动签名 + 类安装）。D1.2 就从写 INF 与软件设备创建工具开始。
+
+---
+
+## 39. D1.1 续：INF 安装链路已打通，设备启动失败（问题码 10）—— 定位到 `VirtualDevice` 的落点
+
+### 已经打通的（每一步都有实测）
+
+| 步骤 | 结果 |
+|---|---|
+| 驱动构建 + 测试证书签名 | ✅ `nvmeofnd.sys`（9 KB） |
+| 作为服务加载 | ✅ `STATE: RUNNING`，**无蓝屏** |
+| INF + `devcon install` 创建设备节点 | ✅ `ROOT\SCSIADAPTER\0001`（名称正确显示为 "NVMe-of over NetworkDirect (StorPort virtual miniport)"） |
+| **目录文件（.cat）** | ✅ `Inf2Cat` 生成 + `signtool` 签名 → `pnputil /add-driver /install` **成功**，`Published Name: oem149.inf`，"Driver package installed on device: ROOT\SCSIADAPTER\0001" |
+| 服务由 INF 正确创建 | ✅ `BINARY_PATH_NAME = \SystemRoot\System32\drivers\nvmeofndx.sys`、`LOAD_ORDER_GROUP = SCSI Miniport` |
+| 驱动作为服务手动启动 | ✅ `sc start nvmeofndx` → `RUNNING`（**映像可加载、签名有效**：`Get-AuthenticodeSignature` = Valid，签发者 `CN=NVMeoF Test Driver`） |
+| 代码完整性日志 | 干净（只有无关的反作弊驱动记录）→ **不是签名/CI 拒绝** |
+
+### 卡住的地方（诊断精确）
+
+```
+devcon status root\nvmeofndx
+    Name: NVMe-oF over NetworkDirect (StorPort virtual miniport)
+    The device has the following problem: 10          ← CM_PROB_FAILED_START
+Kernel-PnP: Device ROOT\SCSIADAPTER\0001 had a problem starting.
+埋点: TraceDriverEntry / TraceFindAdapter / … 全部未到达（PnP 路径下驱动根本没跑起来）
+```
+
+### 根因判断与下一步（很具体）
+
+`VirtualDevice = 1` 在 Windows 的存储驱动模型里是一个**设备（硬件）级**的设置：StorPort 靠它判断"这是一个虚拟适配器，
+不需要硬件枚举"。我把它写进了 INF 的**软件键**：
+
+```
+[Nvmeofnd_Inst]
+AddReg    = Nvmeofnd_AddReg          ← 软件键（HKR 指软件键）
+[Nvmeofnd_AddReg]
+HKR,, "VirtualDevice", 0x00010001, 1
+```
+
+**正确做法是放进 `.HW` 段**（`HKR` 在 `.HW` 段里指向设备的**硬件键**）：
+
+```
+[Nvmeofnd_Inst.HW]
+AddReg = Nvmeofnd_HW_AddReg
+[Nvmeofnd_HW_AddReg]
+HKR,, "VirtualDevice", %REG_DWORD%, 1
+```
+
+**下一步**：改 INF → 重新 `Inf2Cat` + 签名 → `pnputil` 重装（或新硬件 ID）→ `devcon restart` →
+期望看到 `TraceFindAdapter`、`TraceInitialize`、`TraceBusChange` 到达，且 `Get-Disk` 出现我们的 RAM LUN。
+
+### 顺带记下的两个工具链事实（都踩过）
+
+1. **测试签名模式下，INF 驱动包必须有签名过的 `.cat`**，只签 `.sys` 不够 —— `pnputil` 会明确报
+   "The third-party INF does not contain digital signature information"，而 `setupapi.dev.log` 里给出真正原因：
+   "Driver package does not contain a catalog file, and Code Integrity is in Test Signing mode. Error = 0xE000022F"。
+2. **`Inf2Cat` 的 `DriverVer` 按 UTC 判定"未来日期"**：本机 UTC+8，本地 10/04 的 INF 会被判为未来
+   （`22.9.7: DriverVer set to a date in the future`）→ 写**前一天**的日期即可。
+3. `Inf2Cat.exe` 在 `bin\<ver>\x86\`（大写 I），而 `devcon.exe` 在 `Tools\<ver>\x64\` —— **不在同一个目录里**。
