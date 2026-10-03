@@ -5265,3 +5265,56 @@ D0 内核线已经踩过同一个坑并留下证据（DRIVER-D0 §25）：`NdkRe
 
 两者都与**命名空间所指向的设备**有关 —— 当前导出的是**内存盘 `/dev/ram0`**（ramdisk 本来就不支持
 thin provisioning / deallocate）。**下一步用 1 TB 真盘验证**（任务 4），看这两项是否随之通过。
+
+---
+
+## 32. ⚠️ 事故与恢复：真盘命名空间上跑了写测试，主 GPT 被覆盖后从备份重建
+
+### 发生了什么
+
+把 nvmet 的命名空间切到真盘 `/dev/nvme1n1`（整盘）之后，我**仍然跑了带写入的 initiator 测试套件**，
+其中一条是 `WRITE 8 blocks x 512 B = 4096 B at slba 0`。**整盘命名空间的 slba 0 就是 MBR + GPT 头 +
+分区表项** → LBA 0–7 被测试数据覆盖：
+
+| 检查 | 损坏后 |
+|---|---|
+| LBA 0 保护性 MBR 签名 | `eb f8`（应为 `55 aa`） |
+| LBA 1 GPT 头 | `05 12 1f 2c…`（应为 `EFI PART`） |
+| LBA 2 分区表项 | 测试斜坡数据 |
+| 内核视图 | **分区全部消失** |
+| **盘尾备份 GPT** | **`EFI PART` ✓ 完好** |
+
+**分区数据本身从未被触碰**，只有分区表；而 GPT 在盘尾保存完整备份正是为这种事故准备的。
+
+### 恢复（标准流程，`python3` 实现，脚本见 `src/tools/restore_gpt_from_backup.py`）
+
+1. 先**留存现场**（当前前 34 扇区存到 `/root/nvme1n1-first34-sectors-before-gpt-restore.bin`）；
+2. 读盘尾备份头，核对 `MyLBA == 末扇区`、`AlternateLBA == 1`、`FirstUsable=34`、`LastUsable`、
+   `EntryArrayLBA=末扇区-32`、`NumEntries=128`、`EntrySize=128`（**任何一项不符即拒绝继续**）；
+3. 从备份复制 32 个表项扇区；重建主头：`MyLBA=1`、`AlternateLBA=末扇区`、`PartitionEntryLBA=2`，
+   **重算表项数组 CRC32 与头部 CRC32**；
+4. 合成保护性 MBR（`0xEE` 分区 + `55 AA`）；
+5. 写 LBA 0 / 1 / 2…，回读校验。
+
+### 恢复结果（内核为权威验证）
+
+```
+nvme1n1     931.5G disk
+|-nvme1n1p1   300M  EFI System                ← ESP
+|-nvme1n1p2    16M  Microsoft reserved        ← MSR
+`-nvme1n1p3 931.2G  ntfs  Microsoft basic data ← NTFS
+blkid: PTTYPE="gpt";  p3 UUID="2C20EE7D77F58150" TYPE="ntfs"
+```
+
+三个分区、类型、PARTLABEL、NTFS UUID 全部与 `EVIDENCE-1TB.md` 记录一致。
+
+> 我的脚本末尾打印的 `header self-check: FAIL` 是**我校验代码自身的错误**（先在内存中把 CRC 字段清零
+> 再计算，读回时却拿含该字段的原始字节重新计算，必然不等）。**权威验证是内核成功解析了这张表。**
+
+### 规则（今后必须遵守）
+
+1. **真盘命名空间只允许只读操作**。任何写测试只跑在内存盘/文件盘命名空间上。
+2. **真盘的字节级证据用只读路径**：`f5_interop.exe -initiator <ip> <port> <local> -dump out.bin`
+   （DESIGN 里既有的取回模式，131072 块 / 64 MiB），再与对端裸读做 sha256 对照。
+3. **跑任何会写盘的套件前，先确认命名空间指向哪个设备** —— 这次我在切换设备之后没有重新确认这一点。
+4. 分区表的"备份"是标准特性且**确实救回来了**：以后动真盘前可以先把 GPT 导出留档（`sfdisk --dump`）。
