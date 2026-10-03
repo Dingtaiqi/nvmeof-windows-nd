@@ -363,7 +363,13 @@ static NTSTATUS Step3ClientConnect(void) {
     // SAME PORT as the listener, which is what the working user-mode pair does: there the client
     // binds 192.168.100.3:<server port> and the server listens on 192.168.100.2:<same port>.  Tried
     // with a separate port first; that is now eliminated, and every other variable has been too.
-    local.sin_port = RtlUshortByteSwap(kPort);
+    // LOCAL PORT 0: the provider allocates the implicit local endpoint itself.
+    // The working user-mode client has an explicit IND2Connector::Bind step before Connect; NDKPI has no
+    // such call - the documentation says a connector connected via NdkConnect "has its own dedicated
+    // IMPLICIT local endpoint", i.e. the provider creates it.  Every previous run passed a concrete port
+    // here (the listener's port, then its neighbour); 0 is the one value never tried, and it is what "the
+    // provider allocates the endpoint" implies.
+    local.sin_port = 0;
     local.sin_addr.s_addr = RtlUlongByteSwap(0x0A64C6A3);      // placeholder, set by caller
     remote.sin_family = AF_INET;
     remote.sin_port = RtlUshortByteSwap(kPort);
