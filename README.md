@@ -393,6 +393,7 @@ drops the link.
 | [DESIGN.md](DESIGN.md) | Design and measurement log; §8 is the defect-by-defect history |
 | [INTEROP_F5.md](INTEROP_F5.md) | How to use a separate Linux machine as an independent peer (link script, steps, rollback) |
 | [EVIDENCE-1TB.md](EVIDENCE-1TB.md) | Raw evidence for the 1 TB disk on Windows, including the teardown record |
+| [DRIVER-D0.md](DRIVER-D0.md) | Preparation for the kernel-mode route (D0/D1): what is already proven about this machine (the WDK is installed, ndkpi.h and storport.h are present), what the probe must prove, how to build and load a driver here, and the risks in the order that decides whether the route exists at all |
 | [ROADMAP.md](ROADMAP.md) | What is still missing for a complete NVMe-oF, as a work plan: per-item scope, dependencies, effort estimate and — for every item — an acceptance criterion, plus milestones, the critical path and the decisions that change the ordering |
 | [COMMERCIAL.md](COMMERCIAL.md) | Commercial licensing (AGPL dual licensing) and license-compatibility notes |
 
