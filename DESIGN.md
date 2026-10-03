@@ -5069,3 +5069,42 @@ D:\nvmeof\c2.conf: 'target' selects the MODE and belongs on the command line  ->
 | ~~远端 STag 失效（SGL subtype 0xf）我们做不到~~ **是误解，已解决** | 当初的判断是"做不到"；实际是**不需要**：`IND2QueuePair` 只有本地 `Invalidate()`，但 Linux host 的完成路径在没收到 invalidation 时会自己本地 `IB_WR_LOCAL_INV`——不依赖我们 | 已按此实现：照做传输 + 普通 SEND，不再拒绝（§8.40(2)）。真正做不到的只是"代替 host 作废"，而 host 不需要 |
 | **通告位与实现漂移**（§8.70、§8.74 各发生一次：ONCS 漏写、VWC 写反） | 一个主机相信的能力位是"它会照着做"的承诺：漏写会让主机用不到已实现的功能（discard 整条路径消失），写反会让主机丢掉它被告知安全的字节 | 位与实现来自同一张表（`kNvmeOfIoCaps` + `nvmeofOncsFromCaps()`），由无硬件单测 + xref + 本机 initiator 端到端三道门禁钉住；VWC 由 target 每次填 Identify 时自检并打 `[FAIL]` |
 
+---
+
+## 27. ★ 方向 A 对接的诊断结论：`Queue::reap` 丢弃乱序完成
+
+**现象**（`evidence/f5_dirA_linux_nvmet_2026-10-04.log`）：连上真实 Linux `nvmet` 后，第 1 条 admin 命令
+通过（RDMA Write 1024 B 落地），**从第 2 条起全部"没有完成"**，而诊断显示**数据其实已经到了内存里**。
+
+**根因**（`src/f5_interop.cpp`）：
+
+```c
+// 第 509/514 行
+if (!ndOk(q.reap(CTX_CAP, &r, kWaitMs))) ...     // 先等"胶囊发送完成"
+HRESULT st = q.reap(CTX_RESP, &r, timeoutMs);    // 再等"响应完成"
+```
+
+而 **`Queue::reap(expect, ...)` 会把上下文不匹配的完成丢弃** —— 这一点本文件自己写着（第 2420、2664 行）：
+
+> `// Queue::reap(expect, ...) throws away every completion whose context is not the ...`
+> `// They are queued, not dropped: nvmeof::Queue::reap() DISCARDS a ...`
+
+于是：**响应的完成先于发送的完成到达时，它在第 509 行被丢掉**，第 514 行便永远等不到 → 超时。
+第 1 条命令能过，是因为目标首次处理耗时较长、发送完成先被收割；此后响应先到的窗口变大，从此条条超时。
+
+**注意这个坑的性质**：不是传输、不是连接、不是偏移 —— 是**完成队列的乱序处理策略**。而且本文件在
+**目标侧**已经做对了（注释明说 target 侧是"queued, not dropped"），**主机侧的 `reap` 却仍会丢弃** ——
+两侧策略不一致。
+
+**修法（下一步）**：让 `Queue::reap(expect, ...)` 把不匹配的完成**暂存起来**（而不是丢弃），并在等待前
+先检查暂存表。这与该库在目标侧已有的做法一致，也能一并消除其它依赖"先 reap 谁"的脆弱顺序。
+
+**顺带更正一条会被误读的诊断**：日志里
+
+```
+[diag] the identify payload IS in the region at offset 23808 (expected 25344)
+```
+
+差 1536 字节**不是缺陷**。`kIdOff` 的比较基准已过期：数据落地区被有意移到独立的 `kOutOff`（第 1336 行），
+而 `1536 = (32 − 8) × 64` 恰好是接收环从 8 加深到 32 时下游偏移整体后移的量（第 76 行 `kCapSlots = 32`，
+而第 77/78 行注释仍写 "8 x ..."）。**该诊断信息本身需要改成对比 `kOutOff`**，否则下一个人会去追一个不存在的偏移 bug。
