@@ -112,9 +112,11 @@ static VOID Step3Complete(PVOID context, NTSTATUS status, NDK_OBJECT_HEADER* obj
     KeSetEvent(&c->Event, IO_NO_INCREMENT, FALSE);
 }
 
+static ULONG g_acceptCompletionCount = 0;   // "never called back" vs "called back late" are different bugs
 static VOID Step3RequestComplete(PVOID context, NTSTATUS status) {
     STEP3_ASYNC* c = (STEP3_ASYNC*)context;
     c->Status = status;
+    g_acceptCompletionCount++;   // "never called back" vs "called back late" are different bugs
     KeSetEvent(&c->Event, IO_NO_INCREMENT, FALSE);
 }
 
@@ -186,6 +188,8 @@ static STEP3_ASYNC g_acceptCtx;              // static: the accept completion ar
 static NTSTATUS    g_acceptCallStatus = STATUS_SUCCESS;
 static ULONG       g_privLenInCallback = 0;
 static NTSTATUS    g_privStatusInCallback = STATUS_SUCCESS;
+static ULONG       g_peerInLimit = 0;
+static ULONG       g_peerOutLimit = 0;
 static NTSTATUS g_serverAcceptStatus   = STATUS_SUCCESS;
 static NTSTATUS g_clientCompleteStatus = STATUS_SUCCESS;
 static NTSTATUS g_clientConnectStatus  = STATUS_SUCCESS;
@@ -199,29 +203,22 @@ static VOID Step3ConnectEvent(PVOID context, NDK_CONNECTOR* connector) {
     UNREFERENCED_PARAMETER(context);
     g_incoming = connector;
 
-    // The accept happens HERE, not in a queued work item.  NdkAccept is declared
-    // _IRQL_requires_max_(DISPATCH_LEVEL), which is this callback's own IRQL, so calling it here is
-    // legal - and the accept's completion is what the main thread waits for.  (Whether the provider
-    // also accepts it from a work item is a question this run does not need to answer any more.)
+    // The accept is NOT posted here any more.  The previous version posted it in this callback (which
+    // is legal - NdkAccept is _IRQL_requires_max_(DISPATCH_LEVEL)), the call returned STATUS_PENDING,
+    // and its completion then never arrived, before OR after the client completed its side.  The next
+    // hypothesis to test is the opposite order: let the client finish first, then accept from the main
+    // thread at PASSIVE_LEVEL.  One variable changes per run.
     ULONG inLimit = 0, outLimit = 0;
     ULONG len = sizeof(g_privBuf);
     RtlZeroMemory(g_privBuf, sizeof(g_privBuf));
     g_privStatusInCallback = connector->Dispatch->NdkGetConnectionData(connector, &inLimit, &outLimit,
                                                                       g_privBuf, &len);
     g_privLenInCallback = len;
+    g_peerInLimit = inLimit;
+    g_peerOutLimit = outLimit;
     logf("  server[callback]: NdkGetConnectionData      = 0x%08X  peerIn=%u peerOut=%u privLen=%u\r\n",
          g_privStatusInCallback, inLimit, outLimit, len);
-
-    Step3Start(&g_acceptCtx);
-    NTSTATUS st = connector->Dispatch->NdkAccept(connector, g_server.Qp, inLimit, outLimit,
-                                                 &g_serverPriv, sizeof(g_serverPriv),
-                                                 NULL, NULL, Step3RequestComplete, &g_acceptCtx);
-    g_acceptCallStatus = st;
-    logf("  server[callback]: NdkAccept posted         = 0x%08X\r\n", st);
-    if (st != STATUS_PENDING) {
-        g_serverAcceptStatus = st;
-        KeSetEvent(&g_acceptPosted, IO_NO_INCREMENT, FALSE);
-    }
+    KeSetEvent(&g_acceptPosted, IO_NO_INCREMENT, FALSE);     // the main thread may now accept
 }
 
 // ---------------------------------------------------------------------------
@@ -462,17 +459,16 @@ static void Step3Run(void) {
     g_serverPriv.Address = 0;
     g_clientPriv.Magic = STEP3_PRIV_MAGIC;
     g_clientPriv.Rkey = 0;
-    g_clientPriv.Address = 0;
     logf("\r\n-- client connects from 192.168.100.3 to 192.168.100.2:%u\r\n", kPort);
     SOCKADDR_IN local, remote;
     RtlZeroMemory(&local, sizeof(local));
     RtlZeroMemory(&remote, sizeof(remote));
     local.sin_family = AF_INET;
     local.sin_port = RtlUshortByteSwap(kPort);
-    local.sin_addr.s_addr = RtlUlongByteSwap(0xC0A86403);          // 192.168.100.3
+    local.sin_addr.s_addr = RtlUlongByteSwap(0xC0A86403);
     remote.sin_family = AF_INET;
     remote.sin_port = RtlUshortByteSwap(kPort);
-    remote.sin_addr.s_addr = RtlUlongByteSwap(0xC0A86402);         // 192.168.100.2
+    remote.sin_addr.s_addr = RtlUlongByteSwap(0xC0A86402);
 
     g_serverPriv.Magic = STEP3_PRIV_MAGIC;
     g_serverPriv.Rkey = 0;
@@ -492,16 +488,10 @@ static void Step3Run(void) {
     g_clientConnectStatus = st;
     logf("  client: NdkConnect                     = 0x%08X\r\n", st);
     if (!NT_SUCCESS(st)) {
-        logf("\r\nANSWER: the connect request itself failed (0x%08X); nothing to complete.\r\n", st);
+        logf("\r\nANSWER: the connect request itself failed (0x%08X).\r\n", st);
         return;
     }
 
-    // CLIENT FIRST, THEN THE SERVER'S ACCEPT - and this ordering is the whole point of this version.
-    // NdkAccept returns STATUS_PENDING and its completion cannot arrive until the client completes
-    // its side.  Waiting for the accept first, as earlier versions did, deadlocked: the accept waited
-    // for the client, the client waited for the accept, and the 15 s timeout that fired was then
-    // reported as 0xC00000B5 - which is STATUS_IO_TIMEOUT, my own sentinel, NOT a provider error.
-    // Three rounds were spent treating my own timeout as if the provider had refused the accept.
     Step3Start(&c);
     st = g_client.Connector->Dispatch->NdkCompleteConnect(g_client.Connector, NULL, NULL,
                                                           Step3RequestComplete, &c);
@@ -509,39 +499,58 @@ static void Step3Run(void) {
     g_clientCompleteStatus = st;
     logf("  client: NdkCompleteConnect             = 0x%08X\r\n", st);
 
-    logf("  server: waiting for the accept to finish\r\n");
-    LARGE_INTEGER t;
-    t.QuadPart = -15000LL * 10000;
-    if (KeWaitForSingleObject(&g_acceptPosted, Executive, KernelMode, FALSE, &t) == STATUS_TIMEOUT) {
-        logf("  server: accept did not complete within 15 s (accept call returned 0x%08X)\r\n", g_acceptCallStatus);
-        g_serverAcceptStatus = STATUS_IO_TIMEOUT;
-    } else if (g_acceptCallStatus == STATUS_PENDING) {
-        g_serverAcceptStatus = g_acceptCtx.Status;
-    } else {
-        g_serverAcceptStatus = g_acceptCallStatus;
-    }
-    logf("  server: NdkAccept                      = 0x%08X\r\n", g_serverAcceptStatus);
-
-    // The private-data question, answered by reading it twice: inside the callback (where it arrived
-    // with len 0) and now, after both sides have completed.
+    // CLIENT FIRST, THEN ACCEPT, AND THIS TIME FROM THE MAIN THREAD.  The previous version posted the
+    // accept inside the connect-event callback and waited for a completion that never arrived; the one
+    // before that waited for the accept BEFORE the client completed, which was a deadlock of my own
+    // making.  One variable changes per run, and this run also counts completions so that "the provider
+    // never called back" cannot be confused with "it called back late".
     if (g_incoming) {
+        logf("  server: accepting from the main thread (client already completed)\r\n");
+        Step3Start(&g_acceptCtx);
+        ULONG before = g_acceptCompletionCount;
+        NTSTATUS ast = g_incoming->Dispatch->NdkAccept(g_incoming, g_server.Qp,
+                                                       g_peerInLimit ? g_peerInLimit : 1,
+                                                       g_peerOutLimit ? g_peerOutLimit : 1,
+                                                       &g_serverPriv, sizeof(g_serverPriv),
+                                                       NULL, NULL, Step3RequestComplete, &g_acceptCtx);
+        g_acceptCallStatus = ast;
+        logf("  server: NdkAccept call                  = 0x%08X\r\n", ast);
+        if (ast == STATUS_PENDING) {
+            LARGE_INTEGER t2;
+            t2.QuadPart = -30000LL * 10000;
+            NTSTATUS w = KeWaitForSingleObject(&g_acceptCtx.Event, Executive, KernelMode, FALSE, &t2);
+            logf("  server: accept wait                    = 0x%08X  completions %u -> %u\r\n",
+                 w, before, g_acceptCompletionCount);
+            g_serverAcceptStatus = (w == STATUS_TIMEOUT) ? STATUS_IO_TIMEOUT : g_acceptCtx.Status;
+        } else {
+            g_serverAcceptStatus = ast;
+        }
+        logf("  server: NdkAccept                      = 0x%08X\r\n", g_serverAcceptStatus);
+
         ULONG in2 = 0, out2 = 0, len2 = sizeof(g_privBuf);
         RtlZeroMemory(g_privBuf, sizeof(g_privBuf));
         NTSTATUS st2 = g_incoming->Dispatch->NdkGetConnectionData(g_incoming, &in2, &out2, g_privBuf, &len2);
         STEP3_PRIV* pd2 = (STEP3_PRIV*)g_privBuf;
         logf("  server[after accept]: NdkGetConnectionData = 0x%08X privLen=%u magic=0x%08X rkey=0x%08X addr=0x%llX\r\n",
              st2, len2, pd2->Magic, pd2->Rkey, (unsigned long long)pd2->Address);
+    } else {
+        logf("  server: NO CONNECT EVENT ARRIVED - g_incoming is NULL\r\n");
+        g_serverAcceptStatus = STATUS_CONNECTION_INVALID;
     }
 
-    logf("\r\n  verdict: client connect=0x%08X completeConnect=0x%08X  server accept=0x%08X  privLen(callback)=%u\r\n",
-         g_clientConnectStatus, g_clientCompleteStatus, g_serverAcceptStatus, g_privLenInCallback);
-    const BOOLEAN bothOk = (BOOLEAN)(NT_SUCCESS(g_clientConnectStatus) &&
-                                     NT_SUCCESS(g_clientCompleteStatus) &&
-                                     NT_SUCCESS(g_serverAcceptStatus));
-    logf("\r\nANSWER: %s\r\n", NT_SUCCESS(st)
-         ? "both endpoints completed the connection.  Step 3 succeeds; step 4 (one RDMA Read "
-           "compared byte for byte) is the next file."
-         : "the connection did not complete on both sides.  Read the statuses above.");
+    logf("\r\n  verdict: client connect=0x%08X completeConnect=0x%08X  server accept=0x%08X  privLen(callback)=%u  completions=%u\r\n",
+         g_clientConnectStatus, g_clientCompleteStatus, g_serverAcceptStatus, g_privLenInCallback,
+         g_acceptCompletionCount);
+    {
+        const BOOLEAN bothOk = (BOOLEAN)(NT_SUCCESS(g_clientConnectStatus) &&
+                                         NT_SUCCESS(g_clientCompleteStatus) &&
+                                         NT_SUCCESS(g_serverAcceptStatus));
+        logf("\r\nANSWER: %s\r\n", bothOk
+             ? "BOTH sides completed the connection - step 3 succeeds and step 4 (one RDMA Read "
+               "compared byte for byte) is next."
+             : "NOT connected: the verdict line above says which side failed, and completions= says "
+               "whether the provider ever called back at all.");
+    }
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registryPath) {
