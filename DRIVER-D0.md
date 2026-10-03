@@ -519,3 +519,33 @@ FAILURE_BUCKET_ID: AV_nt!KiStartSystemThread
 
 **另一条更普遍的教训**：内核里凡是把指针交给"之后会被调用"的东西（完成回调、DPC、work item、
 定时器），**它的生命周期必须长于那个调用**，而栈上的东西**永远不满足**这个条件。
+
+---
+
+## 17. 步骤 3 的第二次尝试（栈修复后）：**骨架打通，三个缺陷待修**
+
+`ndkstep3c.sys`（完成上下文改静态后）加载、运行、**没有蓝屏**，输出：
+
+```
+server: NdkListen            = 0x00000000                                  <- 监听成功
+client: NdkConnect           = 0x00000000                                  <- 连接请求发出
+server: NdkGetConnectionData = 0xC0000023  peerIn=1 peerOut=1 privLen=56   <- 连接事件真的触发
+server: peer private data    = magic=0x4E564D46 rkey=0x00000000 addr=0x0
+server: NdkAccept            = 0xC00000B5                                  <- 接受失败
+client: NdkCompleteConnect   = 0x00000000
+```
+
+**已经打通的**：`.2` 上 `NdkListen` 成功 → `.3` 的 `NdkConnect` 成功 → **服务端的连接事件回调真的
+被调用**（我为了规避 IRQL 排的 work item 跑起来了）→ 私有数据交换路径走通。**步骤 3 的骨架是通的。**
+
+**三个缺陷，都已定位**：
+
+| # | 现象 | 诊断 |
+|---|---|---|
+| 1 | `NdkGetConnectionData` = `0xC0000023`（`STATUS_BUFFER_TOO_SMALL`），返回的 `privLen` = **56**，而我传的缓冲区是 16 字节 | 私有数据没读出来（打印出的 rkey/addr 全是 0 就是因为这个）。签名是 `_Out_writes_bytes_to_opt_(*pPrivateDataLength, *pPrivateDataLength)` + `_Inout_ ULONG*`：**输入是缓冲区容量、输出是实际长度**，容量不够就回这个状态。修法：给足容量（例如 256 字节） |
+| 2 | `NdkAccept` = `0xC00000B5`（`STATUS_INVALID_DEVICE_REQUEST`） | 接受失败。要在修好 #1 之后重测 —— 也可能与"在 work item 里而非回调上下文里 accept"有关，需要实验区分，不能猜 |
+| 3 | **`ANSWER:` 行宣布"两端完成连接"，而服务端的 accept 明明失败了** | 我的成功判据只检查了客户端 `NdkCompleteConnect` 的状态。**这是一个"不会失败的检查"** —— 本项目反复强调这条规矩，我自己在这里犯了 |
+
+**下一轮的顺序**：① 私有数据缓冲区给足并重测 → ② 若 accept 仍失败，用实验区分"上下文"与"次序"两个
+假设（例如：直接在回调里 accept 对比在 work item 里 accept）→ ③ **修好判据**（两边都成功才算成功）
+→ ④ 再做步骤 4（一次 RDMA Read 逐字节比对）。
