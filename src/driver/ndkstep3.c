@@ -48,6 +48,29 @@ static const ULONG kClientIf = 41;      // 192.168.100.3
 #define STEP3_DEFAULT_PORT 18520
 static USHORT kPort = STEP3_DEFAULT_PORT;
 
+// A second switch, next to the port: ServerSide.  With it set to 0 the driver skips the listener and
+// acts only as the client, which is what makes ISOLATION possible - a kernel client against the
+// user-mode listener that is already known to work, and then the reverse.  Without that split, "the
+// connect is refused" cannot be attributed to either side, and the last three rounds were spent
+// changing one side at a time while both were in play.
+static ULONG Step3ConfigDword(const wchar_t* valueName, ULONG dflt) {
+    UNICODE_STRING name, value;
+    RtlInitUnicodeString(&name, L"\\Registry\\Machine\\Software\\NVMeoFProbe");
+    RtlInitUnicodeString(&value, valueName);
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    HANDLE h = NULL;
+    if (!NT_SUCCESS(ZwOpenKey(&h, KEY_READ, &oa))) return dflt;
+    UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 8];
+    ULONG len = 0;
+    NTSTATUS st = ZwQueryValueKey(h, &value, KeyValuePartialInformation, buf, sizeof(buf), &len);
+    ZwClose(h);
+    if (!NT_SUCCESS(st)) return dflt;
+    KEY_VALUE_PARTIAL_INFORMATION* info = (KEY_VALUE_PARTIAL_INFORMATION*)buf;
+    if (info->Type != REG_DWORD || info->DataLength < 4) return dflt;
+    return *(ULONG*)info->Data;
+}
+
 static USHORT Step3ReadPort(void) {
     UNICODE_STRING name, value;
     RtlInitUnicodeString(&name, L"\\Registry\\Machine\\Software\\NVMeoFProbe");
@@ -336,7 +359,7 @@ static NTSTATUS Step3ClientConnect(void) {
     RtlZeroMemory(&local, sizeof(local));
     RtlZeroMemory(&remote, sizeof(remote));
     local.sin_family = AF_INET;
-    local.sin_port = RtlUshortByteSwap(kPort);
+    local.sin_port = RtlUshortByteSwap((USHORT)(kPort + 1));   // NOT the listener port: two endpoints of the same host on the same port is what the CM refused
     local.sin_addr.s_addr = RtlUlongByteSwap(0x0A64C6A3);      // placeholder, set by caller
     remote.sin_family = AF_INET;
     remote.sin_port = RtlUshortByteSwap(kPort);
@@ -360,7 +383,7 @@ static NTSTATUS Step3ClientConnect(void) {
         &g_clientPriv, sizeof(g_clientPriv),
         Step3RequestComplete, &c);
     st = Step3Finish(st, &c, 15000);
-    logf("  client: NdkConnect                     = 0x%08X\r\n", st);
+    logf("  client: NdkConnect (local %u)          = 0x%08X\r\n", st);
     if (!NT_SUCCESS(st)) return st;
 
     Step3Start(&c);
@@ -399,6 +422,8 @@ static VOID Step3Unload(PDRIVER_OBJECT driver) {
 
 static void Step3Run(void) {
     kPort = Step3ReadPort();
+    const ULONG serverSide = Step3ConfigDword(L"ServerSide", 1);
+    logf("  flags: port=%u ServerSide=%u\r\n", kPort, serverSide);
     logf("ndkstep3: D0 step 3 - connect two NDK endpoints from one kernel driver (port %u)\r\n\r\n", kPort);
 
     RtlZeroMemory(&g_wskClientDispatch, sizeof(g_wskClientDispatch));
@@ -457,6 +482,9 @@ static void Step3Run(void) {
     // and got the hex wrong (0x0A64C602 is 10.100.198.2, not 192.168.100.2); the provider answered
     // NdkListen with 0xC0000141, a status that says nothing about the real mistake.  Two lines of
     // logging make the next one of these cost a glance instead of a build-load-read round.
+    if (serverSide == 0) {
+        logf("  server: SKIPPED - client-only instance (ServerSide=0)\r\n");
+    } else {
     logf("  server: asking to listen on 192.168.100.2:%u (s_addr host order 0x%08X)\r\n",
          kPort, RtlUlongByteSwap(srvAddr.sin_addr.s_addr));
     Step3Start(&c);
@@ -464,6 +492,7 @@ static void Step3Run(void) {
                                                 sizeof(srvAddr), Step3RequestComplete, &c);
     st = Step3Finish(st, &c, 15000);
     logf("  server: NdkListen                      = 0x%08X\r\n", st);
+    }
     if (!NT_SUCCESS(st)) return;
 
     g_serverPriv.Magic = STEP3_PRIV_MAGIC;
@@ -498,6 +527,7 @@ static void Step3Run(void) {
                                                   Step3RequestComplete, &c);
     st = Step3Finish(st, &c, 20000);
     g_clientConnectStatus = st;
+    logf("  client: local port %u -> remote %u:%u\r\n", kPort + 1, 0xC0A86402, kPort);
     logf("  client: NdkConnect                     = 0x%08X\r\n", st);
     if (!NT_SUCCESS(st)) {
         logf("\r\nANSWER: the connect request itself failed (0x%08X).\r\n", st);
