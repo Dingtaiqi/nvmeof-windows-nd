@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 # Check whether the first 4096 bytes of /dev/nvme1n1 still hold a valid GPT.
 # The initiator test suite issues "WRITE 8 blocks at slba 0", which on a whole-disk namespace is the
 # MBR plus the GPT header plus the first partition-entry sectors - so this must be verified on the media,

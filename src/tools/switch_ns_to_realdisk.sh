@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 # Point the Linux nvmet namespace at the real 1 TB disk instead of the RAM disk, with safety checks.
 # Run as root from the laptop.  Written to a file because PowerShell -> ssh -> bash loses quotes.
 set -u

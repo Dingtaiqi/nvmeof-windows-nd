@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 # Rebuild the PRIMARY GPT of /dev/nvme1n1 from the intact BACKUP GPT at the end of the disk.
 #
 # Why this is needed: the initiator's test suite issues "WRITE 8 blocks at slba 0", and this namespace

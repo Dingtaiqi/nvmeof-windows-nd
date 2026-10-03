@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 # Read-only inspection of the backup GPT on /dev/nvme1n1 so the primary can be rebuilt from it.
 set -u
 D=/dev/nvme1n1
