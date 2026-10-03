@@ -331,6 +331,22 @@ struct Queue {
         }
     }
 
+    // ---- completions that did not match the context a caller asked for ----
+    //
+    // They are STASHED here, not dropped, and this is a fix rather than a tidy-up.  reap() used to
+    // read a non-matching completion out of the CQ and throw it away, which is fatal to any caller
+    // that reaps two different contexts on one queue: submitCommand waits for the capsule-send
+    // completion (CTX_CAP) and then for the response completion (CTX_RESP), so when the response
+    // arrives first it was consumed and discarded by the first reap and the second waited forever.
+    // Against a Linux nvmet target that is exactly the observed shape - the FIRST admin command
+    // passes and every later one times out.  The target side of this library already queues instead
+    // of dropping ("They are queued, not dropped", f5_interop.cpp:2420); this makes the host side agree.
+    static const size_t kStashSlots = 64;
+    ND2_RESULT stash[kStashSlots] = {};
+    size_t     stashCount = 0;
+    unsigned   stashHits  = 0;      // how often an out-of-order completion was saved rather than lost
+    unsigned   stashLost  = 0;      // non-zero means the stash overflowed - that IS a defect
+
     // Reap one completion, optionally requiring a context.  A wildcard reap is
     // available but every use of it is a place a stray CQE can be swallowed,
     // so callers that use it must say why.
@@ -344,11 +360,28 @@ struct Queue {
         if (!cq) return ND_UNSUCCESSFUL;
         ULONGLONG t0 = GetTickCount64();
         for (;;) {
+            // A stashed completion that matches is the answer, and it is checked FIRST: it may have
+            // arrived before this call was even made.
+            for (size_t i = 0; i < stashCount; i++) {
+                ND2_RESULT s = stash[i];
+                if (!expect || s.RequestContext == expect) {
+                    for (size_t k = i + 1; k < stashCount; k++) stash[k - 1] = stash[k];
+                    stashCount--;
+                    if (out) *out = s;
+                    return s.Status;
+                }
+            }
             ND2_RESULT r = {};
             if (cq->GetResults(&r, 1) == 1) {
                 if (expect && r.RequestContext != expect) {
-                    printf("    (queue %u: ignoring completion ctx=%p type=%d st=0x%08X)\n",
-                           qid, r.RequestContext, (int)r.RequestType, (unsigned)r.Status);
+                    if (stashCount < kStashSlots) {
+                        stash[stashCount++] = r;
+                        stashHits++;
+                    } else {
+                        stashLost++;
+                        printf("    (queue %u: stash FULL (%u lost) ctx=%p type=%d st=0x%08X)\n",
+                               qid, stashLost, r.RequestContext, (int)r.RequestType, (unsigned)r.Status);
+                    }
                     continue;
                 }
                 if (out) *out = r;
