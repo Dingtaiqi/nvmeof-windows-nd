@@ -1,0 +1,5 @@
+region : offset 1024 MiB, length 512 MiB of /dev/nvme1n1 (CT1000P3PSSD8, 1953525168 sectors)
+windows: f5_interop.exe -initiator 192.168.100.5 4420 192.168.100.2 -subnqn nqn.2024-01.local.rdma:linux-nvmet -dump slice_dump.bin
+windows sha256: e6c356e2449134efdae2db62d1eacbfd2743c417a2a2aeae18f1e307c9370e80  (536870912 bytes)
+linux  sha256: e6c356e2449134efdae2db62d1eacbfd2743c417a2a2aeae18f1e307c9370e80  (dd if=/dev/nvme1n1 bs=512 skip=2097152 count=1048576 | sha256sum)
+match: True

@@ -5362,3 +5362,32 @@ Linux 侧稍后才发起连接 → **监听端已经不存在** → CM 只能回
 1. **`ssh 'sh -c "..."'` 的嵌套引号今天吃掉了两次命令**（`nvme` 打印帮助、参数丢失），
    每次都浪费一轮。**凡是有参数的命令，一律写成脚本文件再 `scp` + 执行。**
 2. **串行编排里"先起一端、再起另一端"必须检查时间窗**，否则测到的是"对端已退出"，而不是被测对象。
+
+---
+
+## 34. ★★★ 任务 4 完成：**1 TB 物理盘的字节级证明**（sha256 一致）
+
+```
+区域     : /dev/nvme1n1（CT1000P3PSSD8, 1953525168 扇区）偏移 1 GiB、长度 512 MiB
+Windows  : f5_interop.exe -initiator 192.168.100.5 4420 192.168.100.2 -subnqn ...linux-nvmet -dump slice_dump.bin
+           sha256 = e6c356e2449134efdae2db62d1eacbfd2743c417a2a2aeae18f1e307c9370e80   (512 MiB, 11 s ≈ 46 MB/s)
+Linux    : dd if=/dev/nvme1n1 bs=512 skip=2097152 count=1048576 | sha256sum
+           sha256 = e6c356e2449134efdae2db62d1eacbfd2743c417a2a2aeae18f1e307c9370e80
+结论     : ★★ 完全一致 —— Windows 经 NVMe-oF/RDMA 读到的字节 == 那块物理盘上的字节
+```
+
+证据：`evidence/dirA_realdisk_slice_sha256_2026-10-05.log`。
+
+### 为什么是"1 GiB 偏移处的 512 MiB 片"，而不是整盘
+
+两个约束逼出来的做法，都值得记：
+
+1. **`-dump` 会读整个命名空间，`-blocks` 不限制它**。对 931 GB 的真盘就是 ~4.7 小时，并且**已经写出
+   31 GB**（55 MB/s）才发现 —— 那次我**立即停掉并删除了半成品文件**（D 盘从 84 GB 剩余恢复）。
+2. **nvmet 不能导出只读设备**：它**以写方式**打开后端设备，只读的 loop 设备会得到
+   `nvmet: failed to open block device /dev/loop0: (-13)`（EACCES）。所以片必须是可写的
+   → 用 `dmsetup` 线性映射（`0 1048576 linear /dev/nvme1n1 2097152`），并且**刻意放在 1 GiB 偏移**，
+   远离 LBA 0 的分区表；读取路径只发 NVMe READ（`isDump ? NVMEOF_OPC_READ : NVMEOF_OPC_WRITE`，已核实）。
+
+> 顺带一条流程教训：**在这台机器上跑任何"取回"操作前，先确认它读多少**。这次 31 GB 的教训很便宜地
+> 换来了"D 盘还有 84 GB"。
