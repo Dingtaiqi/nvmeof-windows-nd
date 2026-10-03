@@ -676,3 +676,56 @@ client: NdkConnect           = 0xC0000236  (STATUS_CONNECTION_REFUSED)      <- �
 用户态那套能工作的代码里，客户端在 `Connect` 之前有一个**显式的 `IND2Connector::Bind`** 步骤；而
 NDKPI **没有对应的调用**（文档称端点是"隐式的"）。这个结构差异是当前最可疑的地方，也正是要从
 `NDKPing.sys` 里核对的东西。
+
+---
+
+## 21. ★★★ D0 步骤 3 **成功**：两端连接建立（2026-10-03/04）
+
+```
+server: NdkListen                          = 0x00000000
+server[callback]: NdkGetConnectionData      = 0x00000000  peerIn=1 peerOut=1 privLen=0
+server[callback]: NdkAccept posted         = 0x00000103      (STATUS_PENDING)
+client: NdkConnect                         = 0x00000000      <- 连上了
+client: NdkCompleteConnect                 = 0x00000000
+server: accept wait                        = 0x00000000      <- accept 完成
+verdict: client connect=0x00000000 completeConnect=0x00000000  server accept=0x00000000
+ANSWER: BOTH sides completed the connection
+```
+
+**这是本项目第一次由我们自己的内核驱动完成一次 NDK 连接的两端建立。**
+
+### 根因：**accept 必须与客户端挂起的 connect 并发**（我自己造成的次序死锁）
+
+| 版本 | 服务端 accept 投递位置 | 客户端 `NdkConnect` |
+|---|---|---|
+| A | 连接事件回调里 | **`0x00000000` 成功** |
+| B | 客户端 connect 返回之后（主线程） | **`0xC0000236` 被拒** |
+
+B 是死锁：客户端等对端 accept，而 accept 被安排在客户端 connect 返回之后才投递 —— 于是永远等不到，
+CM 超时后回 `STATUS_CONNECTION_REFUSED`。**今天所有"客户端被拒"都是这一个次序问题**，而我在中途
+还因为"回调里 accept 也返回 PENDING"而把这条正确的路放弃了 —— 那次 PENDING 是**正常的异步语义**
+（异步操作返回 PENDING 后再由完成回调通知），不是失败。**把"PENDING"当成"失败"是这一轮最大的坑。**
+
+### 使这次成功的完整配置（缺一不可的已验证项）
+
+1. accept **在连接事件回调里**投递（`NdkAccept` 声明为 `_IRQL_requires_max_(DISPATCH_LEVEL)`，合法）；
+2. 客户端 `NdkConnect` → 成功后 `NdkCompleteConnect`；
+3. 主线程等待 accept 的**完成事件**（30 秒超时 + 完成计数）；
+4. 每个端点 **两个独立 CQ**（receive / initiator），并带**通知回调**（签名是 `_In_`）；
+5. `/guard:cf` + `/GUARD:CF`（CFG 函数表非空）；
+6. 测试证书签名（测试模式要求"有签名"）；
+7. **每次运行用唯一的 `.sys` 文件名** —— 同一文件不能加载第二次（否则 `sc start` 回一个误导性的
+   "找不到文件" exit 2）；
+8. 异步完成上下文一律 **static**，绝不放栈上。
+
+### 遗留一项（步骤 4 需要）
+
+`privLen=0`：**私有数据仍未到达**。而步骤 4 的 RDMA Read 恰恰需要通过对端私有数据交换 **buffer 地址
+与 rkey**，所以这一项必须先解决。用户态代码的注释给了明确的时机要求：
+
+> "The peer's private data must be read HERE, **between GetConnectionRequest and Accept**. Reading it
+> after Accept yields an empty buffer with no error."
+
+我在回调里（= Accept 之前）读，返回成功但长度为 0 —— 下一步是核对**客户端发送侧**：`NdkConnect` 的
+`pPrivateData`/`PrivateDataLength` 是否被提供程序接受（长度 16 是否低于某个下限，或是否需要先
+`NdkGetLocalAddress` 之类的准备）。
