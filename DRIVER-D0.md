@@ -394,3 +394,40 @@ NdkCreateConnector             = 0x00000000  connector=FFFFCD89B3D48D20
 
 **一个已知的小问题**：`sc stop` 没有让驱动停下（查询仍为 RUNNING），说明 `DriverUnload` 没被调用
 —— 探针在 DriverEntry 之后不再做任何事，所以无害，重启即清。D1 里必须解决（StorPort 驱动要能停）。
+
+---
+
+## 14. 蓝屏闭环：**转储证据**（`kd`/`cdb`，WDK 自带）
+
+用 WDK 的 `cdb.exe` 分析 `C:\Windows\Minidump\100326-20671-01.dmp`（19:13 那次崩溃），
+把 §12 的推断变成了直接证据：
+
+```
+BUGCHECK_CODE:  139
+BUGCHECK_P1:    a
+Arg1: 000000000000000a, Indirect call guard check detected invalid control transfer.
+SYMBOL_NAME:    mlx4eth63+785f7
+IMAGE_NAME:     mlx4eth63.sys
+FAILURE_BUCKET_ID: 0x139_a_GUARD_ICALL_CHECK_FAILURE_mlx4eth63!unknown_function
+
+STACK_TEXT:
+  nt!guard_icall_bugcheck+0x1e
+  tcpip!ndkpiCloseCompletionCore+0x7e
+  tcpip!NdkpiCloseCompletion+0xb
+  tcpip!NdkpiBind+0x11f
+```
+
+**读法**：WSK/NDK 的公共层在 `tcpip.sys`（`NdkpiCloseCompletion`），它回头调用**我提供的完成回调**，
+而最终那次间接调用的目标落在 `mlx4eth63.sys`（Mellanox 的 ND 提供程序）—— 内核对这个目标做 CFG
+校验，发现**不在合法函数表里**，于是 `guard_icall_bugcheck` 直接 fast-fail 整机。
+
+**两个修正是同一处的两面**，缺一不可：
+
+1. **`/guard:cf`** —— 让我的函数进入 CFG 函数表（0 项 → 8/0xA 项），这样别人回调我才合法；
+2. **close 调用传真正的空回调而不是 `NULL`** —— 栈上正是 close 完成路径，`NULL` 也不是合法目标。
+
+**修复后的验证**（比"没再崩"更强）：同一个驱动、同一批调用（含全部 create/close），在 19:35 之后
+连续两次加载**全部成功、零转储**。此外转储列表里**最后一次崩溃停在 19:13**，即修复之前。
+
+**方法论**：这台机器上就装着 WDK 的调试器（`C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe`），
+一条命令就能把"蓝屏码 + 栈 + 出错模块"读出来。以后内核工作出问题，**先读转储，再猜**。
