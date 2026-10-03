@@ -475,3 +475,47 @@ NdkGetCqResults(Cq, Results, MaxResults);
 
 **仍然待读的确切签名**（下一步第一件事，不猜）：`NdkRegisterMr`、`NDK_FN_CONNECT_EVENT_CALLBACK`、
 `NDK_SGE` 的字段名、`NDK_RESULT` 的字段名。
+
+---
+
+## 16. 步骤 3 的第一次尝试：`0x7E` 蓝屏，以及它的根因（**异步完成上下文放在栈上**）
+
+步骤 3 的驱动（`ndkstep3.c`）编译链接签名一次通过，第一次加载也**没有立刻崩**，跑到了：
+
+```
+server if36 / client if41: 两个适配器都打开、PD/CQ/QP/Connector/Listener 全部 0x00000000
+server: NdkListen                      = 0xC0000141
+```
+
+`0xC0000141` 是**我自己拼错 IP**：192.168.100.2 应为 `0xC0A86402`（192=0xC0、168=0xA8、100=0x64），
+我写成 `0x0A64C602`，那是 **10.100.198.2** —— 一个不存在的地址。用户态代码用 `InetPton` 所以从未踩到；
+内核里手拼 sockaddr 就错了。**已修，并把实际请求的地址写进日志**，让下一个同类错误只需一眼。
+
+改对 IP 之后的那次加载**蓝屏**了：
+
+```
+BUGCHECK_CODE: 0x7e (SYSTEM_THREAD_EXCEPTION_NOT_HANDLED)
+BUGCHECK_P1:   0xFFFFFFFFC0000005 (access violation)
+ExceptionAddress: nt!ExpWorkerThread+0x2d6
+栈: nt!ExpWorkerThread <- nt!PspSystemStartup <- nt!KiStartSystemThread
+FAILURE_BUCKET_ID: AV_nt!KiStartSystemThread
+```
+
+**访问违例发生在系统工作线程里** —— 正是我为规避 IRQL 而排的那个接受连接的 work item。
+
+**根因（已从签名确认不是别的原因）**：`NdkGetConnectionData` 的第 4 个参数确实是缓冲区、
+`DisconnectEvent` 确实是 `_In_opt_`（传 NULL 合法），所以问题在别处：
+
+> **我把异步操作的"完成上下文"放在了栈上。**
+> `NdkListen` / `NdkConnect` / `NdkCompleteConnect` / `NdkAccept` 都可能返回 `STATUS_PENDING` 并在
+> **之后**调用完成回调。而这个上下文原本是 `STEP3_ASYNC c;`（**栈变量**），于是当完成晚于所在函数
+> 返回时，提供程序往**已经失效的栈地址**写 → 内存被破坏 → 工作线程里访问违例 → 整机 `0x7E`。
+
+**为什么 L1/L2 用同样的写法却没崩**：那两级的 create 恰好**同步完成**（返回 `STATUS_SUCCESS`），
+没有"迟到"的写入。**"it worked so far" 在这里恰恰是最危险的信号。**
+
+**修复**：四处完成上下文全部改为 **static**（`STEP3_ASYNC c;` → `static STEP3_ASYNC c;`），
+并把这个理由写在代码旁边。重新构建签名：`ndkstep3c.sys`。
+
+**另一条更普遍的教训**：内核里凡是把指针交给"之后会被调用"的东西（完成回调、DPC、work item、
+定时器），**它的生命周期必须长于那个调用**，而栈上的东西**永远不满足**这个条件。

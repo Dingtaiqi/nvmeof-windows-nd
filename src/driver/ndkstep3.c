@@ -1,0 +1,460 @@
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// ---------------------------------------------------------------------------
+//  D0 step 3: connect two NDK endpoints inside one kernel driver.
+//
+//  WHAT THIS ADDS OVER ndkprobe.c.  That file proves an adapter can be opened and NDK objects
+//  created (steps 1-2, measured).  This one proves a CONNECTION: adapter on 192.168.100.2
+//  listens, adapter on 192.168.100.3 connects, the two exchange private data, and both sides
+//  report the read limits they negotiated.  Step 4 (one RDMA Read compared byte for byte) is
+//  the next file; it needs everything here first.
+//
+//  THE IRQL CONSTRAINT IS THE SHAPE OF THIS FILE, not an implementation detail.  A listener's
+//  connect-event callback runs at DISPATCH_LEVEL, while NdkCreateConnector / NdkGetConnectionData
+//  / NdkAccept are declared _IRQL_requires_max_(APC_LEVEL) or PASSIVE_LEVEL.  Calling them
+//  straight from the callback would be a bug that only shows up under load, so the callback does
+//  exactly one thing - queue a work item - and every NDK call happens in that work item at
+//  PASSIVE_LEVEL.  Microsoft's own sample does the same thing by queueing a disconnect work item
+//  from its callback.
+//
+//  WHY BOTH ENDS LIVE IN ONE DRIVER.  A first connect test wants no second machine, no
+//  cooperating user-mode peer and no protocol: two adapters on one card, cabled to each other,
+//  are enough to answer "does a connection complete and what limits come out of it".
+//
+//  Build (hand-rolled; /guard:cf and /GUARD:CF are NOT optional - see DRIVER-D0.md 12-14):
+//    cl /nologo /c /kernel /GS- /guard:cf /W4 /D_AMD64_ /I"<kits>\Include\10.0.26100.0\km" ^
+//       /I"<kits>\Include\10.0.26100.0\shared" ndkstep3.c /Fo:ndkstep3.obj
+//    link /nologo /DRIVER:WDM /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /MACHINE:X64 /GUARD:CF ^
+//       /LIBPATH:"<kits>\Lib\10.0.26100.0\km\x64" ndkstep3.obj ntoskrnl.lib hal.lib ^
+//       ntstrsafe.lib netio.lib bufferoverflowfastfailk.lib /OUT:ndkstep3.sys
+//  Then sign it (test mode wants a signature, not just "unsigned allowed"):
+//    signtool sign /fd sha256 /s My /n "NVMeoF Test Driver" ndkstep3.sys
+// ---------------------------------------------------------------------------
+#define NTSTRSAFE_LIB
+#include <ntddk.h>
+#include <ntstrsafe.h>
+#include <ndkpi.h>
+#include <wsk.h>
+#include <wskndk.h>
+
+#define STEP3_LOG_PATH L"\\??\\C:\\ndkstep3-result.txt"
+
+static const ULONG kServerIf = 36;      // 192.168.100.2
+static const ULONG kClientIf = 41;      // 192.168.100.3
+static const USHORT kPort    = 18520;
+
+static char   g_log[8192];
+static size_t g_len = 0;
+
+static void logf(const char* fmt, ...) {
+    if (g_len >= sizeof(g_log) - 2) return;
+    va_list a;
+    va_start(a, fmt);
+    RtlStringCbVPrintfA(g_log + g_len, sizeof(g_log) - g_len, fmt, a);
+    va_end(a);
+    g_len = strlen(g_log);
+}
+
+static void writeLog(void) {
+    UNICODE_STRING path;
+    RtlInitUnicodeString(&path, STEP3_LOG_PATH);
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &path, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    HANDLE h = NULL;
+    IO_STATUS_BLOCK iosb;
+    NTSTATUS st = ZwCreateFile(&h, FILE_APPEND_DATA | SYNCHRONIZE, &oa, &iosb, NULL,
+                               FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               FILE_OPEN_IF, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    if (!NT_SUCCESS(st)) { DbgPrint("[ndkstep3] cannot open the log: 0x%08X\n", st); return; }
+    ZwWriteFile(h, NULL, NULL, NULL, &iosb, g_log, (ULONG)g_len, NULL, NULL);
+    ZwClose(h);
+}
+
+// ---------------------------------------------------------------------------
+//  Async-to-sync, the shape Microsoft's sample uses.  Every NDK create/close and every connect
+//  step can return STATUS_PENDING and complete later, so each one gets an event and a completion
+//  callback.  A create that pends and is never waited on is a driver that loads, prints nothing
+//  and looks like a hang.
+// ---------------------------------------------------------------------------
+typedef struct _STEP3_ASYNC {
+    KEVENT   Event;
+    NTSTATUS Status;
+    PVOID    Object;
+} STEP3_ASYNC;
+
+static VOID Step3Complete(PVOID context, NTSTATUS status, NDK_OBJECT_HEADER* obj) {
+    STEP3_ASYNC* c = (STEP3_ASYNC*)context;
+    c->Status = status;
+    c->Object = obj;
+    KeSetEvent(&c->Event, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID Step3RequestComplete(PVOID context, NTSTATUS status) {
+    STEP3_ASYNC* c = (STEP3_ASYNC*)context;
+    c->Status = status;
+    KeSetEvent(&c->Event, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID Step3DoNothing(PVOID context) { UNREFERENCED_PARAMETER(context); }
+
+static void Step3Start(STEP3_ASYNC* c) {
+    KeInitializeEvent(&c->Event, NotificationEvent, FALSE);
+    c->Status = STATUS_SUCCESS;
+    c->Object = NULL;
+}
+
+static NTSTATUS Step3Finish(NTSTATUS status, STEP3_ASYNC* c, ULONG waitMs) {
+    if (status != STATUS_PENDING) return status;
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -((LONGLONG)waitMs * 10000);      // relative, 100 ns units
+    NTSTATUS w = KeWaitForSingleObject(&c->Event, Executive, KernelMode, FALSE, &timeout);
+    if (w == STATUS_TIMEOUT) return STATUS_IO_TIMEOUT;
+    return c->Status;
+}
+
+// ---------------------------------------------------------------------------
+//  Two endpoints, each with its own adapter and objects.
+// ---------------------------------------------------------------------------
+typedef struct _STEP3_END {
+    const char*        Name;
+    ULONG              IfIndex;
+    NDK_ADAPTER*       Adapter;
+    NDK_PD*            Pd;
+    NDK_CQ*            Cq;
+    NDK_QP*            Qp;
+    NDK_LISTENER*      Listener;
+    NDK_CONNECTOR*     Connector;
+} STEP3_END;
+
+static STEP3_END g_server;
+static STEP3_END g_client;
+
+static WSK_REGISTRATION          g_registration;
+static WSK_CLIENT_NPI            g_wskClient;
+static WSK_CLIENT_DISPATCH       g_wskClientDispatch;
+static WSK_PROVIDER_NPI          g_wskProvider;
+static WSK_PROVIDER_NDK_DISPATCH g_ndk;      // the STRUCT - sizeof(struct) is what the provider wants
+
+// A WORK_QUEUE_ITEM, not IoAllocateWorkItem: there is no device object here, and
+// IoAllocateWorkItem(NULL) fails - which would leave the listener's callback queueing nothing and
+// the server never accepting.  ExInitializeWorkItem/ExQueueWorkItem need no device.
+static WORK_QUEUE_ITEM g_acceptWorkItem;
+static KEVENT          g_acceptPosted;       // set when the accept has been POSTED
+static KEVENT          g_acceptFinished;     // set when the accept has COMPLETED
+static NDK_CONNECTOR*  g_incoming;           // the connector the listener handed us
+
+// What the two sides exchange over the connection.  Magic so a mismatch is loud rather than a
+// silent misread of somebody else's bytes.
+#define STEP3_PRIV_MAGIC 0x4E564D46u         // "NVMF"
+typedef struct _STEP3_PRIV {
+    ULONG   Magic;
+    ULONG   Rkey;
+    ULONG64 Address;
+} STEP3_PRIV;
+
+static STEP3_PRIV g_serverPriv;
+static STEP3_PRIV g_clientPriv;
+static STEP3_PRIV g_receivedPriv;            // what the server read out of the client's request
+
+// ---------------------------------------------------------------------------
+//  The connect-event callback.  DISPATCH_LEVEL: queue and return, nothing else.
+// ---------------------------------------------------------------------------
+static VOID Step3AcceptWorker(PVOID ctx);        // forward: the callback queues it
+
+static VOID Step3ConnectEvent(PVOID context, NDK_CONNECTOR* connector) {
+    UNREFERENCED_PARAMETER(context);
+    g_incoming = connector;
+    ExQueueWorkItem(&g_acceptWorkItem, DelayedWorkQueue);   // DISPATCH_LEVEL: queue, do not call NDK
+}
+
+// ---------------------------------------------------------------------------
+//  Open one endpoint's adapter and objects.
+// ---------------------------------------------------------------------------
+static NTSTATUS Step3OpenEnd(STEP3_END* e, ULONG ifIndex, const char* name) {
+    e->Name = name;
+    e->IfIndex = ifIndex;
+
+    NDK_VERSION ver;
+    RtlZeroMemory(&ver, sizeof(ver));
+    ver.Major = 2;
+    ver.Minor = 0;
+
+    NTSTATUS st = g_ndk.WskOpenNdkAdapter(g_wskProvider.Client, ver, (NET_IFINDEX)ifIndex, &e->Adapter);
+    logf("  %s if%u: WskOpenNdkAdapter            = 0x%08X  adapter=%p\r\n", name, ifIndex, st, e->Adapter);
+    if (!NT_SUCCESS(st) || !e->Adapter) return st;
+
+        // STATIC ON PURPOSE, and this is the fix for the 0x7E bugcheck this file caused.
+    // NdkListen, NdkConnect, NdkCompleteConnect and NdkAccept are ASYNCHRONOUS: they can return
+    // STATUS_PENDING and call the completion routine LATER.  This context used to be a plain
+    // stack local, so a completion that arrived after the enclosing frame was gone made the
+    // provider write into dead stack - memory corruption that surfaced as an access violation
+    // inside a worker thread and bugchecked the machine (0x7E, AV_nt!KiStartSystemThread,
+    // nt!ExpWorkerThread).  The level-1/level-2 probe survived the same pattern only because
+    // those creates happened to complete synchronously.
+
+    static STEP3_ASYNC c;
+    Step3Start(&c);
+    st = e->Adapter->Dispatch->NdkCreatePd(e->Adapter, Step3Complete, &c, &e->Pd);
+    st = Step3Finish(st, &c, 10000);
+    if (NT_SUCCESS(st) && !e->Pd) e->Pd = (NDK_PD*)c.Object;
+    logf("  %s: NdkCreatePd                       = 0x%08X  pd=%p\r\n", name, st, e->Pd);
+    if (!NT_SUCCESS(st)) return st;
+
+    Step3Start(&c);
+    st = e->Adapter->Dispatch->NdkCreateCq(e->Adapter, 64, NULL, NULL, NULL, Step3Complete, &c, &e->Cq);
+    st = Step3Finish(st, &c, 10000);
+    if (NT_SUCCESS(st) && !e->Cq) e->Cq = (NDK_CQ*)c.Object;
+    logf("  %s: NdkCreateCq                       = 0x%08X  cq=%p\r\n", name, st, e->Cq);
+    if (!NT_SUCCESS(st)) return st;
+
+    Step3Start(&c);
+    st = e->Pd->Dispatch->NdkCreateQp(e->Pd, e->Cq, e->Cq, NULL, 16, 16, 4, 4, 0,
+                                      Step3Complete, &c, &e->Qp);
+    st = Step3Finish(st, &c, 10000);
+    if (NT_SUCCESS(st) && !e->Qp) e->Qp = (NDK_QP*)c.Object;
+    logf("  %s: NdkCreateQp                       = 0x%08X  qp=%p\r\n", name, st, e->Qp);
+    return st;
+}
+
+// ---------------------------------------------------------------------------
+//  Server side: listen, and in the worker accept with our own private data.
+// ---------------------------------------------------------------------------
+static VOID Step3AcceptWorker(PVOID ctx) {
+    UNREFERENCED_PARAMETER(ctx);
+
+    ULONG inLimit = 0, outLimit = 0;
+    ULONG privLen = sizeof(g_receivedPriv);
+    RtlZeroMemory(&g_receivedPriv, sizeof(g_receivedPriv));
+
+    NTSTATUS st = g_incoming->Dispatch->NdkGetConnectionData(g_incoming, &inLimit, &outLimit,
+                                                             &g_receivedPriv, &privLen);
+    logf("  server: NdkGetConnectionData           = 0x%08X  peerIn=%u peerOut=%u privLen=%u\r\n",
+         st, inLimit, outLimit, privLen);
+    logf("  server: peer private data              = magic=0x%08X rkey=0x%08X addr=0x%llX\r\n",
+         g_receivedPriv.Magic, g_receivedPriv.Rkey,
+         (unsigned long long)g_receivedPriv.Address);
+
+        // STATIC ON PURPOSE, and this is the fix for the 0x7E bugcheck this file caused.
+    // NdkListen, NdkConnect, NdkCompleteConnect and NdkAccept are ASYNCHRONOUS: they can return
+    // STATUS_PENDING and call the completion routine LATER.  This context used to be a plain
+    // stack local, so a completion that arrived after the enclosing frame was gone made the
+    // provider write into dead stack - memory corruption that surfaced as an access violation
+    // inside a worker thread and bugchecked the machine (0x7E, AV_nt!KiStartSystemThread,
+    // nt!ExpWorkerThread).  The level-1/level-2 probe survived the same pattern only because
+    // those creates happened to complete synchronously.
+
+    static STEP3_ASYNC c;
+    Step3Start(&c);
+    st = g_incoming->Dispatch->NdkAccept(g_incoming, g_server.Qp, inLimit, outLimit,
+                                         &g_serverPriv, sizeof(g_serverPriv),
+                                         NULL, NULL, Step3RequestComplete, &c);
+    st = Step3Finish(st, &c, 15000);
+    logf("  server: NdkAccept                      = 0x%08X\r\n", st);
+    KeSetEvent(&g_acceptPosted, IO_NO_INCREMENT, FALSE);     // posted (or failed): client may proceed
+    KeSetEvent(&g_acceptFinished, IO_NO_INCREMENT, FALSE);
+}
+
+// ---------------------------------------------------------------------------
+//  Client side: connect with our private data, then complete the connect.
+// ---------------------------------------------------------------------------
+static NTSTATUS Step3ClientConnect(void) {
+    SOCKADDR_IN local, remote;
+    RtlZeroMemory(&local, sizeof(local));
+    RtlZeroMemory(&remote, sizeof(remote));
+    local.sin_family = AF_INET;
+    local.sin_port = RtlUshortByteSwap(kPort);
+    local.sin_addr.s_addr = RtlUlongByteSwap(0x0A64C6A3);      // placeholder, set by caller
+    remote.sin_family = AF_INET;
+    remote.sin_port = RtlUshortByteSwap(kPort);
+
+        // STATIC ON PURPOSE, and this is the fix for the 0x7E bugcheck this file caused.
+    // NdkListen, NdkConnect, NdkCompleteConnect and NdkAccept are ASYNCHRONOUS: they can return
+    // STATUS_PENDING and call the completion routine LATER.  This context used to be a plain
+    // stack local, so a completion that arrived after the enclosing frame was gone made the
+    // provider write into dead stack - memory corruption that surfaced as an access violation
+    // inside a worker thread and bugchecked the machine (0x7E, AV_nt!KiStartSystemThread,
+    // nt!ExpWorkerThread).  The level-1/level-2 probe survived the same pattern only because
+    // those creates happened to complete synchronously.
+
+    static STEP3_ASYNC c;
+    Step3Start(&c);
+    NTSTATUS st = g_client.Connector->Dispatch->NdkConnect(
+        g_client.Connector, g_client.Qp,
+        (CONST PSOCKADDR)&local, sizeof(local),
+        (CONST PSOCKADDR)&remote, sizeof(remote),
+        1, 1,                                                   // inbound / outbound read limits
+        &g_clientPriv, sizeof(g_clientPriv),
+        Step3RequestComplete, &c);
+    st = Step3Finish(st, &c, 15000);
+    logf("  client: NdkConnect                     = 0x%08X\r\n", st);
+    if (!NT_SUCCESS(st)) return st;
+
+    Step3Start(&c);
+    st = g_client.Connector->Dispatch->NdkCompleteConnect(g_client.Connector, NULL, NULL,
+                                                          Step3RequestComplete, &c);
+    st = Step3Finish(st, &c, 15000);
+    logf("  client: NdkCompleteConnect             = 0x%08X\r\n", st);
+    return st;
+}
+
+// ---------------------------------------------------------------------------
+//  DriverEntry / DriverUnload
+// ---------------------------------------------------------------------------
+static void Step3Cleanup(void) {
+    if (g_server.Connector) { g_server.Connector->Dispatch->NdkCloseConnector(&g_server.Connector->Header, Step3DoNothing, NULL); g_server.Connector = NULL; }
+    if (g_client.Connector) { g_client.Connector->Dispatch->NdkCloseConnector(&g_client.Connector->Header, Step3DoNothing, NULL); g_client.Connector = NULL; }
+    if (g_server.Listener)  { g_server.Listener->Dispatch->NdkCloseListener(&g_server.Listener->Header, Step3DoNothing, NULL); g_server.Listener = NULL; }
+    STEP3_END* ends[2] = { &g_server, &g_client };
+    for (int i = 0; i < 2; i++) {
+        STEP3_END* e = ends[i];
+        if (e->Qp)  { e->Qp->Dispatch->NdkCloseQp(&e->Qp->Header, Step3DoNothing, NULL); e->Qp = NULL; }
+        if (e->Cq)  { e->Cq->Dispatch->NdkCloseCq(&e->Cq->Header, Step3DoNothing, NULL); e->Cq = NULL; }
+        if (e->Pd)  { e->Pd->Dispatch->NdkClosePd(&e->Pd->Header, Step3DoNothing, NULL); e->Pd = NULL; }
+        if (e->Adapter) { g_ndk.WskCloseNdkAdapter(g_wskProvider.Client, e->Adapter); e->Adapter = NULL; }
+    }
+    // the WORK_QUEUE_ITEM is a static; nothing to free
+    if (g_wskProvider.Client) { WskReleaseProviderNPI(&g_registration); g_wskProvider.Client = NULL; }
+    WskDeregister(&g_registration);
+}
+
+static VOID Step3Unload(PDRIVER_OBJECT driver) {
+    UNREFERENCED_PARAMETER(driver);
+    Step3Cleanup();
+    DbgPrint("[ndkstep3] unloaded\n");
+}
+
+static void Step3Run(void) {
+    logf("ndkstep3: D0 step 3 - connect two NDK endpoints from one kernel driver\r\n\r\n");
+
+    RtlZeroMemory(&g_wskClientDispatch, sizeof(g_wskClientDispatch));
+    g_wskClientDispatch.Version = MAKE_WSK_VERSION(1, 0);
+    g_wskClient.ClientContext = NULL;
+    g_wskClient.Dispatch = &g_wskClientDispatch;
+
+    NTSTATUS st = WskRegister(&g_wskClient, &g_registration);
+    logf("WskRegister                            = 0x%08X\r\n", st);
+    if (!NT_SUCCESS(st)) return;
+
+    st = WskCaptureProviderNPI(&g_registration, 0xFFFFFFFF, &g_wskProvider);
+    logf("WskCaptureProviderNPI                  = 0x%08X\r\n", st);
+    if (!NT_SUCCESS(st)) return;
+
+    RtlZeroMemory(&g_ndk, sizeof(g_ndk));
+    st = g_wskProvider.Dispatch->WskControlClient(g_wskProvider.Client,
+                                                  WSKNDK_GET_WSK_PROVIDER_NDK_DISPATCH,
+                                                  0, NULL, sizeof(g_ndk), &g_ndk, NULL, NULL);
+    logf("WskControlClient('NDKD')               = 0x%08X\r\n", st);
+    if (!NT_SUCCESS(st) || !g_ndk.WskOpenNdkAdapter) return;
+
+    logf("\r\n-- opening both endpoints\r\n");
+    if (!NT_SUCCESS(Step3OpenEnd(&g_server, kServerIf, "server"))) return;
+    if (!NT_SUCCESS(Step3OpenEnd(&g_client, kClientIf, "client"))) return;
+
+    // A connector per side (the listener hands the server its own on connect).
+        // STATIC ON PURPOSE, and this is the fix for the 0x7E bugcheck this file caused.
+    // NdkListen, NdkConnect, NdkCompleteConnect and NdkAccept are ASYNCHRONOUS: they can return
+    // STATUS_PENDING and call the completion routine LATER.  This context used to be a plain
+    // stack local, so a completion that arrived after the enclosing frame was gone made the
+    // provider write into dead stack - memory corruption that surfaced as an access violation
+    // inside a worker thread and bugchecked the machine (0x7E, AV_nt!KiStartSystemThread,
+    // nt!ExpWorkerThread).  The level-1/level-2 probe survived the same pattern only because
+    // those creates happened to complete synchronously.
+    static STEP3_ASYNC c;
+    Step3Start(&c);
+    st = g_client.Adapter->Dispatch->NdkCreateConnector(g_client.Adapter, Step3Complete, &c, &g_client.Connector);
+    st = Step3Finish(st, &c, 10000);
+    if (NT_SUCCESS(st) && !g_client.Connector) g_client.Connector = (NDK_CONNECTOR*)c.Object;
+    logf("  client: NdkCreateConnector             = 0x%08X  connector=%p\r\n", st, g_client.Connector);
+
+    Step3Start(&c);
+    st = g_server.Adapter->Dispatch->NdkCreateListener(g_server.Adapter, Step3ConnectEvent, NULL,
+                                                       Step3Complete, &c, &g_server.Listener);
+    st = Step3Finish(st, &c, 10000);
+    if (NT_SUCCESS(st) && !g_server.Listener) g_server.Listener = (NDK_LISTENER*)c.Object;
+    logf("  server: NdkCreateListener              = 0x%08X  listener=%p\r\n", st, g_server.Listener);
+
+    SOCKADDR_IN srvAddr;
+    RtlZeroMemory(&srvAddr, sizeof(srvAddr));
+    srvAddr.sin_family = AF_INET;
+    srvAddr.sin_port = RtlUshortByteSwap(kPort);
+    srvAddr.sin_addr.s_addr = RtlUlongByteSwap(0xC0A86402);        // 192.168.100.2
+    // Print the address we are actually asking for.  The first version hand-built this sockaddr
+    // and got the hex wrong (0x0A64C602 is 10.100.198.2, not 192.168.100.2); the provider answered
+    // NdkListen with 0xC0000141, a status that says nothing about the real mistake.  Two lines of
+    // logging make the next one of these cost a glance instead of a build-load-read round.
+    logf("  server: asking to listen on 192.168.100.2:%u (s_addr host order 0x%08X)\r\n",
+         kPort, RtlUlongByteSwap(srvAddr.sin_addr.s_addr));
+    Step3Start(&c);
+    st = g_server.Listener->Dispatch->NdkListen(g_server.Listener, (CONST PSOCKADDR)&srvAddr,
+                                                sizeof(srvAddr), Step3RequestComplete, &c);
+    st = Step3Finish(st, &c, 15000);
+    logf("  server: NdkListen                      = 0x%08X\r\n", st);
+    if (!NT_SUCCESS(st)) return;
+
+    g_serverPriv.Magic = STEP3_PRIV_MAGIC;
+    g_serverPriv.Rkey = 0;
+    g_serverPriv.Address = 0;
+    g_clientPriv.Magic = STEP3_PRIV_MAGIC;
+    g_clientPriv.Rkey = 0;
+    g_clientPriv.Address = 0;
+
+    logf("\r\n-- client connects from 192.168.100.3 to 192.168.100.2:%u\r\n", kPort);
+    SOCKADDR_IN local, remote;
+    RtlZeroMemory(&local, sizeof(local));
+    RtlZeroMemory(&remote, sizeof(remote));
+    local.sin_family = AF_INET;
+    local.sin_port = RtlUshortByteSwap(kPort);
+    local.sin_addr.s_addr = RtlUlongByteSwap(0xC0A86403);          // 192.168.100.3
+    remote.sin_family = AF_INET;
+    remote.sin_port = RtlUshortByteSwap(kPort);
+    remote.sin_addr.s_addr = RtlUlongByteSwap(0xC0A86402);         // 192.168.100.2
+
+    if (!g_client.Connector) return;
+    Step3Start(&c);
+    st = g_client.Connector->Dispatch->NdkConnect(g_client.Connector, g_client.Qp,
+                                                  (CONST PSOCKADDR)&local, sizeof(local),
+                                                  (CONST PSOCKADDR)&remote, sizeof(remote),
+                                                  1, 1, &g_clientPriv, sizeof(g_clientPriv),
+                                                  Step3RequestComplete, &c);
+    st = Step3Finish(st, &c, 20000);
+    logf("  client: NdkConnect                     = 0x%08X\r\n", st);
+    if (!NT_SUCCESS(st)) {
+        logf("\r\nANSWER: the connect did not complete (0x%08X).\r\n", st);
+        return;
+    }
+
+    logf("  server: waiting for the accept to finish\r\n");
+    LARGE_INTEGER t;
+    t.QuadPart = -15000LL * 10000;
+    KeWaitForSingleObject(&g_acceptPosted, Executive, KernelMode, FALSE, &t);
+
+    Step3Start(&c);
+    st = g_client.Connector->Dispatch->NdkCompleteConnect(g_client.Connector, NULL, NULL,
+                                                          Step3RequestComplete, &c);
+    st = Step3Finish(st, &c, 20000);
+    logf("  client: NdkCompleteConnect             = 0x%08X\r\n", st);
+
+    logf("\r\nANSWER: %s\r\n", NT_SUCCESS(st)
+         ? "both endpoints completed the connection.  Step 3 succeeds; step 4 (one RDMA Read "
+           "compared byte for byte) is the next file."
+         : "the connection did not complete on both sides.  Read the statuses above.");
+}
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registryPath) {
+    UNREFERENCED_PARAMETER(registryPath);
+    driver->DriverUnload = Step3Unload;
+    RtlZeroMemory(g_log, sizeof(g_log));
+    g_len = 0;
+    KeInitializeEvent(&g_acceptPosted, NotificationEvent, FALSE);
+    KeInitializeEvent(&g_acceptFinished, NotificationEvent, FALSE);
+    ExInitializeWorkItem(&g_acceptWorkItem, Step3AcceptWorker, NULL);
+
+    __try {
+        Step3Run();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        logf("\r\nEXCEPTION 0x%08X during step 3\r\n", GetExceptionCode());
+    }
+
+    writeLog();
+    return STATUS_SUCCESS;
+}
