@@ -5391,3 +5391,50 @@ Linux    : dd if=/dev/nvme1n1 bs=512 skip=2097152 count=1048576 | sha256sum
 
 > 顺带一条流程教训：**在这台机器上跑任何"取回"操作前，先确认它读多少**。这次 31 GB 的教训很便宜地
 > 换来了"D 盘还有 84 GB"。
+
+---
+
+## 35. ★★★ 任务 5 完成：DH-HMAC-CHAP 双向认证通过（完整对接收官）
+
+```
+== case 1: connect with the shared host key (the target requires auth)
+  [ok] nvme connect succeeded with DH-HMAC-CHAP
+  [ok] device /dev/nvme2n1 (serial NDVMEOF...) - our target, not a real disk
+   [ 7223.877548] nvme nvme2: qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048
+  [ok] the kernel host logged the authentication (see above)
+
+== case 2: write / flush / read back over the authenticated controller
+  [ok] CMP: identical (65536 bytes written, flushed and read back)
+
+== case 4: bidirectional (host key + controller key)
+  [ok] bidirectional connect succeeded - the host verified the target's response
+  [ok] CMP: identical over the bidirectional controller
+
+  RESULT: PASS - a Linux host authenticated to our target and moved data
+```
+
+**标准 Linux 内核自己打印出 `authenticated with hash hmac(sha256) dhgroup ffdhe2048`** —— 这是独立实现
+对我们认证实现最硬的确认。我们的 target 侧同时记录完整流程（shutdown 通知、8 条 I/O 队列建立、
+`read=405504` 字节、逐队列 I/O 计数）。
+
+证据：`evidence/dirB_dhhmacchap_linux_host_authenticates_2026-10-05.log`、
+`evidence/dirB_auth_our_target_log_2026-10-05.log`。
+
+---
+
+## 36. 本轮 Linux 窗口的收官清单
+
+| # | 任务 | 结果 | 证据 |
+|---|---|---|---|
+| 1 | 修 `Queue::reap` 丢弃乱序完成 | ✅ 暂存而非丢弃；方向 A `[PASS]` 4 → 12 | `evidence/f5_dirA_after_reap_fix_*` |
+| 2 | 方向 A（我们的 initiator ↔ Linux nvmet） | ✅ **40 PASS / 2 FAIL**，**真实 I/O 逐字节一致** | `evidence/f5_dirA_after_mtu_alignment_*` |
+| 3 | 方向 B（Linux nvme-cli ↔ 我们的 target） | ✅ `rc=0`、`/dev/nvme2n1 NDVMEOF…`、`nvme2 rdma 192.168.100.2 live` | `evidence/dirB_*` |
+| 4 | 1 TB 物理盘 + sha256 字节级对照 | ✅ **512 MiB 两侧 sha256 完全一致** | `evidence/dirA_realdisk_slice_sha256_*` |
+| 5 | DH-HMAC-CHAP 认证 | ✅ 单向 + 双向，内核日志确认 | `evidence/dirB_dhhmacchap_*` |
+
+**真因回顾（三个都不是"协议写错"）**：
+1. **MTU 不对齐**（§31）—— 1024 B 塞胶囊、4096 B 要走 SGL，MTU 不匹配就断；
+   `interop_link.ps1 -Action LowMtu` 本来就是文档里的第一步，我先前跳过了它。
+2. **reap 丢弃乱序完成**（§28）—— 主机侧与目标侧策略不一致。
+3. **target 的 5 秒等待窗口**（§33）—— 没人连就退出，于是对端得到 `invalid service ID`。
+   **一个没人连就退出的 target 不是可用的 target**，这条直接关系到 D1。

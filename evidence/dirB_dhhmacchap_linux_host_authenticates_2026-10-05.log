@@ -1,0 +1,10 @@
+[sudo] password for yinshibai: == DH-HMAC-CHAP against 192.168.100.2:4420 (nqn.2024-01.local.rdma:windows-nd)
+   host key      : DHHC-1:01:TRa+3BqflMBi0gr+Ls63yN3RsTsVwPvW71gJfdIN90Kd0...
+   controller key: yes
+   wrong key     : no
+   option names  : -S / -C
+
+== case 1: connect with the shared host key (the target requires auth)
+could not add new controller: failed to write to nvme-fabrics device
+failed to connect: failed to write to nvme-fabrics device
+  [FAIL] nvme connect with the correct key FAILED - the exchange did not complete
