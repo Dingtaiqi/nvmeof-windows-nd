@@ -1,0 +1,32 @@
+# bridge.conf.example - the bridge's configuration file.
+#
+# One command-line token per line, WITHOUT the leading dash.  The file supplies OPTIONS;
+# the command line supplies the MODE and its addresses, because those are positional
+# (-initiator <ip> <port> <localip> / -target <ip> <port>) and a file that switched modes
+# would silently change what was asked for.  A flag given on the command line wins over
+# the file; -checkconfig validates this file without opening anything.
+#
+#   f5_interop.exe -initiator 192.168.100.5 4420 192.168.100.3 -config bridge.conf
+#   f5_interop.exe -checkconfig bridge.conf
+
+# --- the iSCSI side the bridge serves to Windows' own initiator
+iscsi 3260
+iscsiaddr 127.0.0.1
+# Burst sizes: through Windows' initiator each SCSI command and each Data-Out PDU costs a
+# fixed ~16-20 ms, so throughput is bought by putting more data behind each one.  These are
+# the measured values; both are capped by the INITIATOR's registry (see the README).
+iscsimbl 4194304
+iscsichunk 1048576
+# readwrite                      # serve the namespace read-write (read-only otherwise)
+# iscsitime                      # per-command timing in the log (measurement, not production)
+
+# --- connecting to the NVMe-oF target
+subnqn nqn.2024-01.local.rdma:linux-nvmet
+hostnqn nqn.2014-08.org.nvmexpress:uuid:ndvmeof-f5-0001
+queues 4
+backendretry 15                  # keep retrying instead of exiting when the peer is absent
+# authkey "DHHC-1:01:....:"      # quotes, because the value ends with ':'
+# reconnection is the TARGET side's option, not the initiator's
+
+# --- operations
+statusfile "C:\ProgramData\nvmeof-windows-nd\bridge-status.json"

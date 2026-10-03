@@ -518,6 +518,7 @@ static void test_config(void) {
             fputs("iscsi 3260\n", f);
             fputs("subnqn \"nqn.2024-01.local.rdma:x\"\n", f);
             fputs("readwrite\n", f);
+            fputs("backendretry 15      # a trailing comment is not part of the value\n", f);
             fclose(f);
         }
         nvmeof_config::Loaded c;
@@ -525,11 +526,12 @@ static void test_config(void) {
         const bool ok = nvmeof_config::load(path, c, err);
         CHECK(ok, "a well-formed config file loads");
         if (!ok) printf("       (%s)\n", err.c_str());
-        CHECK_EQ_U32((uint32_t)c.tokens.size(), 7u, "five options, one of them a bare switch");
-        if (c.tokens.size() == 7) {
+        CHECK_EQ_U32((uint32_t)c.tokens.size(), 9u, "six options (one with a trailing comment), one of them a bare switch");
+        if (c.tokens.size() == 9) {
             CHECK(c.tokens[0] == "-target" && c.tokens[1] == "192.168.100.5", "key becomes -key, value kept");
             CHECK(c.tokens[4] == "-subnqn" && c.tokens[5] == "nqn.2024-01.local.rdma:x", "quotes are stripped");
             CHECK(c.tokens[6] == "-readwrite", "a bare key is a switch");
+            CHECK(c.tokens[7] == "-backendretry" && c.tokens[8] == "15", "a trailing comment is stripped from the value");
         }
         DeleteFileA(path);
     }

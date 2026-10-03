@@ -76,6 +76,24 @@ static inline bool parseLine(const std::string& raw, int lineNo, Loaded& out, st
     // letters, digits, '-' and '_' only.  Anything else (a stray '=', a leading '-') is
     // rejected rather than guessed at - the two ways to write "target" are how a config
     // file ends up with a setting that is silently ignored.
+    // TRAILING COMMENTS, stripped before anything else looks at the line.  "backendretry 15
+    //   # keep retrying" is the shape everybody writes, and the first version of this
+    // parser took the whole thing as the value and rejected the file for containing spaces
+    // - which is how this was found: the file in src/bridge.conf.example, checked with
+    // -checkconfig.  Outside quotes, '#' or ';' starts a comment that runs to the end of the
+    // line; inside quotes it is just a character, and no value this program takes (NQNs,
+    // paths, IPs, DHHC keys, numbers) contains either one anyway.
+    {
+        bool inQuote = false;
+        char quoteChar = 0;
+        for (size_t k = 0; k < s.size(); k++) {
+            const char c = s[k];
+            if (inQuote) { if (c == quoteChar) inQuote = false; continue; }
+            if (c == '"' || c == '\'') { inQuote = true; quoteChar = c; continue; }
+            if (c == '#' || c == ';') { s = trim(s.substr(0, k)); break; }
+        }
+        if (s.empty()) return true;      // the whole line was a comment
+    }
     size_t i = 0;
     while (i < s.size() && !isSpace(s[i])) i++;
     const std::string key = s.substr(0, i);

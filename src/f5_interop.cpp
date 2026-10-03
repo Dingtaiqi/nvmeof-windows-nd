@@ -231,6 +231,7 @@ static uint32_t    g_reconnectWaitMs = 5000;
 // the command line is parsed long before that function is defined, and a file-scope name
 // has to exist before its first use.
 static const char* g_statusFile    = nullptr;
+static const char* g_configPath    = nullptr;   // -config <path>, applied at startup
 static uint64_t    g_statusStarted = 0;
 static uint32_t    g_statusWrites  = 0;
 // ---- file-backed namespace (-nsfile) ----
@@ -4390,6 +4391,78 @@ int main(int argc, char** argv) {
         if      (strcmp(argv[i], "-service") == 0) g_serviceMode = true;
         else if (strcmp(argv[i], "-svcname") == 0) g_svcName = argv[i + 1];
         else if (strcmp(argv[i], "-log")     == 0) g_svcLog  = argv[i + 1];
+        else if (strcmp(argv[i], "-config")  == 0) g_configPath = argv[i + 1];
+    }
+
+    // ---- -config <path>: APPLY the file ------------------------------------------
+    //
+    // The tokens are APPENDED to the command line, after dropping any whose flag the
+    // command line already gave.  That ordering makes the precedence work without
+    // touching anything positional: this program reads the mode and its addresses from
+    // argv[1..4] BY POSITION, so tokens merged in front of them would change what the
+    // command line asked for - and "later wins" in the option loop lets the file fill in
+    // exactly the settings nobody specified.
+    //
+    // The mode selectors are refused rather than ignored: -target/-initiator/-discover
+    // decide what this process IS, and a config file that quietly switched modes would be
+    // the worst kind of surprise.  The file configures the bridge; the command line says
+    // what to run.
+    if (g_configPath) {
+        static nvmeof_config::Loaded cfg;
+        static std::vector<std::string> store;
+        static std::vector<char*> merged;
+        std::string err;
+        if (!nvmeof_config::load(g_configPath, cfg, err)) { printf("%s\n", err.c_str()); return 2; }
+        for (size_t k = 0; k < cfg.tokens.size(); k++) {
+            const std::string& tk = cfg.tokens[k];
+            if (tk == "-target" || tk == "-initiator" || tk == "-discover" ||
+                tk == "-genkey" || tk == "-authselftest") {
+                printf("%s: '%s' selects the MODE and belongs on the command line, "
+                       "not in the config file\n", g_configPath, tk.c_str() + 1);
+                return 2;
+            }
+        }
+        unsigned kept = 0, dropped = 0;
+        for (size_t k = 0; k < cfg.tokens.size(); k++) {
+            if (cfg.tokens[k][0] != '-') continue;                // a value: belongs to its flag
+            bool onCommandLine = false;
+            for (int i = 1; i < argc; i++) {
+                if (cfg.tokens[k] == argv[i]) { onCommandLine = true; break; }
+            }
+            if (onCommandLine) { dropped++; continue; }
+            store.push_back(cfg.tokens[k]);
+            if (k + 1 < cfg.tokens.size() && cfg.tokens[k + 1][0] != '-') store.push_back(cfg.tokens[k + 1]);
+            kept++;
+        }
+        for (int i = 0; i < argc; i++) merged.push_back(argv[i]);   // positional prefix intact
+        for (size_t k = 0; k < store.size(); k++) merged.push_back(const_cast<char*>(store[k].c_str()));
+        merged.push_back(nullptr);
+        printf("[config] %s: %u option(s) applied, %u left to the command line\n",
+               g_configPath, kept, dropped);
+        argc = (int)merged.size() - 1;
+        argv = merged.data();
+    }
+    // ---- log size cap: rotate BEFORE opening it ----------------------------------
+    //
+    // The service log is opened in APPEND mode and nothing ever bounded it, so a bridge
+    // left running grows it without limit; the eventual failure is a full disk and a
+    // service that can no longer write its own diagnostics.  One generation is kept
+    // (<log>.1): enough to answer "what happened before the restart", small enough to
+    // explain in a sentence, and no rotation policy to get wrong.
+    if (g_serviceMode && !g_svcLog.empty()) {
+        const long long kMaxLogBytes = 8LL * 1024 * 1024;
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExA(g_svcLog.c_str(), GetFileExInfoStandard, &fad)) {
+            const long long sz = ((long long)fad.nFileSizeHigh << 32) | (long long)fad.nFileSizeLow;
+            if (sz > kMaxLogBytes) {
+                const std::string prev = g_svcLog + ".1";
+                DeleteFileA(prev.c_str());          // replace, never accumulate
+                if (!MoveFileA(g_svcLog.c_str(), prev.c_str())) {
+                    printf("[service] log rotation failed (%s); appending to the existing file\n",
+                           g_svcLog.c_str());
+                }
+            }
+        }
     }
     bool logFailed = false;
     if (g_serviceMode && !g_svcLog.empty()) {

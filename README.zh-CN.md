@@ -32,6 +32,7 @@
 | `src/interop_link.ps1` | 互操作链路：桥接 + 搬 IP/路由 + 降 MTU，失败自动回滚 |
 | `src/f5_session.ps1` | **互操作整场**：链路 → 对端 → 方向 A → discovery → 方向 B → 一份报告文件；`-Auth` 换成带认证的版本 |
 | `src/run_f5_auth.ps1` | DH-HMAC-CHAP 六个用例（本机两口直连，不需要 Linux） |
+| `src/nvmeof_config.h`、`src/bridge.conf.example` | 桥的配置文件：一行一个命令行 token（不带前导横线），支持注释与行尾注释。**文件提供选项，命令行提供模式与它的位置参数地址**，命令行给了的开关优先。`-checkconfig <path>` 校验文件并退出，什么都不打开 |
 | `src/run_fuzz.ps1` | iSCSI wire fuzzer，**编两遍跑两遍**：一遍在 AddressSanitizer 下做 20 万次变异（PDU 构造器、login 文本、协商助手，以及按操作序列驱动的挂起写表），另一遍故意读堆缓冲区后一字节、**要求** ASAN 抓住；抓不到就判套件失败，因为"不会失败的 fuzzer"和"根本没在看"长得一模一样。它第一次跑就抓到真 bug：畸形报价 `"12abc"` 让数字键协商返回 12 字节，而 RFC 7143 §13.14 的下限是 512（DESIGN §8.75） |
 | `src/run_iscsi.ps1` | iSCSI 层自己的测试，**不需要硬件也不需要网卡**：4 字节 padding、BHS 取值器、每个 PDU 构造器对精确字节、login 文本解析、协商规则（InitialR2T 取 OR、ImmediateData 取 AND、数字键取小值）、保护后端 staging 缓冲的 R2T burst 尺寸、挂起写表。`-AllToolsets` 用机器上每个 MSVC 工具集各编一遍 |
 | `src/hygiene.ps1` | CI 的三条仓库级检查——每个源文件有 SPDX 头、每个 `.ps1` 有 UTF-8 BOM、三份文档无乱码——做成脚本，于是**同一份代码既门禁 push 也门禁本地全量**（`run_all.ps1` 第一项就是它）。这些规则原先只写在 `ci.yml` 里，结果一次 push 因为 BOM 变红，而写它的人当时没有任何办法先自查 |
