@@ -91,7 +91,7 @@ static WSK_REGISTRATION            g_registration;
 static WSK_CLIENT_NPI               g_client;
 static WSK_CLIENT_DISPATCH          g_clientDispatch;
 static WSK_PROVIDER_NPI             g_provider;
-static WSK_PROVIDER_NDK_DISPATCH*   g_ndk;
+static WSK_PROVIDER_NDK_DISPATCH    g_ndk;    // the STRUCT, not a pointer: Microsoft's own sample (NdkWrapper.c) passes sizeof(struct) and the provider validates that size - passing sizeof(pointer) is what returned STATUS_INVALID_PARAMETER
 static NDK_ADAPTER*                 g_adapter;
 
 static void cleanup(void);          // defined below; NdProbeUnload is above it on purpose
@@ -102,9 +102,135 @@ static void NdProbeUnload(PDRIVER_OBJECT driver) {
     DbgPrint("[ndkprobe] unloaded\n");
 }
 
+// ---------------------------------------------------------------------------
+//  NDK object creation, in the shape Microsoft's own sample uses (NdkWrapper.c in the
+//  published SDN tree).  Every NDK create can complete asynchronously, so each one gets a
+//  KEVENT plus a completion callback and is turned into a synchronous call.  This is not
+//  ceremony: a create that returns STATUS_PENDING and is never waited on leaves a driver
+//  that loads, prints nothing, and looks exactly like a hang.
+// ---------------------------------------------------------------------------
+typedef struct _PROBE_ASYNC {
+    KEVENT            Event;
+    NTSTATUS          Status;
+    NDK_OBJECT_HEADER* Object;
+} PROBE_ASYNC;
+
+static VOID ProbeCreateCompletion(PVOID context, NTSTATUS status, NDK_OBJECT_HEADER* obj) {
+    PROBE_ASYNC* c = (PROBE_ASYNC*)context;
+    c->Status = status;
+    c->Object = obj;
+    KeSetEvent(&c->Event, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID ProbeStartCreate(PROBE_ASYNC* c) {
+    KeInitializeEvent(&c->Event, NotificationEvent, FALSE);
+    c->Status = STATUS_SUCCESS;
+    c->Object = NULL;
+}
+
+// Waits only when the provider said PENDING; otherwise the returned status is the answer.
+static NTSTATUS ProbeFinishCreate(NTSTATUS status, PROBE_ASYNC* c) {
+    if (status == STATUS_PENDING) {
+        KeWaitForSingleObject(&c->Event, Executive, KernelMode, FALSE, NULL);
+        return c->Status;
+    }
+    return status;
+}
+
+static NDK_ADAPTER*     g_adapter;
+static NDK_PD*          g_pd;
+static NDK_CQ*          g_recvCq;
+static NDK_CQ*          g_sendCq;
+static NDK_QP*          g_qp;
+static NDK_LISTENER*    g_listener;
+static NDK_CONNECTOR*   g_connector;
+
+// Steps 1 and 2 of D0: query what the adapter can do, then create the objects a queue pair
+// needs.  This is where an NDKPI implementation that is present but unusable shows itself:
+// opening an adapter can succeed while creating a CQ or a QP fails.
+static void probeAdapterObjects(void) {
+    NTSTATUS st;
+
+    NDK_ADAPTER_INFO info;
+    ULONG infoSize = sizeof(info);
+    RtlZeroMemory(&info, sizeof(info));
+    st = g_adapter->Dispatch->NdkQueryAdapterInfo(g_adapter, &info, &infoSize);
+    logf("NdkQueryAdapterInfo                = 0x%08X  (%u bytes of %u)\r\n",
+         st, (unsigned)infoSize, (unsigned)sizeof(info));
+    if (NT_SUCCESS(st)) {
+        logf("  provider %u.%u  vendor 0x%04X device 0x%04X\r\n",
+             info.Version.Major, info.Version.Minor, info.VendorId, info.DeviceId);
+        logf("  MaxRegistrationSize=%llu MiB  MaxWindowSize=%llu MiB  MaxTransferLength=%u KiB\r\n",
+             (unsigned long long)(info.MaxRegistrationSize >> 20),
+             (unsigned long long)(info.MaxWindowSize >> 20),
+             info.MaxTransferLength / 1024);
+        logf("  MaxInboundReadLimit=%u  MaxOutboundReadLimit=%u  FRMRPageCount=%u\r\n",
+             info.MaxInboundReadLimit, info.MaxOutboundReadLimit, info.FRMRPageCount);
+        logf("  MaxReadRequestSge=%u  MaxInitiatorRequestSge=%u  MaxReceiveRequestSge=%u\r\n",
+             info.MaxReadRequestSge, info.MaxInitiatorRequestSge, info.MaxReceiveRequestSge);
+        logf("  MaxCqDepth=%u  MaxInitiatorQueueDepth=%u  MaxReceiveQueueDepth=%u\r\n",
+             info.MaxCqDepth, info.MaxInitiatorQueueDepth, info.MaxReceiveQueueDepth);
+    }
+
+    PROBE_ASYNC c;
+
+    ProbeStartCreate(&c);
+    st = g_adapter->Dispatch->NdkCreatePd(g_adapter, ProbeCreateCompletion, &c, &g_pd);
+    st = ProbeFinishCreate(st, &c);
+    if (NT_SUCCESS(st) && !g_pd) g_pd = (NDK_PD*)c.Object;
+    logf("NdkCreatePd                        = 0x%08X  pd=%p\r\n", st, g_pd);
+
+    ProbeStartCreate(&c);
+    st = g_adapter->Dispatch->NdkCreateCq(g_adapter, 64, NULL, NULL, NULL,
+                                          ProbeCreateCompletion, &c, &g_recvCq);
+    st = ProbeFinishCreate(st, &c);
+    if (NT_SUCCESS(st) && !g_recvCq) g_recvCq = (NDK_CQ*)c.Object;
+    logf("NdkCreateCq (receive, depth 64)     = 0x%08X  cq=%p\r\n", st, g_recvCq);
+
+    ProbeStartCreate(&c);
+    st = g_adapter->Dispatch->NdkCreateCq(g_adapter, 64, NULL, NULL, NULL,
+                                          ProbeCreateCompletion, &c, &g_sendCq);
+    st = ProbeFinishCreate(st, &c);
+    if (NT_SUCCESS(st) && !g_sendCq) g_sendCq = (NDK_CQ*)c.Object;
+    logf("NdkCreateCq (send, depth 64)        = 0x%08X  cq=%p\r\n", st, g_sendCq);
+
+    if (g_pd && g_recvCq && g_sendCq) {
+        ProbeStartCreate(&c);
+        st = g_pd->Dispatch->NdkCreateQp(g_pd, g_recvCq, g_sendCq, NULL,
+                                         16, 16, 4, 4, 0,
+                                         ProbeCreateCompletion, &c, &g_qp);
+        st = ProbeFinishCreate(st, &c);
+        if (NT_SUCCESS(st) && !g_qp) g_qp = (NDK_QP*)c.Object;
+        logf("NdkCreateQp (16 recv / 16 send)     = 0x%08X  qp=%p\r\n", st, g_qp);
+    } else {
+        logf("NdkCreateQp                         = skipped (needs pd and both cqs)\r\n");
+    }
+
+    if (g_adapter && g_qp) {
+        ProbeStartCreate(&c);
+        st = g_adapter->Dispatch->NdkCreateListener(g_adapter, NULL, NULL,
+                                                    ProbeCreateCompletion, &c, &g_listener);
+        st = ProbeFinishCreate(st, &c);
+        if (NT_SUCCESS(st) && !g_listener) g_listener = (NDK_LISTENER*)c.Object;
+        logf("NdkCreateListener                   = 0x%08X  listener=%p\r\n", st, g_listener);
+
+        ProbeStartCreate(&c);
+        st = g_adapter->Dispatch->NdkCreateConnector(g_adapter, ProbeCreateCompletion, &c, &g_connector);
+        st = ProbeFinishCreate(st, &c);
+        if (NT_SUCCESS(st) && !g_connector) g_connector = (NDK_CONNECTOR*)c.Object;
+        logf("NdkCreateConnector                  = 0x%08X  connector=%p\r\n", st, g_connector);
+    }
+}
+
 static void cleanup(void) {
-    if (g_ndk && g_adapter) {
-        g_ndk->WskCloseNdkAdapter(g_provider.Client, g_adapter);
+    if (g_listener) { g_listener->Dispatch->NdkCloseListener(&g_listener->Header, NULL, NULL); g_listener = NULL; }
+    if (g_connector) { g_connector->Dispatch->NdkCloseConnector(&g_connector->Header, NULL, NULL); g_connector = NULL; }
+    if (g_qp) { g_qp->Dispatch->NdkCloseQp(&g_qp->Header, NULL, NULL); g_qp = NULL; }
+    if (g_recvCq) { g_recvCq->Dispatch->NdkCloseCq(&g_recvCq->Header, NULL, NULL); g_recvCq = NULL; }
+    if (g_sendCq) { g_sendCq->Dispatch->NdkCloseCq(&g_sendCq->Header, NULL, NULL); g_sendCq = NULL; }
+    if (g_pd) { g_pd->Dispatch->NdkClosePd(&g_pd->Header, NULL, NULL); g_pd = NULL; }
+    if (g_ndk.WskOpenNdkAdapter && g_adapter) {
+        g_ndk.WskCloseNdkAdapter(g_provider.Client, g_adapter);
         g_adapter = NULL;
     }
     if (g_provider.Client) {
@@ -139,17 +265,16 @@ static void probe(void) {
     // WskControlClient ("Irp must be NULL and pOutputSize must be Non-NULL"), and passing
     // NULL is what produced STATUS_INVALID_PARAMETER on the first run - a parameter error
     // being read as "not supported" would have ended this investigation one step too early.
-    g_ndk = NULL;
-    SIZE_T returned = 0;
+    RtlZeroMemory(&g_ndk, sizeof(g_ndk));
     st = g_provider.Dispatch->WskControlClient(
              g_provider.Client,
              WSKNDK_GET_WSK_PROVIDER_NDK_DISPATCH,      // ((ULONG)'NDKD')
              0, NULL,
              sizeof(g_ndk), &g_ndk,
-             &returned, NULL);
-    logf("WskControlClient('NDKD')           = 0x%08X   ndk dispatch=%p (%u bytes)\r\n",
-         st, g_ndk, (unsigned)returned);
-    if (!NT_SUCCESS(st) || !g_ndk) {
+             NULL, NULL);
+    logf("WskControlClient('NDKD')           = 0x%08X   Open=%p Close=%p\r\n",
+         st, g_ndk.WskOpenNdkAdapter, g_ndk.WskCloseNdkAdapter);
+    if (!NT_SUCCESS(st) || !g_ndk.WskOpenNdkAdapter) {
         logf("\r\nANSWER: this machine has a WSK provider but it does NOT expose the NDK\r\n"
              "        extension.  WskOpenNdkAdapter is therefore unreachable and the kernel\r\n"
              "        route cannot start here.  That is a D0 answer, not a failure.\r\n");
@@ -163,7 +288,7 @@ static void probe(void) {
             ver.Major = kMajorVersions[v];
             ver.Minor = 0;
             NDK_ADAPTER* adapter = NULL;
-            st = g_ndk->WskOpenNdkAdapter(g_provider.Client, ver, (NET_IFINDEX)kIfIndexes[i], &adapter);
+            st = g_ndk.WskOpenNdkAdapter(g_provider.Client, ver, (NET_IFINDEX)kIfIndexes[i], &adapter);
             logf("WskOpenNdkAdapter(v%u.%u, if%u)%-6s = 0x%08X   adapter=%p\r\n",
                  ver.Major, ver.Minor, kIfIndexes[i], "", st, adapter);
             if (NT_SUCCESS(st) && adapter) { g_adapter = adapter; break; }
@@ -171,6 +296,7 @@ static void probe(void) {
     }
 
     if (g_adapter) {
+        probeAdapterObjects();
         logf("\r\nANSWER: an NDK adapter was OPENED through WSK.  D0 step 1 succeeds, and the\r\n"
              "        next steps (create CQ/QP, connect, one RDMA Read compared byte for byte)\r\n"
              "        are worth building.\r\n");

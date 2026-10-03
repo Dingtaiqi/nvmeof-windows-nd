@@ -272,3 +272,39 @@ WskRegister / WskCaptureProviderNPI / WskReleaseProviderNPI / WskDeregister
 
 **已经足够支持 D1 的判断**：内核态 RDMA 可用，所以剩下的问题是"我们的客户端怎么接上"，而不是"这条路
 是否存在"。
+
+---
+
+## 10. ★ 找到 `0xC000000D` 的真正原因：**传出的是指针大小，而不是结构体大小**
+
+上一轮我用"字节搜索 + 方法自检"确认了微软自己的内核 NDK 客户端**不使用** `'NDKD'` 立即数，据此推断
+"`WSKNDK_GET_WSK_PROVIDER_NDK_DISPATCH` 不是客户端取派发表的方式"。**这个推断是错的** —— 搜索本身
+没错，但它证明不了"没用这个宏"，因为宏的参数是 `sizeof` 和取地址，编译进二进制的是**结构体大小 16**
+和一条 `lea`，而不是那四个字符。
+
+真正的答案来自**微软自己的示例代码**（`NdkWrapper.c`，微软版权，公开在 `ccpgames/SDN` 仓库的
+`NDKCI/RdmaSample/` 下）：
+
+```c
+static WSK_PROVIDER_NDK_DISPATCH WskNdkDispatch;      // ← 结构体本体
+...
+status = WskProviderNpi.Dispatch->WskControlClient(
+    WskProviderNpi.Client,
+    WSKNDK_GET_WSK_PROVIDER_NDK_DISPATCH,
+    0, NULL,
+    sizeof(WskNdkDispatch), &WskNdkDispatch,          // ← sizeof(结构体) = 16
+    NULL, NULL);                                      // ← OutputSizeReturned 就是 NULL
+```
+
+对照我的实现：调用形状**完全一致**（连 `OutputSizeReturned = NULL` 都一样，我早先还专门"修"过这一处，
+其实它本来是对的），唯一实质差别是我声明成**指针**、传 `sizeof(pointer)` = 8 字节。提供程序校验输出
+缓冲区大小，太小就回 **`STATUS_INVALID_PARAMETER`**。改成结构体本体后……（见 §11 实测）
+
+**方法论教训**（值得单独记）：字节搜索能证明"某个立即数存在"，**不能**证明"某个源码常量被使用"——
+`sizeof(struct)` 和 `&struct` 在二进制里不留那四个字符。我据一个否定结论改了方向，代价是一轮。
+
+## 11. 探针扩展：适配器信息 + PD/CQ/QP/Listener/Connector（步骤 1–2）
+
+按示例的**异步转同步**形状补齐（每次 create 配一个 KEVENT + 完成回调；不等待的话驱动会"加载成功、
+什么都不打印"，看起来和挂死一样）：`NdkQueryAdapterInfo`、`NdkCreatePd`、两个 `NdkCreateCq`、
+`NdkCreateQp`、`NdkCreateListener`、`NdkCreateConnector`，并在卸载时逆序关闭。
