@@ -46,6 +46,16 @@
 #include <wsk.h>
 #include <wskndk.h>
 
+// PROBE_LEVEL 1 = register, capture the WSK provider and ask for the NDK dispatch.  Nothing is
+// created, no callback is handed to anybody: the smallest thing that can still answer "does this
+// machine let a kernel driver reach NDKPI at all".
+// PROBE_LEVEL 2 adds the adapter query and the NDK object creation (Pd, Cqs, Qp, Listener,
+// Connector).  That is the level that hands callbacks to the provider, which is why it is not the
+// one to try first.
+#ifndef PROBE_LEVEL
+#define PROBE_LEVEL 2
+#endif
+
 #define PROBE_LOG_PATH L"\\??\\C:\\ndprobe-result.txt"
 
 // The interfaces to try.  These are the two CX3 Pro ports this project measured on
@@ -121,6 +131,11 @@ static VOID ProbeCreateCompletion(PVOID context, NTSTATUS status, NDK_OBJECT_HEA
     c->Object = obj;
     KeSetEvent(&c->Event, IO_NO_INCREMENT, FALSE);
 }
+
+// NDKPI declares the close completion routines _In_ (not optional), so passing NULL is asking for
+// trouble; Microsoft's own sample carries a do-nothing callback for exactly this.  The closes in
+// cleanup() use it.
+static VOID ProbeDoNothing(PVOID context) { UNREFERENCED_PARAMETER(context); }
 
 static VOID ProbeStartCreate(PROBE_ASYNC* c) {
     KeInitializeEvent(&c->Event, NotificationEvent, FALSE);
@@ -223,12 +238,14 @@ static void probeAdapterObjects(void) {
 }
 
 static void cleanup(void) {
-    if (g_listener) { g_listener->Dispatch->NdkCloseListener(&g_listener->Header, NULL, NULL); g_listener = NULL; }
-    if (g_connector) { g_connector->Dispatch->NdkCloseConnector(&g_connector->Header, NULL, NULL); g_connector = NULL; }
-    if (g_qp) { g_qp->Dispatch->NdkCloseQp(&g_qp->Header, NULL, NULL); g_qp = NULL; }
-    if (g_recvCq) { g_recvCq->Dispatch->NdkCloseCq(&g_recvCq->Header, NULL, NULL); g_recvCq = NULL; }
-    if (g_sendCq) { g_sendCq->Dispatch->NdkCloseCq(&g_sendCq->Header, NULL, NULL); g_sendCq = NULL; }
-    if (g_pd) { g_pd->Dispatch->NdkClosePd(&g_pd->Header, NULL, NULL); g_pd = NULL; }
+#if PROBE_LEVEL >= 2
+    if (g_listener) { g_listener->Dispatch->NdkCloseListener(&g_listener->Header, ProbeDoNothing, NULL); g_listener = NULL; }
+    if (g_connector) { g_connector->Dispatch->NdkCloseConnector(&g_connector->Header, ProbeDoNothing, NULL); g_connector = NULL; }
+    if (g_qp) { g_qp->Dispatch->NdkCloseQp(&g_qp->Header, ProbeDoNothing, NULL); g_qp = NULL; }
+    if (g_recvCq) { g_recvCq->Dispatch->NdkCloseCq(&g_recvCq->Header, ProbeDoNothing, NULL); g_recvCq = NULL; }
+    if (g_sendCq) { g_sendCq->Dispatch->NdkCloseCq(&g_sendCq->Header, ProbeDoNothing, NULL); g_sendCq = NULL; }
+    if (g_pd) { g_pd->Dispatch->NdkClosePd(&g_pd->Header, ProbeDoNothing, NULL); g_pd = NULL; }
+#endif
     if (g_ndk.WskOpenNdkAdapter && g_adapter) {
         g_ndk.WskCloseNdkAdapter(g_provider.Client, g_adapter);
         g_adapter = NULL;
@@ -296,7 +313,9 @@ static void probe(void) {
     }
 
     if (g_adapter) {
+#if PROBE_LEVEL >= 2
         probeAdapterObjects();
+#endif
         logf("\r\nANSWER: an NDK adapter was OPENED through WSK.  D0 step 1 succeeds, and the\r\n"
              "        next steps (create CQ/QP, connect, one RDMA Read compared byte for byte)\r\n"
              "        are worth building.\r\n");

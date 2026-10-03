@@ -308,3 +308,47 @@ status = WskProviderNpi.Dispatch->WskControlClient(
 按示例的**异步转同步**形状补齐（每次 create 配一个 KEVENT + 完成回调；不等待的话驱动会"加载成功、
 什么都不打印"，看起来和挂死一样）：`NdkQueryAdapterInfo`、`NdkCreatePd`、两个 `NdkCreateCq`、
 `NdkCreateQp`、`NdkCreateListener`、`NdkCreateConnector`，并在卸载时逆序关闭。
+
+---
+
+## 12. ★ 探针蓝屏的根因：**我的驱动没有 CFG 插桩**（`0x139` 子码 10）
+
+加载探针时机器**当天蓝屏四次**（14:18、17:04、19:02、19:13，转储在 `C:\Windows\Minidump`）。
+崩溃码与参数（从 `Microsoft-Windows-WER-SystemErrorReporting` 事件读出）：
+
+```
+0x00000139 (0x000000000000000a, 0x0, 0x0, 0x0)
+```
+
+`0x139` = `KERNEL_SECURITY_CHECK_FAILURE`，**参数 1 = 10 = `FAST_FAIL_GUARD_ICALL_CHECK_FAILURE`**
+—— **控制流保护（CFG）在一次间接调用上失败**。
+
+### 证据（静态对照，不需要再加载任何东西）
+
+```
+                        DLL characteristics    Guard CF function count
+我的 ndkprobe4.sys      0x2160 (无 CFG)          0        <- 完全没有函数表
+微软 NDKPing.sys        0x4160 (有 CFG)          --       <- 能正常加载的那个
+修复后 ndkprobe_l1.sys  有 CFG                   8
+修复后 ndkprobe_l2.sys  有 CFG                   0xA
+```
+
+**原因**：我用手工 `cl /kernel` 编译，**丢掉了 WDK 驱动工程默认的 `/guard:cf`**。于是：
+我的驱动把回调函数（`ProbeCreateCompletion`）交给提供程序，而提供程序（微软组件，**有** CFG）做起
+间接调用时，内核的 CFG 校验发现**我的函数不在合法目标表里**（表为空）→ 立刻
+`FAST_FAIL_GUARD_ICALL_CHECK_FAILURE` → 蓝屏。
+
+这解释了为什么**任何把回调交给提供程序的探针版本都会崩**，也解释了为什么崩溃发生在"加载后几秒"
+而不是加载瞬间。
+
+**修复**：`cl /guard:cf` + `link /GUARD:CF`（WDK 工程默认就有，手工构建必须自己加）。
+顺带修掉第二个潜在缺陷：`cleanup()` 里 close 调用曾传 `NULL` 完成回调，而 NDKPI 的签名是 `_In_`
+—— 微软示例专门有个 `DoNothing` 回调就是为此，现已照做。
+
+**新增分级开关**：`PROBE_LEVEL=1` 只做"注册 + 取 NDK 派发表"（不创建对象、不传回调），
+`PROBE_LEVEL=2` 才做适配器查询与对象创建。先跑 1 再跑 2 —— 崩溃的代价是整机重启，不应该用
+最复杂的那一级去试探。
+
+**教训（写下来）**：手工 cl/link 构建内核驱动，会**静默丢掉 WDK 工程默认的一整套开关**
+（CFG、`/GS`、`/hotpatch`、`/guard:cf` 的链接标志……）。丢掉的那些**不会报错**，只会让驱动在
+别人（这里是提供程序）回调你的时候把整机打蓝。以后手工构建的驱动必须显式列出这些开关。
