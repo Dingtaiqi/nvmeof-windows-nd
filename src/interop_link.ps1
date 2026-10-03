@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # ===========================================================================
 #  interop_link.ps1 - put a LAN machine on the same L2 segment as a CX3 port,
