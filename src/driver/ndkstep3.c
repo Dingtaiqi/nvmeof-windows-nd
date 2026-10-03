@@ -477,6 +477,123 @@ static VOID Step3Unload(PDRIVER_OBJECT driver) {
     logf("  unload requested - cleanup deliberately skipped (see comment)\r\n");
 }
 
+// ===== STEP 4: one RDMA Read, byte compared.  Interfaces read from ndkpi.h, not from memory =====
+#define STEP4_LEN   4096
+#define STEP4_OFF   64
+static const char kStep4Text[] = "NVMEOF-STEP4-PAYLOAD";
+
+static UCHAR*  g_srvBuf  = NULL;   // server: read FROM here
+static UCHAR*  g_cliBuf  = NULL;   // client: read lands HERE
+static MDL*    g_srvMdl  = NULL;
+static MDL*    g_cliMdl  = NULL;
+static NDK_MR* g_srvMr   = NULL;
+static NDK_MR* g_cliMr   = NULL;
+static UINT32  g_srvRkey = 0;
+static UINT32  g_cliLkey = 0;
+static STEP3_ASYNC g_syncA;        // static, always: a completion context must outlive its call
+
+static NTSTATUS Step4Register(NDK_PD* pd, UCHAR* buf, MDL** ppMdl, NDK_MR** ppMr,
+                              UINT32* pToken, const char* who) {
+    *ppMdl = IoAllocateMdl(buf, STEP4_LEN, FALSE, FALSE, NULL);
+    if (!*ppMdl) { logf("  %s: IoAllocateMdl failed\r\n", who); return STATUS_INSUFFICIENT_RESOURCES; }
+    __try {
+        MmProbeAndLockPages(*ppMdl, KernelMode, IoReadAccess);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        NTSTATUS e = GetExceptionCode();
+        IoFreeMdl(*ppMdl); *ppMdl = NULL;
+        logf("  %s: MmProbeAndLockPages = 0x%08X\r\n", who, e);
+        return e;
+    }
+    Step3Start(&g_syncA);
+    NTSTATUS st = pd->Dispatch->NdkCreateMr(pd, FALSE, Step3Complete, &g_syncA, ppMr);
+    st = Step3Finish(st, &g_syncA, 10000);
+    logf("  %s: NdkCreateMr                = 0x%08X  mr=%p\r\n", who, st, *ppMr);
+    if (!NT_SUCCESS(st)) return st;
+    Step3Start(&g_syncA);
+    st = (*ppMr)->Dispatch->NdkRegisterMr(*ppMr, *ppMdl, STEP4_LEN, (who[0] == 's') ? NDK_MR_FLAG_ALLOW_REMOTE_READ : NDK_MR_FLAG_ALLOW_LOCAL_WRITE, Step3Complete, &g_syncA);
+    st = Step3Finish(st, &g_syncA, 10000);
+    logf("  %s: NdkRegisterMr(%u bytes)    = 0x%08X\r\n", who, (unsigned)STEP4_LEN, st);
+    if (!NT_SUCCESS(st)) return st;
+    *pToken = (*ppMr)->Dispatch->NdkGetRemoteTokenFromMr(*ppMr);
+    logf("  %s: rkey=0x%08X  buffer=%p\r\n", who, *pToken, buf);
+    return STATUS_SUCCESS;
+}
+
+// Registered BEFORE the accept, because the accept is what carries the address and rkey to the peer,
+// and the accept now happens inside the connect-event callback.
+static NTSTATUS Step4ServerPrepare(void) {
+    g_srvBuf = (UCHAR*)ExAllocatePoolWithTag(NonPagedPoolNx, STEP4_LEN, 'B4pS');
+    if (!g_srvBuf) return STATUS_INSUFFICIENT_RESOURCES;
+    for (ULONG i = 0; i < STEP4_LEN; i++) g_srvBuf[i] = (UCHAR)(i & 0xFF);
+    RtlCopyMemory(g_srvBuf + STEP4_OFF, kStep4Text, sizeof(kStep4Text));
+    return Step4Register(g_server.Pd, g_srvBuf, &g_srvMdl, &g_srvMr, &g_srvRkey, "server");
+}
+
+static NTSTATUS Step4ClientRead(void) {
+    g_cliBuf = (UCHAR*)ExAllocatePoolWithTag(NonPagedPoolNx, STEP4_LEN, 'C4pS');
+    if (!g_cliBuf) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(g_cliBuf, STEP4_LEN);
+    NTSTATUS st = Step4Register(g_client.Pd, g_cliBuf, &g_cliMdl, &g_cliMr, &g_cliLkey, "client");
+    if (!NT_SUCCESS(st)) return st;
+
+    // Peer private data, the way step 3 measured it: size query first, then fetch with that length.
+    // Passing the buffer size instead returns success with zero bytes and no error at all.
+    ULONG need = 0, got, inLim = 0, outLim = 0;
+    g_client.Connector->Dispatch->NdkGetConnectionData(g_client.Connector, NULL, NULL, NULL, &need);
+    got = need ? need : sizeof(g_privBuf);
+    RtlZeroMemory(g_privBuf, sizeof(g_privBuf));
+    st = g_client.Connector->Dispatch->NdkGetConnectionData(g_client.Connector, &inLim, &outLim,
+                                                            g_privBuf, &got);
+    STEP3_PRIV* peer = (STEP3_PRIV*)g_privBuf;
+    logf("  client: peer data              = 0x%08X  need=%u got=%u magic=0x%08X rkey=0x%08X addr=0x%llX\r\n",
+         st, need, got, peer->Magic, peer->Rkey, (unsigned long long)peer->Address);
+    if (peer->Magic != STEP3_PRIV_MAGIC || got == 0) {
+        logf("\r\nANSWER: STEP 4 CANNOT START - the peer's address and rkey did not arrive.\r\n");
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    NDK_SGE sge;
+    sge.VirtualAddress    = g_cliBuf;
+    sge.Length            = STEP4_LEN;
+    sge.MemoryRegionToken = g_cliLkey;
+    st = g_client.Qp->Dispatch->NdkRead(g_client.Qp, NULL, &sge, 1, peer->Address, peer->Rkey, 0);
+    logf("  client: NdkRead(%u bytes)       = 0x%08X\r\n", (unsigned)STEP4_LEN, st);
+    if (!NT_SUCCESS(st)) {
+        logf("\r\nANSWER: STEP 4 FAILED - the read was refused (0x%08X).\r\n", st);
+        return st;
+    }
+
+    NDK_RESULT res[4];
+    NDK_CQ* pollCq = g_client.SendCq ? g_client.SendCq : g_client.Cq;
+    if (!pollCq) { logf("\r\nANSWER: STEP 4 FAILED - the client has no CQ to poll.\r\n"); return STATUS_INVALID_DEVICE_STATE; }
+    for (int spin = 0; spin < 300; spin++) {
+        RtlZeroMemory(res, sizeof(res));
+        ULONG n = pollCq->Dispatch->NdkGetCqResults(pollCq, res, 4);
+        if (n) {
+            logf("  client: completion status=0x%08X transferred=%u results=%u\r\n",
+                 res[0].Status, res[0].BytesTransferred, n);
+            if (!NT_SUCCESS(res[0].Status)) {
+                logf("\r\nANSWER: STEP 4 FAILED - the read completed with 0x%08X.\r\n", res[0].Status);
+                return res[0].Status;
+            }
+            ULONG diff = 0, firstDiff = 0;
+            for (ULONG i = 0; i < STEP4_LEN; i++)
+                if (g_cliBuf[i] != g_srvBuf[i]) { if (!diff) firstDiff = i; diff++; }
+            logf("  compare: %u of %u bytes differ (first at %u)\r\n",
+                 diff, (unsigned)STEP4_LEN, firstDiff);
+            logf("  server +%u: \"%.*s\"\r\n", (unsigned)STEP4_OFF, (int)sizeof(kStep4Text), (char*)(g_srvBuf + STEP4_OFF));
+            logf("  client +%u: \"%.*s\"\r\n", (unsigned)STEP4_OFF, (int)sizeof(kStep4Text), (char*)(g_cliBuf + STEP4_OFF));
+            logf("\r\nANSWER: %s\r\n", diff == 0
+                 ? "STEP 4 PASSES - one RDMA Read landed byte for byte."
+                 : "STEP 4 FAILS - the bytes differ.");
+            return diff == 0 ? STATUS_SUCCESS : STATUS_DATA_ERROR;
+        }
+        KeStallExecutionProcessor(1000);
+    }
+    logf("\r\nANSWER: STEP 4 FAILED - no completion reached the send CQ within 300 ms.\r\n");
+    return STATUS_IO_TIMEOUT;
+}
+
 static void Step3Run(void) {
     kPort = Step3ReadPort();
     const ULONG serverSide = Step3ConfigDword(L"ServerSide", 1);
@@ -553,11 +670,17 @@ static void Step3Run(void) {
     if (!NT_SUCCESS(st)) return;
 
     g_serverPriv.Magic = STEP3_PRIV_MAGIC;
-    g_serverPriv.Rkey = 0;
-    g_serverPriv.Address = 0;
     g_clientPriv.Magic = STEP3_PRIV_MAGIC;  g_clientPriv.Rkey = 0xDEADBEEF;
     g_clientPriv.Address = 0x1122334455667788ULL;  g_clientPriv.Marker = 0x3C3C3C3C;
     logf("  client: sending %u bytes of private data (marker 0x3C3C3C3C)\r\n", (unsigned)sizeof(g_clientPriv));
+    if (NT_SUCCESS(Step4ServerPrepare())) {
+        g_serverPriv.Address = (ULONG64)(ULONG_PTR)g_srvBuf;
+        g_serverPriv.Rkey    = g_srvRkey;
+        g_serverPriv.Marker  = 0x5EED0004;
+        logf("  server: MR ready for Accept: addr=0x%llX rkey=0x%08X\r\n",
+             (unsigned long long)g_serverPriv.Address, g_serverPriv.Rkey);
+    } else logf("  server: MR preparation FAILED\r\n");
+
     logf("\r\n-- client connects from 192.168.100.3 to 192.168.100.2:%u\r\n", kPort);
     SOCKADDR_IN local, remote;
     RtlZeroMemory(&local, sizeof(local));
@@ -570,8 +693,6 @@ static void Step3Run(void) {
     remote.sin_addr.s_addr = RtlUlongByteSwap(0xC0A86402);
 
     g_serverPriv.Magic = STEP3_PRIV_MAGIC;
-    g_serverPriv.Rkey = 0;
-    g_serverPriv.Address = 0;
     g_clientPriv.Magic = STEP3_PRIV_MAGIC;
 
     if (!g_client.Connector) return;
@@ -595,6 +716,11 @@ static void Step3Run(void) {
                                                           Step3RequestComplete, &c);
     st = Step3Finish(st, &c, 20000);
     g_clientCompleteStatus = st;
+    if (NT_SUCCESS(st)) {
+        logf("  client: connected - step 4 RDMA Read follows\r\n");
+        Step4ClientRead();
+    }
+
     logf("  client: NdkCompleteConnect             = 0x%08X\r\n", st);
 
     // CLIENT FIRST, THEN ACCEPT, AND THIS TIME FROM THE MAIN THREAD.  The previous version posted the

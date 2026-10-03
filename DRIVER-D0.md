@@ -884,3 +884,68 @@ typedef struct _NDK_SGE {
 - 同一 `.sys` 文件**不能二次加载**（`sc start` 会回误导性的 exit 2）→ 每次运行用唯一文件名；
 - 不在 `DriverUnload` 里做"未等待的清理"（`0xCE`）；
 - 不强杀持有内核 RDMA 资源的进程（`NDKPing.sys` 的 `0xCE` 教训）。
+
+---
+
+## 25. ★★★★ D0 步骤 4 **通过**：一次 RDMA Read 逐字节完全一致 —— **D0 四步全部完成**
+
+```
+client: peer data   = 0x00000000  need=148 got=148 magic=0x4E564D46 rkey=0x10011800 addr=0xFFFFAB8DCA9FF000
+client: NdkRead(4096 bytes) = 0x00000000
+client: completion  status=0x00000000 transferred=4096 results=1
+compare: 0 of 4096 bytes differ (first at 0)
+server +64: "NVMEOF-STEP4-PAYLOAD"
+client +64: "NVMEOF-STEP4-PAYLOAD"
+ANSWER: STEP 4 PASSES - one RDMA Read landed byte for byte.
+```
+
+**我们自己的内核驱动完成了：打开 ND 适配器 → 建 PD/CQ/QP/Listener/Connector → 两端连接 + 私有数据交换
+（rkey + 地址）→ 一次 4096 字节的 RDMA Read → 逐字节比对 0 处不同。**
+
+### 完整调用序列（步骤 4，全部从 `ndkpi.h` 核实后使用）
+
+```c
+// 服务端：准备被读的内存（必须在 Accept 之前，因为地址/rkey 随 Accept 的私有数据送到对端）
+buf = ExAllocatePoolWithTag(NonPagedPoolNx, 4096, 'B4pS');
+mdl = IoAllocateMdl(buf, 4096, FALSE, FALSE, NULL);
+MmProbeAndLockPages(mdl, KernelMode, IoReadAccess);
+NdkCreateMr(Pd, FALSE, CreateCompletion, &ctx, &Mr);
+NdkRegisterMr(Mr, mdl, 4096, NDK_MR_FLAG_ALLOW_REMOTE_READ, Completion, &ctx);   // ★ 关键
+rkey = Mr->Dispatch->NdkGetRemoteTokenFromMr(Mr);
+// 地址与 rkey 随 NdkAccept 的私有数据发出
+
+// 客户端：落地缓冲区 + 发起读
+NdkRegisterMr(CliMr, cliMdl, 4096, NDK_MR_FLAG_ALLOW_LOCAL_WRITE, Completion, &ctx);
+NdkGetConnectionData(Conn, NULL, NULL, NULL, &need);                 // 先查长度
+got = need; NdkGetConnectionData(Conn, &in, &out, buf, &got);        // 再按 announced 长度取
+NDK_SGE sge = { .VirtualAddress = cliBuf, .Length = 4096, .MemoryRegionToken = CliLkey };
+NdkRead(Qp, NULL, &sge, 1, peerAddr, peerRkey, 0);
+ULONG n = NdkGetCqResults(Cq, res, 4);        // 返回"完成个数"（ULONG），非 NTSTATUS
+// res[0].Status / res[0].BytesTransferred 才是判据
+```
+
+### 这一轮踩到并修掉的三个坑（都值得记）
+
+1. **`NdkRegisterMr` 的 `Flags` 决定远端能否读**：传 `0`（= `NDK_MR_FLAG_ALLOW_LOCAL_READ`）时读会在
+   完成时回 **`0xC0000005` 访问违例**、`transferred=0`。被读的一方须 `NDK_MR_FLAG_ALLOW_REMOTE_READ`
+   （`0x2`），落地的一方须 `NDK_MR_FLAG_ALLOW_LOCAL_WRITE`（`0x1`）。
+   （`ndkpi.h` 235–239 行的宏定义已抄录在案。）
+2. **删除代码时多删了一行 `Step3Start(&c);`**，导致 `NdkCreateQp` 复用了仍存着 CQ 指针的完成上下文，
+   于是 `e->Qp` 实际拿到的是 **CQ 指针** —— 日志里 `qp` 与 `cq` **打印出同一个地址**就是铁证。
+   症状是"客户端连不上"（把一个 CQ 当 QP 去连接），与真正的连接故障难以区分。
+   **教训：对象地址相等这种"不可能"的输出，要当成第一优先级的线索。**
+3. **创建类接口的对象是通过完成回调的 `Context->Object` 传出的**（本文件的既有写法：
+   `if (NT_SUCCESS(st) && !e->X) e->X = (Type*)c.Object;`）。我另加第二个 CQ 时按"请求完成回调"的
+   两参数签名调用，得到"成功但对象为 NULL"，随后 `NdkCreateQp` 回 `0xC00000F1`。
+
+### D0 全程结论
+
+| 步骤 | 内容 | 结果 |
+|---|---|---|
+| 1 | WSK → NDK 派发表 → 打开 ND 适配器 | ✅ |
+| 2 | 适配器能力 + PD/CQ/QP/Listener/Connector | ✅ |
+| 3 | 两端连接 + 私有数据交换（rkey/地址） | ✅ |
+| 4 | **一次 4096 字节 RDMA Read，逐字节 0 处不同** | ✅ |
+
+**内核态 NetworkDirect/RDMA 通路已由我们自己的驱动完整走通**，这是 D1（StorPort 微型端口 / NVMe-oF
+内核驱动）的直接地基。
