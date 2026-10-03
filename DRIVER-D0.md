@@ -197,3 +197,78 @@ WskControlClient('NDKD')           = 0xC000000D   ndk dispatch=0000000000000000 
 如果仍然 `0xC000000D`，那才是"内核这条路在这张卡上不成立"。
 
 探针不需要重新编译：`sc create ndkprobe3 type= kernel binPath= <...>\ndkprobe2.sys` 即可重跑。
+
+
+---
+
+## 9. ★ D0 结论：**内核态 RDMA 在这台机器上能用**（2026-10，实测）
+
+这一节推翻了我上一节的假设，并且给出了真正的答案。
+
+### (1) 决定性实测：Windows 自带的内核态 NDK 客户端跑通了
+
+排查中发现这台机器上装了 **`C:\Windows\System32\NDKPing.exe` 与 `NDKPerfCmd.exe`** —— 它们不是
+Mellanox 的工具，而是 **Windows 自己的组件**（WinSxS 里是 `microsoft-windows-ndkping-setup` /
+`microsoft-windows-ndkperf-setup` 包；驱动是 `NDKPing.sys` / `NDKPerf.sys`，服务可由 `sc start` 启动）。
+
+用它做本机两口的**内核态** RDMA 往返（server 在 ifIndex 36 = 192.168.100.2，client 在 41 = .3）：
+
+```
+NDKPing.exe -S -ServerAddr 192.168.100.2:18515 -ServerIf 36 -TestType rping -W 25
+NDKPing.exe -C -ServerAddr 192.168.100.2:18515 -ClientAddr 192.168.100.3 -ClientIf 41 -TestType rping -V
+```
+
+结果（客户端输出与日志）：
+
+```
+32768 bytes of data successfully transferred     (重复 13 次，全部成功)
+NDKPing Client completes test (rping) on interface 41.
+```
+
+**这就是 D0 的答案：内核态 RDMA 可以工作。** D1（StorPort 微型端口）的立足点是成立的 —— 而且这个
+结论不是我的代码"看起来对"，是**操作系统自己的内核客户端在同一对网卡上完成了数据传输**。
+
+### (2) 撤回：上一节"提供程序不健康"的假设是错的
+
+§8 里我写"用户态端点坏了，所以 ND/NDK 提供程序可能也不健康，两者同源"。**内核 RDMA 明明跑通了，
+所以提供程序是健康的**，那个假设不成立。它同时说明：
+
+- 我探针上的 `0xC000000D` **不是提供程序的问题**，是**我的调用约定不对**；
+- 用户态端点坏掉（`stag_smoketest`）是**另一件事**，与内核路径无关 —— 这条线索本身值得追：
+  同一对网卡、同一个提供程序，**内核能用而用户态不能用**。
+
+### (3) 我的管线没错，错的是"取扩展"这一步
+
+`dumpbin /imports NDKPing.sys` 显示它导入的 WSK 函数与我的探针**完全一致**，且都来自 `NETIO.SYS`：
+
+```
+WskRegister / WskCaptureProviderNPI / WskReleaseProviderNPI / WskDeregister
+```
+
+也就是说：注册与捕获提供程序这一步我做对了（也印证了导入库是 **`netio.lib`**，WDK 里没有 `wsk.lib`）。
+
+差别只在**扩展调用**。用"按字节找立即数"（并用我自己的二进制做方法自检，确认搜索有效）验证：
+
+| 二进制 | 含 `NDKD` 立即数 | 含 `0xC0000007` |
+|---|---|---|
+| `NDKPing.sys` | **0** | 0 |
+| `NDKPerf.sys` | **0** | 0 |
+| `NDKPing.exe` | **0** | 0 |
+| `ndkprobe2.sys`（自检） | 1 ✅ 方法有效 | — |
+
+**所以微软自己的客户端根本不使用 `WSKNDK_GET_WSK_PROVIDER_NDK_DISPATCH ('NDKD')` 这个控制码。**
+`wskndk.h` 只给了这个宏，而它显然不是客户端取派发表的方式（`NPIID` 是 GUID，也与这个 ULONG 不匹配）。
+
+### (4) 下一步（收窄到一个具体问题）
+
+**问题**：`NDKPing.sys` 是怎么从 WSK 拿到 `NDK_ADAPTER` 的？
+
+候选：(a) `WskControlClient(..., SIO_WSK_REGISTER_EXTENSION, WSK_EXTENSION_CONTROL_IN{NpiId=某个 GUID})`
+—— 需要一个 WDK 里没有给出的 GUID；(b) 另一个 WSK 提供程序（而非默认的 tcpip 那个）。
+
+**做法**：`dumpbin /disasm C:\Windows\System32\drivers\NDKPing.sys`，定位
+`WskCaptureProviderNPI` 调用点之后那段代码，看它传给 `WskControlClient`（通过提供程序派发表间接调用）
+的**立即数控制码**和 **GUID 指针**。这比继续猜要快，也比编一个 GUID 诚实。
+
+**已经足够支持 D1 的判断**：内核态 RDMA 可用，所以剩下的问题是"我们的客户端怎么接上"，而不是"这条路
+是否存在"。
