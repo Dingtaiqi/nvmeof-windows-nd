@@ -729,3 +729,48 @@ CM 超时后回 `STATUS_CONNECTION_REFUSED`。**今天所有"客户端被拒"都
 我在回调里（= Accept 之前）读，返回成功但长度为 0 —— 下一步是核对**客户端发送侧**：`NdkConnect` 的
 `pPrivateData`/`PrivateDataLength` 是否被提供程序接受（长度 16 是否低于某个下限，或是否需要先
 `NdkGetLocalAddress` 之类的准备）。
+
+---
+
+## 22. 第六次蓝屏 `0xCE`：**不是我方**（`NDKPing.sys`），以及私有数据的关键线索
+
+### (1) 转储归属：`NDKPing.sys`
+
+```
+BUGCHECK_CODE:     ce
+IMAGE_NAME:        NDKPing.sys
+MODULE_NAME:       NDKPing
+FAILURE_BUCKET_ID: 0xCE_IMAGE_NDKPing.sys
+```
+
+`0xCE` = `DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS`（驱动带着未完成操作被卸载）。
+**出错的是微软自己的 NDKPing 驱动** —— 我为了停止测试用 `Stop-Process -Force` 强杀过 `NDKPing.exe`
+两次，它的驱动在进程消失后带着挂起的操作卸载，于是蓝屏。
+
+> **教训（与上午同源，代价更高）**：**不要强杀持有内核态 RDMA 资源的进程**。上午强杀用户态 target
+> 污染了 RDMA 栈；这次强杀 NDKPing 直接把机器打蓝。要停它就用它自己的退出方式，或者等它跑完。
+
+同样要记下的是：**今天 6 次蓝屏里 5 次是我方**（CFG 未插桩 ×4、异步上下文放栈上 ×1），**1 次是
+Mellanox（`mlx4_bus.sys` 的 `0x9F` 电源状态失败），1 次是微软（`NDKPing.sys` 的 `0xCE`）**。区分归属
+很重要：既不能把自己的问题当成环境的，也不能把环境的算成自己的。
+
+### (2) 私有数据：长度查询回 56，真正读取回 0
+
+同一次运行（步骤 3 依然全部成功，作为回归证据）：
+
+```
+server[callback]: size query               = 0x00000000  need=56
+server[callback]: NdkGetConnectionData      = 0x00000000  peerIn=1 peerOut=1 privLen=0
+verdict: client connect=0x00000000 completeConnect=0x00000000  server accept=0x00000000
+```
+
+**问题被收窄为**：先做长度查询时提供程序说需要 **56** 字节，而带着 256 字节缓冲区去真正读取时，
+`*pPrivateDataLength` 回 **0** 且状态是成功。
+
+**下一步假设（可直接测）**：该提供程序要求第二次调用时把 `*pPrivateDataLength` **设成它announced的
+那个值**（56），而不是调用方缓冲区的大小。若这条成立，私有数据就能取到，**步骤 4 需要的 rkey/地址
+交换通道即打通**。
+
+（另需注意：56 恰好等于适配器信息里的 `MaxCallerData`，所以也可能是"提供程序支持的上限"而非"对端
+实际发送长度"。两种解释对应不同的修法，**用一个明确长度的发送侧测试即可区分**：客户端发 24 字节、
+服务端若收到 24 则说明是实际长度，若仍是 56 则是上限。）

@@ -208,9 +208,11 @@ static NDK_CONNECTOR*  g_incoming;           // the connector the listener hande
 // silent misread of somebody else's bytes.
 #define STEP3_PRIV_MAGIC 0x4E564D46u         // "NVMF"
 typedef struct _STEP3_PRIV {
-    ULONG   Magic;
-    ULONG   Rkey;
-    ULONG64 Address;
+    ULONG   Magic;          // "NVMF"
+    ULONG   Rkey;           // the MR token - step 4 needs this to travel
+    ULONG64 Address;        // the buffer address - and this
+    ULONG   Marker;         // a second recognisable value, so "arrived" is unambiguous
+    ULONG   Pad;            // keep the size a round 32 bytes
 } STEP3_PRIV;
 
 static STEP3_PRIV g_serverPriv;
@@ -252,6 +254,16 @@ static VOID Step3ConnectEvent(PVOID context, NDK_CONNECTOR* connector) {
     g_privLenInCallback = len;
     g_peerInLimit = inLimit;
     g_peerOutLimit = outLimit;
+    // TWO STEPS, as the user-mode code does: NDSPI's GetPrivateData(NULL, &len) returns the required
+    // size first (with ND_BUFFER_OVERFLOW), and only then is the buffer filled.  The kernel side used a
+    // single call and got SUCCESS with length 0, which may simply mean this provider only reports the
+    // data on a properly sized second call - or that the peer really sent nothing.  The size query tells
+    // those two apart, and that distinction decides whether step 4 has a channel to exchange rkeys on.
+    {
+        ULONG need = 0;
+        NTSTATUS sq = connector->Dispatch->NdkGetConnectionData(connector, NULL, NULL, NULL, &need);
+        logf("  server[callback]: size query               = 0x%08X  need=%u\r\n", sq, need);
+    }
     logf("  server[callback]: NdkGetConnectionData      = 0x%08X  peerIn=%u peerOut=%u privLen=%u\r\n",
          g_privStatusInCallback, inLimit, outLimit, len);
     KeSetEvent(&g_acceptPosted, IO_NO_INCREMENT, FALSE);     // the main thread may now accept
