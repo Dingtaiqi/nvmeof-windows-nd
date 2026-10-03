@@ -5438,3 +5438,39 @@ Linux    : dd if=/dev/nvme1n1 bs=512 skip=2097152 count=1048576 | sha256sum
 2. **reap 丢弃乱序完成**（§28）—— 主机侧与目标侧策略不一致。
 3. **target 的 5 秒等待窗口**（§33）—— 没人连就退出，于是对端得到 `invalid service ID`。
    **一个没人连就退出的 target 不是可用的 target**，这条直接关系到 D1。
+
+---
+
+## 37. ★★★ 方向 A **全绿**：41 PASS / 0 FAIL（`initiator failures: 0`）
+
+```
+[PASS]=41  [FAIL]=0
+[ref ] foreign ONCS: oncs=0x002C dsm=1 write-zeroes=1 compare=0 wu=0 resv=1 ts=0 - advertisements beyond ours belong to the reference
+[ref ] foreign thin provisioning is the backing device's answer: nsfeat=0x12 thin=0 dlfeat=0 npdg=0 (0-based blocks)
+initiator failures: 0
+```
+
+证据：`evidence/f5_dirA_final_41pass_0fail_2026-10-05.log`。
+
+### 那两项"失败"的真相：**断言写死了我们自己 target 的能力**
+
+原断言（`f5_interop.cpp` 原 1425/1489 行）的注释写得很清楚：
+
+> "THE CAPABILITY BITS ARE A PROMISE... This asserts both halves at once: **the two commands we do answer**
+> are advertised, and the four we do not are absent."
+
+**它是为"我们自己的 target"写的**（我们只答 DSM 与 write-zeroes），却跑在 `runInitiator`（对**外部**对端）
+分支里。而实测参考实现的行为是：
+
+| 位 | nvmet 的实际值 | 说明 |
+|---|---|---|
+| `oncs` | `0x002C` → DSM=1, Write Zeroes=1, **Reservations=1** | **nvmet 真的实现了 reservations**，宣告它是正确的 |
+| `nsfeat` | `0x12` → **thin=0**, `npdg=0` | thin 与否是**后备设备**的回答（内存盘时 `npdg=7`，dm-线性片时 `0`） |
+
+**修法**：新增 `peerIsOurs`（对端 subnqn 是否为我们自己的 `nqn.2024-01.local.rdma:windows-nd`）。
+- **对端是我们自己** → 两条断言保持严格（能力位是承诺，不能多宣告）；
+- **对端是外部实现** → 改为 `[ref ]` **观察行**，并把参考实现的真实取值打印出来；同时仍然断言
+  "外部 target 宣告了本主机将要使用的命令"（DSM | write-zeroes 至少有一个）—— 这一条对任何对端都成立。
+
+> 教训：**把"我们自己实现的能力契约"写成对任意对端的硬断言，会在真实参考实现上产生假失败**；
+> 而假失败比没有断言更贵 —— 它会让人去修一个并不存在的缺陷。

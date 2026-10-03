@@ -950,6 +950,13 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
     // In discovery mode the host connects to the well-known discovery NQN and never
     // creates an I/O queue: that is what `nvme discover` does.
     const char* connectNqn = discover ? NVMEOF_DISC_SUBSYS_NAME : subnqn;
+    // IS THE PEER OURS?  The two capability assertions below encode what OUR target promises - it
+    // answers DSM and write-zeroes and nothing else - and running them against a foreign reference is
+    // not strict, it is wrong.  Measured against Linux nvmet: oncs=0x002C sets the Reservations bit,
+    // which nvmet genuinely implements, and NSFEAT.THIN follows the backing device (npdg=7 behind a
+    // ramdisk, npdg=0 behind a dm-linear slice over an NVMe SSD).  Both were reported as FAILURES for
+    // behaviour that is correct, so: assert when the peer is ours, observe when it is not.
+    const bool peerIsOurs = (strcmp(connectNqn, "nqn.2024-01.local.rdma:windows-nd") == 0);
     if (discover) wantQueues = 0;
     printf("=== F5 INITIATOR %s -> %s:%u%s\n", localIp, serverIp, port,
            discover ? "   [discovery]" : "");
@@ -1422,12 +1429,18 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
                           (oncs & NVMEOF_CTRL_ONCS_WRITE_UNCOR) ? 1 : 0,
                           (oncs & NVMEOF_CTRL_ONCS_RESERVATIONS) ? 1 : 0,
                           (oncs & NVMEOF_CTRL_ONCS_TIMESTAMP) ? 1 : 0);
-                Report("the controller advertises deallocate/write-zeroes, and nothing it cannot answer",
-                       (oncs & (NVMEOF_CTRL_ONCS_DSM | NVMEOF_CTRL_ONCS_WRITE_ZEROES)) ==
-                               (NVMEOF_CTRL_ONCS_DSM | NVMEOF_CTRL_ONCS_WRITE_ZEROES) &&
-                           (oncs & (NVMEOF_CTRL_ONCS_COMPARE | NVMEOF_CTRL_ONCS_WRITE_UNCOR |
-                                    NVMEOF_CTRL_ONCS_RESERVATIONS | NVMEOF_CTRL_ONCS_TIMESTAMP)) == 0,
-                       d);
+                if (peerIsOurs) {
+                    Report("the controller advertises deallocate/write-zeroes, and nothing it cannot answer",
+                           (oncs & (NVMEOF_CTRL_ONCS_DSM | NVMEOF_CTRL_ONCS_WRITE_ZEROES)) ==
+                                   (NVMEOF_CTRL_ONCS_DSM | NVMEOF_CTRL_ONCS_WRITE_ZEROES) &&
+                               (oncs & (NVMEOF_CTRL_ONCS_COMPARE | NVMEOF_CTRL_ONCS_WRITE_UNCOR |
+                                        NVMEOF_CTRL_ONCS_RESERVATIONS | NVMEOF_CTRL_ONCS_TIMESTAMP)) == 0,
+                           d);
+                } else {
+                    printf("    [ref ] foreign ONCS: %s - advertisements beyond ours belong to the reference\n", d);
+                    Report("the foreign target advertises the commands this host will use",
+                           (oncs & (NVMEOF_CTRL_ONCS_DSM | NVMEOF_CTRL_ONCS_WRITE_ZEROES)) != 0, d);
+                }
             } else {
                 printf("    (discovery controller: ioccsz/iorcsz are 0 by design)\n");
             }
@@ -1486,8 +1499,12 @@ static int runInitiator(const char* serverIp, uint16_t port, const char* localIp
             uint16_t npdg   = nvmeof_rd16(idb + NVMEOF_ID_NS_OFF_NPDG);
             sprintf_s(d, "nsfeat=0x%02X thin=%d dlfeat=%u npdg=%u (0-based blocks)",
                       nsfeat, (nsfeat & NVMEOF_NS_FEAT_THIN) ? 1 : 0, dlfeat, npdg);
-            Report("the namespace advertises thin provisioning (the other half of discard)",
-                   (nsfeat & NVMEOF_NS_FEAT_THIN) != 0, d);
+            if (peerIsOurs) {
+                Report("the namespace advertises thin provisioning (the other half of discard)",
+                       (nsfeat & NVMEOF_NS_FEAT_THIN) != 0, d);
+            } else {
+                printf("    [ref ] foreign thin provisioning is the backing device's answer: %s\n", d);
+            }
         }
         if (ok) printf("    the I/O size below follows the target's own block size\n");
     }
