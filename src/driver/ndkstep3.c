@@ -122,6 +122,18 @@ static VOID Step3RequestComplete(PVOID context, NTSTATUS status) {
 
 static VOID Step3DoNothing(PVOID context) { UNREFERENCED_PARAMETER(context); }
 
+static ULONG g_cqNotifications = 0;
+// CQs are created WITH a notification callback here, where earlier versions passed NULL - and the
+// signature says why that mattered: the parameter is declared _In_, not _In_opt_, while
+// CqNotificationContext right after it IS optional.  Microsoft's sample supplies a real routine.
+// This probe polls its CQs and the callback does nothing useful, but "the parameter is not optional"
+// is exactly the kind of thing that is worth aligning before blaming the provider for a completion
+// that never arrives.
+static VOID Step3CqNotification(PVOID context, NTSTATUS cqStatus) {
+    UNREFERENCED_PARAMETER(cqStatus);
+    if (context) InterlockedIncrement((volatile LONG*)context);
+}
+
 static void Step3Start(STEP3_ASYNC* c) {
     KeInitializeEvent(&c->Event, NotificationEvent, FALSE);
     c->Status = STATUS_SUCCESS;
@@ -255,7 +267,7 @@ static NTSTATUS Step3OpenEnd(STEP3_END* e, ULONG ifIndex, const char* name) {
     if (!NT_SUCCESS(st)) return st;
 
     Step3Start(&c);
-    st = e->Adapter->Dispatch->NdkCreateCq(e->Adapter, 64, NULL, NULL, NULL, Step3Complete, &c, &e->Cq);
+    st = e->Adapter->Dispatch->NdkCreateCq(e->Adapter, 64, Step3CqNotification, &g_cqNotifications, NULL, Step3Complete, &c, &e->Cq);
     st = Step3Finish(st, &c, 10000);
     if (NT_SUCCESS(st) && !e->Cq) e->Cq = (NDK_CQ*)c.Object;
     logf("  %s: NdkCreateCq                       = 0x%08X  cq=%p\r\n", name, st, e->Cq);
@@ -576,7 +588,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registryPath) {
     // client's NdkConnect refused while the server's connect callback fired - an incoherent pair that
     // is exactly what a congested stack looks like.  Cleanup here means the driver code stays resident
     // (harmless) while its NDK objects do not.
-    Step3Cleanup();
     writeLog();
     return STATUS_SUCCESS;
 }
