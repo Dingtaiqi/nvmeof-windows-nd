@@ -568,6 +568,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registryPath) {
         logf("\r\nEXCEPTION 0x%08X during step 3\r\n", GetExceptionCode());
     }
 
+    // RELEASE EVERYTHING BEFORE THIS DRIVER FINISHES, and this is not tidiness - it is what makes the
+    // next run possible.  A legacy kernel service cannot be stopped (sc stop answers 1052
+    // ERROR_INVALID_SERVICE_CONTROL) and it cannot be unloaded without a reboot, so an instance that
+    // keeps its adapter, listener, PD, CQs and QP leaves the RDMA stack holding them for the life of
+    // the boot.  Six such instances accumulated in one afternoon, and the run after that reported the
+    // client's NdkConnect refused while the server's connect callback fired - an incoherent pair that
+    // is exactly what a congested stack looks like.  Cleanup here means the driver code stays resident
+    // (harmless) while its NDK objects do not.
+    Step3Cleanup();
     writeLog();
     return STATUS_SUCCESS;
 }
