@@ -5181,3 +5181,43 @@ D0 内核线已经踩过同一个坑并留下证据（DRIVER-D0 §25）：`NdkRe
   Linux 主机互通的目标侧实现佐证 → **不是偏移写错**。
 - **reap 丢弃乱序完成**：已修（§28），`[PASS]` 4 → 12。
 - **`capsule send 0xC0000120 ND_CANCELED`**：出现在早期失败之后，是队列状态退化，**不是独立病因**。
+
+---
+
+## 30. 收窄到"同一个 rkey：目标的 RDMA READ 成功、RDMA WRITE 失败"
+
+### 已排除
+
+- **区域注册标志**：`nvmeof_rdma.h:174-178` 传的是
+  `ALLOW_LOCAL_WRITE | ALLOW_REMOTE_READ | ALLOW_REMOTE_WRITE | RDMA_READ_SINK` —— **权限是全的**，
+  §29 的"缺远端写权限"假设**被推翻**。
+- **SGL 偏移**：见 §29。
+- **reap 丢弃**：已修（§28）。
+
+### 现在的分界点（非常窄，值得直攻）
+
+`nvmeof_rdma.h:182` 发布给对端的密钥是 **`ndWireKey(GetRemoteToken())`（字节交换后的）**。第 63–80 行
+的注释记载了**实测**结论：WinOF 5.50/CX3 对 **RDMA READ 事务的 rkey** 采用相反字节序（发出与校验时都如此），
+不交换就会得到 `remote access error (10)`；交换后：
+
+| 用途 | 状态 |
+|---|---|
+| 目标对我们 connect data 的 **RDMA READ**（fabrics Connect 用） | ✅ 交换后成功（方向 A 的 Connect 就是这条，已通过） |
+| 对端对我们缓冲区的 **RDMA WRITE**（LID 5、Identify，4096 B） | ❌ **全部失败**（`completion=NO`，对端 dmesg 干净） |
+| 响应**装在胶囊里**回来（LID 1，1024 B） | ✅ 不经过我们的 rkey，通过 |
+
+**即：同一个已发布密钥，READ 方向被验证可用，WRITE 方向从未成功过。**
+
+### 下一轮要做的实验（一次只改一个变量）
+
+1. **先把两侧的密钥都打印出来**（发布值 `ndWireKey(token)` 与原始 `token`），确认对端收到的就是发布值；
+2. **临时发布"未交换"的 token** 跑一次：若 4096 B 写落地成功、而 fabrics Connect（目标的 READ）失败，
+   则证明**该 quirk 只作用于 READ 事务**，正确做法是**按事务方向选择密钥形式**（READ 用交换值、WRITE 用原值）
+   —— 这是一个**非对称**处理，需要在 SGL 发布处按命令类型分别填 key；
+3. 若两种形式都写不进去，则问题不在 rkey 字节序，转到**对端证据**：用随仓库自带的
+   `linux/rxe_counts.sh` 在跑前跑后各取一次 rxe 计数器，区分"目标没写"与"写了被拒"。
+
+### 为什么这条线索值得优先
+
+注释里第 ③ 条写着：**CX3↔CX3（同一驱动两侧）两种形式都能工作**，所以本项目的全部自测都不可能暴露它；
+只有与 Linux 对端对接才会显形 —— 而 Linux 窗口只剩这一段时间。**这正是现在最该打的地方。**
