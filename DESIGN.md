@@ -5139,3 +5139,45 @@ HRESULT st = q.reap(CTX_RESP, &r, timeoutMs);    // 再等"响应完成"
 因此若某条命令超时、它的完成事后才到达并被暂存，下一条命令的 `reap(CTX_RESP)` 可能**误领**那一条。
 逐条命令唯一化上下文（或用代数计数）是后续加固方向；当前先以"不丢数据"为优先，因为它把
 "永远超时"变成了"可以继续"。
+
+---
+
+## 29. 方向 A 剩余失败的主假设：主机侧区域**没有按"允许远端写"注册**
+
+### 观察（`evidence/f5_dirA_after_reap_fix_2026-10-05.log`）
+
+| 测试 | 数据量 | 结果 |
+|---|---|---|
+| Get Log Page LID 1 | 1024 B | ✅ 通过 |
+| Get Log Page LID 5 (effects) | 4096 B | ❌ `completion=NO` |
+| Identify Controller / Identify CNS 2 | 4096 B | ❌ 无完成 |
+
+**共同点**：失败的都是**必须由目标 RDMA Write 进我方缓冲区**的；通过的那条（1024 B）**很可能装在响应胶囊里
+（in-capsule）回来**，根本不需要写我们的 SGL。也就是说：**第一次真正动用我们公布的 SGL/rkey 的那条命令就失败了。**
+
+### 主假设（与 D0 内核线的教训完全同源）
+
+D0 内核线已经踩过同一个坑并留下证据（DRIVER-D0 §25）：`NdkRegisterMr` 的 `Flags` 传 `0`
+（= `ALLOW_LOCAL_READ`）时，**远端读不进来**，完成回 `0xC0000005`、`transferred=0`；必须显式
+`NDK_MR_FLAG_ALLOW_REMOTE_READ` / `ALLOW_REMOTE_WRITE`。
+
+**同一个问题在用户态**：主机侧的内存区域若只按"本地读/写"注册，**目标的 RDMA Write 会静默失败** ——
+目标不报错（`dmesg` 干净，实测：只有 `nvmet: Created nvm controller 1`），我方收不到完成。**症状与观察完全一致。**
+
+### 下一轮的具体排查顺序（照此做，不要重复走弯路）
+
+1. **查主机侧区域是怎么注册的**：`src/nvmeof_rdma.h` 的 `Device`/`open`/`registerMemory` 路径，看传给
+   `IND2MemoryRegion::Register` 的访问权限标志 —— 是否包含远端写（`ND_MR_FLAG_ALLOW_REMOTE_WRITE`）。
+   **这是第一顺位。**
+2. **对照反向路径**：我们**自己的 target** 服务过 Linux `nvme-cli`（方向 B 有成功记录）。它的区域注册是
+   可工作的参考实现 —— 直接对比两处标志。
+3. **取对端证据**：笔记本上有 `linux/rxe_counts.sh`（本项目自带，只读）。在跑之前后各取一次 rxe 计数器，
+   若目标确实尝试过 RDMA Write，计数器（如重传/错误类）会有差别；**这能区分"目标没写"与"写了但被拒"**。
+4. 若标志本就正确，再看 `dev.rkey` 是否为**该区域的**正确 key、以及区域是否跨越了未注册的尾部。
+
+### 已排除（避免下一轮重复）
+
+- **SGL 字段偏移**：`cap + 24` 在本代码库读侧（`f5_interop.cpp:426-428`）与写侧处处一致，且有与真实
+  Linux 主机互通的目标侧实现佐证 → **不是偏移写错**。
+- **reap 丢弃乱序完成**：已修（§28），`[PASS]` 4 → 12。
+- **`capsule send 0xC0000120 ND_CANCELED`**：出现在早期失败之后，是队列状态退化，**不是独立病因**。
