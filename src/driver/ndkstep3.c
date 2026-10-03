@@ -263,6 +263,18 @@ static VOID Step3ConnectEvent(PVOID context, NDK_CONNECTOR* connector) {
         ULONG need = 0;
         NTSTATUS sq = connector->Dispatch->NdkGetConnectionData(connector, NULL, NULL, NULL, &need);
         logf("  server[callback]: size query               = 0x%08X  need=%u\r\n", sq, need);
+    // SECOND CALL USES THE ANNOUNCED SIZE, not the buffer size, and the payload length is now a known
+    // 24 bytes on the sending side so the two readings of "56" can be told apart: if this fetch returns
+    // 24, then 56 was the provider's ceiling; if it returns 0 again, the announced size was not the issue.
+    {
+        ULONG need2 = need;
+        ULONG got = need2 ? need2 : sizeof(g_privBuf);
+        NTSTATUS st9 = connector->Dispatch->NdkGetConnectionData(connector, &inLimit, &outLimit,
+                                                                  g_privBuf, &got);
+        STEP3_PRIV* px = (STEP3_PRIV*)g_privBuf;
+        logf("  server[callback]: fetch(announced=%u)  = 0x%08X got=%u magic=0x%08X rkey=0x%08X addr=0x%llX marker=0x%08X\r\n",
+             need, st9, got, px->Magic, px->Rkey, (unsigned long long)px->Address, px->Marker);
+    }
     }
     logf("  server[callback]: NdkGetConnectionData      = 0x%08X  peerIn=%u peerOut=%u privLen=%u\r\n",
          g_privStatusInCallback, inLimit, outLimit, len);
@@ -456,8 +468,13 @@ static void Step3Cleanup(void) {
 
 static VOID Step3Unload(PDRIVER_OBJECT driver) {
     UNREFERENCED_PARAMETER(driver);
-    Step3Cleanup();
-    DbgPrint("[ndkstep3] unloaded\n");
+    // DELIBERATELY EMPTY.  This used to call Step3Cleanup(), which issues NdkClose* requests and
+    // does not wait for them - and a driver that returns from unload with operations still pending
+    // is bugcheck 0xCE by definition.  NDKPing.sys demonstrated exactly that on this machine today.
+    // The objects are released when the machine restarts; D1 must do better, and doing better means
+    // WAITING for every close completion before unload returns, which is a real piece of work rather
+    // than a line to add here.
+    logf("  unload requested - cleanup deliberately skipped (see comment)\r\n");
 }
 
 static void Step3Run(void) {
@@ -538,8 +555,9 @@ static void Step3Run(void) {
     g_serverPriv.Magic = STEP3_PRIV_MAGIC;
     g_serverPriv.Rkey = 0;
     g_serverPriv.Address = 0;
-    g_clientPriv.Magic = STEP3_PRIV_MAGIC;
-    g_clientPriv.Rkey = 0;
+    g_clientPriv.Magic = STEP3_PRIV_MAGIC;  g_clientPriv.Rkey = 0xDEADBEEF;
+    g_clientPriv.Address = 0x1122334455667788ULL;  g_clientPriv.Marker = 0x3C3C3C3C;
+    logf("  client: sending %u bytes of private data (marker 0x3C3C3C3C)\r\n", (unsigned)sizeof(g_clientPriv));
     logf("\r\n-- client connects from 192.168.100.3 to 192.168.100.2:%u\r\n", kPort);
     SOCKADDR_IN local, remote;
     RtlZeroMemory(&local, sizeof(local));
@@ -555,8 +573,6 @@ static void Step3Run(void) {
     g_serverPriv.Rkey = 0;
     g_serverPriv.Address = 0;
     g_clientPriv.Magic = STEP3_PRIV_MAGIC;
-    g_clientPriv.Rkey = 0;
-    g_clientPriv.Address = 0;
 
     if (!g_client.Connector) return;
     Step3Start(&c);

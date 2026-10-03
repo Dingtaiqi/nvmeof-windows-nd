@@ -774,3 +774,53 @@ verdict: client connect=0x00000000 completeConnect=0x00000000  server accept=0x0
 （另需注意：56 恰好等于适配器信息里的 `MaxCallerData`，所以也可能是"提供程序支持的上限"而非"对端
 实际发送长度"。两种解释对应不同的修法，**用一个明确长度的发送侧测试即可区分**：客户端发 24 字节、
 服务端若收到 24 则说明是实际长度，若仍是 56 则是上限。）
+
+---
+
+## 23. ★★★ D0 步骤 3 **完整通过**：连接 + accept + **私有数据（rkey/地址）交换**
+
+```
+client: sending 24 bytes of private data (marker 0x3C3C3C3C)
+server[callback]: size query          = 0x00000000  need=56
+server[callback]: fetch(announced=56) = 0x00000000  got=56
+        magic=0x4E564D46   rkey=0xDEADBEEF   addr=0x1122334455667788   marker=0x3C3C3C3C
+verdict: client connect=0x00000000 completeConnect=0x00000000  server accept=0x00000000
+```
+
+**四个字段全部与发送端一致。** 这就是步骤 4（一次 RDMA Read）所必需的 **rkey + 缓冲区地址** 交换通道，
+现在它被证明可用。
+
+### ★ 私有数据的准确调用约定（**必须记录，否则会静默丢数据**）
+
+| 第二次 `NdkGetConnectionData` 的 `*pPrivateDataLength` 入参 | 结果 |
+|---|---|
+| **256**（调用方缓冲区大小） | `STATUS_SUCCESS` 但 `len=0`、**数据为空**（**静默失败**，最难查的一类） |
+| **56**（第一次查询 announced 的值） | `STATUS_SUCCESS`、`len=56`、**数据完整** |
+
+正确流程（照用户态 `GetPrivateData(NULL,&len)` 再做第二次调用的做法）：
+
+```c
+ULONG need = 0;
+NdkGetConnectionData(conn, NULL, NULL, NULL, &need);          // 第一次：只查长度，得到 need=56
+ULONG got = need;                                             // 第二次：把 need 作为长度入参传入
+NdkGetConnectionData(conn, &inLimit, &outLimit, buf, &got);   // 数据在这里
+```
+
+且读的时机必须是**连接事件回调里（Accept 之前）**；Accept 之后再读拿到的是空缓冲区（用户态注释亦如此
+记载）。
+
+### 本次修掉的真实缺陷：覆盖赋值
+
+上一次运行数据"部分到达"（magic/marker 对、rkey/addr 为 0）不是提供程序的问题，而是**本文件里后写的
+两行 `g_clientPriv.Rkey = 0; g_clientPriv.Address = 0;`**（早期还没有 MR 时的占位）把先写的值覆盖掉了。
+**教训**：占位赋值散落在赋值语句之间时，会产生"看起来像提供程序丢字段"的现象 —— 读回日志里的
+**每一个字段**才定位到。
+
+### D0 进度
+
+| 步骤 | 状态 |
+|---|---|
+| 1 打开适配器 | ✅ |
+| 2 建对象（PD/CQ/QP/Listener/Connector） | ✅ |
+| 3 两端连接 + 私有数据交换 | ✅ **本轮完成** |
+| 4 一次 RDMA Read 并逐字节比对 | ⬜ 下一步 |
