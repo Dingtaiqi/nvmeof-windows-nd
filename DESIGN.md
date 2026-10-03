@@ -5318,3 +5318,47 @@ blkid: PTTYPE="gpt";  p3 UUID="2C20EE7D77F58150" TYPE="ntfs"
    （DESIGN 里既有的取回模式，131072 块 / 64 MiB），再与对端裸读做 sha256 对照。
 3. **跑任何会写盘的套件前，先确认命名空间指向哪个设备** —— 这次我在切换设备之后没有重新确认这一点。
 4. 分区表的"备份"是标准特性且**确实救回来了**：以后动真盘前可以先把 GPT 导出留档（`sfdisk --dump`）。
+
+---
+
+## 33. ★★★ 方向 B 成功：标准 Linux 主机连上**我们的 target**
+
+```
+Linux: nvme connect -t rdma -a 192.168.100.2 -s 4420 -n nqn.2024-01.local.rdma:windows-nd
+       rc=0
+Linux: nvme list
+       /dev/nvme2n1  NDVMEOF0000000000001  NetworkDirect NVMe-oF prototype
+                     50.33 MB / 50.33 MB   512 B   0.5.0
+Linux: nvme list-subsys → nvme-subsys2 - NQN=nqn.2024-01.local.rdma:windows-nd
+我们target日志: [admin] Identify cns=3 nsid=1 → [data] ND_SUCCESS, 4096 bytes
+                [admin] Identify cns=0 nsid=1 → [data] ND_SUCCESS, 4096 bytes
+                [admin] Keep Alive #1 (kato=5000 ms)
+```
+
+**标准 Linux 内核主机把我们的 target 挂成了一块真实块设备。** 证据：
+`evidence/dirB_linux_host_sees_our_target_2026-10-05.log`、
+`evidence/dirB_our_target_serving_linux_host_2026-10-05.log`。
+
+### 之前那个 `Connect rejected: status 8 (invalid service ID)` 的真因
+
+**不是 CM 的字节序，也不是协议缺陷** —— 是我们 target **自己的等待窗口**：
+
+```
+[listener armed] ... is accepting connections
+admin connection request failed: 0x00000102 ND_TIMEOUT after 5000 ms     ← 5 秒没人连
+（进程随后退出）
+```
+
+Linux 侧稍后才发起连接 → **监听端已经不存在** → CM 只能回"没有监听者匹配该 service ID"（`invalid service ID`）。
+
+**修法（流程层面）**：让两端的时间窗**重叠** —— 起 target → 等 `[listener armed]` → **同一次调用内立即**从 Linux 连接。
+实测：武装后 0.2 s 就绪，SSH 往返 2–3 s，落在 5 秒窗口内 ✓。
+
+> **这是一个"产品级"观察**：**一个没人连就退出的 target 不是一个可用的 target**。当前它靠 `-runfor` 自设期限、
+> 超时即退。D1 的 target 形态（以及 kernel 驱动一侧）必须**持续监听**，否则对端随时会遇到"服务 ID 无效"。
+
+### 同时记下的两个操作教训
+
+1. **`ssh 'sh -c "..."'` 的嵌套引号今天吃掉了两次命令**（`nvme` 打印帮助、参数丢失），
+   每次都浪费一轮。**凡是有参数的命令，一律写成脚本文件再 `scp` + 执行。**
+2. **串行编排里"先起一端、再起另一端"必须检查时间窗**，否则测到的是"对端已退出"，而不是被测对象。

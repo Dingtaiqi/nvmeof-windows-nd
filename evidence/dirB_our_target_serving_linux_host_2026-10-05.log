@@ -1,0 +1,250 @@
+=== F5 TARGET on 192.168.100.2:4420 (waiting for a foreign host: nvme-cli, or F5 -initiator)
+    controllers this run will serve: unlimited
+    subnqn 'nqn.2024-01.local.rdma:windows-nd'
+  adapter: maxRegistration=17592186044415 MiB maxWindow=17592186044415 MiB maxTransfer=1024 MiB
+    [key] raw=0x00020148 wire=0x48010200 published=0x48010200 (swapped)
+  nsfile: 'D:\nvmeof\ns48.img' loaded, 98304 blocks x 512 B = 48 MiB (namespace nsze=98304)
+[listener armed] 192.168.100.2:4420 is accepting connections
+  [conn] controller 1 private data: hr=0x00000000 len=56 recfmt=0 qid=0 hrqsize=32 hsqsize=31
+  [conn] 32 admin capsule receives armed
+  [conn] accepted; advertised crqsize=32
+  [conn] GetReadLimits failed
+  [wire]  op=0x7F cid=0 fctype=0x01 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1BE84F4000 len=1024 key=0x00004C6F
+  [wire]   00: 7F 40 00 00 01 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 40 4F E8 1B 8E FF FF
+  [wire]   32: 00 04 00 6F 4C 00 00 4F  00 00 00 00 1F 00 00 00
+  [wire]   48: 88 13 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] fabrics Connect qid=0 sqsize=31 kato=5000
+        connect data: RDMA Read posted (addr=0xFFFF8E1BE84F4000 key=0x00004C6F len=1024)
+  [data]  completion for the transfer: status=0x00000000 ND_SUCCESS bytes=1024
+        hostnqn='nqn.2014-08.org.nvmexpress:uuid:e9924114-11e2-0540-a055-4768acb5c38f'
+        subsysnqn='nqn.2024-01.local.rdma:windows-nd'
+  [wire]  op=0x7F cid=1 fctype=0x04 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 7F 40 01 00 04 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  01 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Property Get off=0x0 -> 0x201E01001F
+  [wire]  op=0x7F cid=4096 fctype=0x00 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 7F 40 00 10 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 14 00 00 00
+  [wire]   48: 00 00 46 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Property Set off=0x14 val=0x460000
+  [wire]  op=0x7F cid=4097 fctype=0x04 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 7F 40 01 10 04 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  01 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Property Get off=0x0 -> 0x201E01001F
+  [wire]  op=0x7F cid=8192 fctype=0x00 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 7F 40 00 20 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 14 00 00 00
+  [wire]   48: 01 00 46 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Property Set off=0x14 val=0x460001
+  [wire]  op=0x7F cid=8193 fctype=0x04 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 7F 40 01 20 04 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 1C 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Property Get off=0x1C -> 0x1
+  [wire]  op=0x7F cid=12288 fctype=0x04 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 7F 40 00 30 04 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 08 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Property Get off=0x8 -> 0x10400
+  [wire]  op=0x06 cid=2 fctype=0x00 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1BF0F3B000 len=4096 key=0x00004C70
+  [wire]   00: 06 40 02 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 B0 F3 F0 1B 8E FF FF
+  [wire]   32: 00 10 00 70 4C 00 00 4F  01 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=1 nsid=0
+  [ok]   Identify VWC=1, which matches the file-backed namespace
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x02 cid=3 fctype=0xFF sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1C1DF7FC00 len=512 key=0x00004C71
+  [wire]   00: 02 40 03 00 FF FF FF FF  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 FC F7 1D 1C 8E FF FF
+  [wire]   32: 00 02 00 71 4C 00 00 4F  02 00 7F 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Get Log Page lid=2 numd=127 -> 512 bytes at offset 0 (zero-filled)
+  [data]  completion for the transfer: status=0x00000000 ND_SUCCESS bytes=493
+  [wire]  op=0x09 cid=4 fctype=0x00 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 09 40 04 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  07 00 00 00 0F 00 0F 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Set Number of Queues -> 8
+  [conn] I/O 1 private data: len=56 recfmt=0 qid=1 cntlid=1
+  [conn] I/O queue 1 connected (1 of 8 granted)
+  [conn] I/O 2 private data: len=56 recfmt=0 qid=2 cntlid=1
+  [conn] I/O queue 2 connected (2 of 8 granted)
+  [conn] I/O 3 private data: len=56 recfmt=0 qid=3 cntlid=1
+  [conn] I/O queue 3 connected (3 of 8 granted)
+  [conn] I/O 4 private data: len=56 recfmt=0 qid=4 cntlid=1
+  [conn] I/O queue 4 connected (4 of 8 granted)
+  [conn] I/O 5 private data: len=56 recfmt=0 qid=5 cntlid=1
+  [conn] I/O queue 5 connected (5 of 8 granted)
+  [conn] I/O 6 private data: len=56 recfmt=0 qid=6 cntlid=1
+  [conn] I/O queue 6 connected (6 of 8 granted)
+  [conn] I/O 7 private data: len=56 recfmt=0 qid=7 cntlid=1
+  [conn] I/O queue 7 connected (7 of 8 granted)
+  [conn] I/O 8 private data: len=56 recfmt=0 qid=8 cntlid=1
+  [conn] I/O queue 8 connected (8 of 8 granted)
+  [io]    q1 fabrics Connect (fctype=0x01 qid=1)
+  [io]    q2 fabrics Connect (fctype=0x01 qid=2)
+  [io]    q3 fabrics Connect (fctype=0x01 qid=3)
+  [io]    q4 fabrics Connect (fctype=0x01 qid=4)
+  [io]    q5 fabrics Connect (fctype=0x01 qid=5)
+  [io]    q6 fabrics Connect (fctype=0x01 qid=6)
+  [io]    q7 fabrics Connect (fctype=0x01 qid=7)
+  [io]    q8 fabrics Connect (fctype=0x01 qid=8)
+  [wire]  op=0x06 cid=6 fctype=0x00 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1BC98E9000 len=4096 key=0x00004C72
+  [wire]   00: 06 40 06 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 90 8E C9 1B 8E FF FF
+  [wire]   32: 00 10 00 72 4C 00 00 4F  06 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=6 nsid=0
+  [admin] slot 11 arrived during a data transfer; queued
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x06 cid=18 fctype=0x00 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1C6E91F000 len=4096 key=0x00004D83
+  [wire]   00: 06 40 12 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 F0 91 6E 1C 8E FF FF
+  [wire]   32: 00 10 00 83 4D 00 00 4F  01 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=1 nsid=0
+  [ok]   Identify VWC=1, which matches the file-backed namespace
+  [admin] slot 12 arrived during a data transfer; queued
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x06 cid=22 fctype=0x00 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1BFBB9D000 len=4096 key=0x00004C73
+  [wire]   00: 06 40 16 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 D0 B9 FB 1B 8E FF FF
+  [wire]   32: 00 10 00 73 4C 00 00 4F  02 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=2 nsid=0
+  [admin] slot 13 arrived during a data transfer; queued
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x06 cid=5 fctype=0x00 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1C6F5E8000 len=4096 key=0x00004D84
+  [wire]   00: 06 40 05 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 80 5E 6F 1C 8E FF FF
+  [wire]   32: 00 10 00 84 4D 00 00 4F  01 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=1 nsid=0
+  [ok]   Identify VWC=1, which matches the file-backed namespace
+  [admin] slot 14 arrived during a data transfer; queued
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x06 cid=23 fctype=0x01 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1BCC22B000 len=4096 key=0x00004C74
+  [wire]   00: 06 40 17 00 01 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 B0 22 CC 1B 8E FF FF
+  [wire]   32: 00 10 00 74 4C 00 00 4F  03 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=3 nsid=1
+  [admin] slot 15 arrived during a data transfer; queued
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x02 cid=4098 fctype=0xFF sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1C6F5F8000 len=512 key=0x00004D85
+  [wire]   00: 02 40 02 10 FF FF FF FF  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 80 5F 6F 1C 8E FF FF
+  [wire]   32: 00 02 00 85 4D 00 00 4F  02 00 7F 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Get Log Page lid=2 numd=127 -> 512 bytes at offset 0 (zero-filled)
+  [admin] slot 16 arrived during a data transfer; queued
+  [data]  completion for the transfer: status=0x00000000 ND_SUCCESS bytes=161
+  [wire]  op=0x06 cid=24 fctype=0x01 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1BCC22B000 len=4096 key=0x00004C75
+  [wire]   00: 06 40 18 00 01 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 B0 22 CC 1B 8E FF FF
+  [wire]   32: 00 10 00 75 4C 00 00 4F  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=0 nsid=1
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x06 cid=25 fctype=0x01 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1BCC22B000 len=4096 key=0x00004C76
+  [wire]   00: 06 40 19 00 01 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 B0 22 CC 1B 8E FF FF
+  [wire]   32: 00 10 00 76 4C 00 00 4F  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=0 nsid=1
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x06 cid=19 fctype=0x01 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1D1CA3B000 len=4096 key=0x00004C77
+  [wire]   00: 06 40 13 00 01 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 B0 A3 1C 1D 8E FF FF
+  [wire]   32: 00 10 00 77 4C 00 00 4F  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=0 nsid=1
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x06 cid=20 fctype=0x00 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1CFBD12000 len=4096 key=0x00004C78
+  [wire]   00: 06 40 14 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 20 D1 FB 1C 8E FF FF
+  [wire]   32: 00 10 00 78 4C 00 00 4F  01 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=1 nsid=0
+  [ok]   Identify VWC=1, which matches the file-backed namespace
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x06 cid=21 fctype=0x01 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1D81883000 len=4096 key=0x00004C79
+  [wire]   00: 06 40 15 00 01 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 30 88 81 1D 8E FF FF
+  [wire]   32: 00 10 00 79 4C 00 00 4F  03 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=3 nsid=1
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x06 cid=4099 fctype=0x01 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1C1F41B000 len=4096 key=0x00004C7A
+  [wire]   00: 06 40 03 10 01 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 B0 41 1F 1C 8E FF FF
+  [wire]   32: 00 10 00 7A 4C 00 00 4F  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=0 nsid=1
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for
+  [wire]  op=0x18 cid=12289 fctype=0x00 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 18 40 01 30 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Keep Alive #1 (kato=5000 ms)
+  [wire]  op=0x18 cid=16384 fctype=0x00 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 18 40 00 40 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Keep Alive #2 (kato=5000 ms)
+  [wire]  op=0x18 cid=16385 fctype=0x00 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 18 40 01 40 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Keep Alive #3 (kato=5000 ms)
+  [wire]  op=0x18 cid=20480 fctype=0x00 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 18 40 00 50 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Keep Alive #4 (kato=5000 ms)
+  [wire]  op=0x18 cid=20481 fctype=0x00 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 18 40 01 50 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Keep Alive #5 (kato=5000 ms)
+  [wire]  op=0x18 cid=24576 fctype=0x00 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 18 40 00 60 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Keep Alive #6 (kato=5000 ms)
+  [wire]  op=0x18 cid=24577 fctype=0x00 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 18 40 01 60 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Keep Alive #7 (kato=5000 ms)
+  [wire]  op=0x18 cid=28672 fctype=0x00 sgl(byte39)=0x40 type=0x04 keyed=1 addr=0x0 len=0 key=0x00000000
+  [wire]   00: 18 40 00 70 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   32: 00 00 00 00 00 00 00 40  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Keep Alive #8 (kato=5000 ms)
+  [wire]  op=0x06 cid=7 fctype=0x01 sgl(byte39)=0x4F type=0x04 keyed=1 addr=0xFFFF8E1BC98EC000 len=4096 key=0x00004C7B
+  [wire]   00: 06 40 07 00 01 00 00 00  00 00 00 00 00 00 00 00
+  [wire]   16: 00 00 00 00 00 00 00 00  00 C0 8E C9 1B 8E FF FF
+  [wire]   32: 00 10 00 7B 4C 00 00 4F  00 00 00 00 00 00 00 00
+  [wire]   48: 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+  [admin] Identify cns=0 nsid=1
+  [data]  Identify: 0x00000000 ND_SUCCESS, 4096 bytes asked for

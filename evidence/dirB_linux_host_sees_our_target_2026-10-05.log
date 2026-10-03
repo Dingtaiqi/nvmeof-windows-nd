@@ -1,0 +1,50 @@
+Node                  Generic               SN                   Model                                    Namespace  Usage                      Format           FW Rev  
+--------------------- --------------------- -------------------- ---------------------------------------- ---------- -------------------------- ---------------- --------
+/dev/nvme0n1          /dev/ng0n1            24194A809101         WD PC SN740 SDDPNQD-512G-1002            0x1        512.11  GB / 512.11  GB    512   B +  0 B   73101000
+/dev/nvme1n1          /dev/ng1n1            242949F3CA20         CT1000P3PSSD8                            0x1          1.00  TB /   1.00  TB    512   B +  0 B   P9CR413 
+/dev/nvme2n1          /dev/ng2n1            NDVMEOF0000000000001 NetworkDirect NVMe-oF prototype          0x1         50.33  MB /  50.33  MB    512   B +  0 B   0.5.0   
+=== list-subsys ===
+
+nvme-subsys2 - NQN=nqn.2024-01.local.rdma:windows-nd
+               hostnqn=nqn.2014-08.org.nvmexpress:uuid:e9924114-11e2-0540-a055-4768acb5c38f
+\
+ +- nvme2 rdma 192.168.100.2 live
+=== id-ctrl ===
+WARNING: 'id-ctrl' is deprecated and will be removed in the next major version, use 'nvme id ctrl' instead
+/dev/nvme2: Permission denied
+[1mUsage: nvme id ctrl <device> [OPTIONS][0m
+
+Send an Identify Controller command to the given device and report 
+information about the specified controller in human-readable or binary 
+format. May also return vendor-specific controller attributes in hex-dump if 
+requested.
+
+[1mOptions:[0m
+  [  --vendor-specific, -V ]            --- dump binary vendor field
+  [  --raw-binary, -b ]                 --- show identify in binary format
+
+[1mGlobal options:[0m
+  [  --verbose, -v ]                    --- Increase output verbosity
+  [  --quiet ]                          --- suppress informational output
+  [  --output-format=<FMT>, -o <FMT> ]  --- Output format: 
+                                            normal|json|binary
+  [  --timeout=<NUM> ]                  --- timeout value, in milliseconds
+  [  --dry-run ]                        --- show command instead of 
+=== namespace ===
+WARNING: 'id-ns' is deprecated and will be removed in the next major version, use 'nvme id ns' instead
+/dev/nvme2n1: Permission denied
+[1mUsage: nvme id ns <device> [OPTIONS][0m
+
+Send an Identify Namespace command to the given device, returns properties 
+of the specified namespace in either human-readable or binary format. Can 
+also return binary vendor-specific namespace attributes.
+
+[1mOptions:[0m
+  [  --namespace-id=<NUM>, -n <NUM> ]   --- identifier of desired namespace
+  [  --force ]                          --- Return this namespace, even if 
+                                            not attached (1.2 devices only)
+  [  --vendor-specific, -V ]            --- dump binary vendor fields
+  [  --raw-binary, -b ]                 --- show identify in binary format
+=== read-only peek at LBA0 ===
+ 5d 7c 1f 3e d9 f8 9b ba a5 44 67 06 21 c0 e3 82
+ ad 4c 6f 0e 29 c8 eb 8a b5 54 77 16 31 d0 f3 92
