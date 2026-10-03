@@ -431,3 +431,47 @@ STACK_TEXT:
 
 **方法论**：这台机器上就装着 WDK 的调试器（`C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe`），
 一条命令就能把"蓝屏码 + 栈 + 出错模块"读出来。以后内核工作出问题，**先读转储，再猜**。
+
+---
+
+## 15. 步骤 3–4 的实现清单（NDKPI 接口面已从 `ndkpi.h` 读出，非记忆）
+
+要调用的成员（结构体 → 成员，逐个从头文件确认）：
+
+| 结构体 | 成员 |
+|---|---|
+| `NDK_ADAPTER_DISPATCH` | `NdkQueryAdapterInfo` `NdkCreateCq` `NdkCreatePd` `NdkCreateConnector` `NdkCreateListener` `NdkBuildLAM` `NdkReleaseLAM` |
+| `NDK_PD_DISPATCH` | `NdkCreateMr` `NdkCreateMw` `NdkCreateQp` `NdkGetPrivilegedMemoryRegionToken` |
+| `NDK_CQ_DISPATCH` | `NdkGetCqResults` `NdkGetCqResultsEx` `NdkArmCq` |
+| `NDK_QP_DISPATCH` | `NdkSend` `NdkReceive` `NdkRead` `NdkWrite` `NdkInvalidate` `NdkFastRegister` `NdkFlush` `NdkBind` |
+| `NDK_MR_DISPATCH` | `NdkRegisterMr` `NdkDeregisterMr` `NdkGetRemoteTokenFromMr` `NdkGetLocalTokenFromMr` `NdkInitializeFastRegisterMr` |
+| `NDK_CONNECTOR_DISPATCH` | `NdkConnect` `NdkCompleteConnect` `NdkAccept` `NdkReject` `NdkGetConnectionData` `NdkGetLocalAddress` `NdkGetPeerAddress` `NdkDisconnect` |
+| `NDK_LISTENER_DISPATCH` | `NdkListen` `NdkGetLocalAddress` `NdkControlConnectEvents` |
+
+调用形状（来自微软示例 `NdkWrapper.c`，逐字对照过）：
+
+```c
+NdkCreateListener(Adapter, ConnectEventHandler, Context, CreateCompletion, &ctx, &Listener);
+NdkListen(Listener, Address, AddressCbLength, Completion, &ctx);
+NdkConnect(Connector, Qp, LocalAddr, LocalLen, RemoteAddr, RemoteLen,
+           InboundReadLimit, OutboundReadLimit, PrivateData, PrivateDataLen, Completion, &ctx);
+NdkCompleteConnect(Connector, DisconnectEventCallback, Socket, Completion, &ctx);
+NdkAccept(Connector, Qp, InboundReadLimit, OutboundReadLimit,
+          PrivateData, PrivateDataLen, DisconnectEventCallback, Socket, Completion, &ctx);
+NdkGetConnectionData(Connector, &InboundReadLimit, &OutboundReadLimit, NULL, &PrivateDataLen);
+NdkBuildLAM(Adapter, Mdl, BytesToMap, Completion, Context, Lam, &LamCbSize, &Fbo);
+NdkRead(Qp, Request, Sgl, SgeCount, RemoteAddress, RemoteToken, Flags);
+NdkGetCqResults(Cq, Results, MaxResults);
+```
+
+**步骤 3–4 的实现顺序**（同一驱动内自建两端：.2 做 listener，.3 做 connector）：
+
+1. 分配非分页内存 → 建 MDL → `NdkBuildLAM` → `NdkCreateMr` + `NdkRegisterMr`（或 FRMR + `NdkFastRegister`）
+   → `NdkGetRemoteTokenFromMr` 取 rkey，把 **buffer 地址 + rkey** 塞进私有数据；
+2. .2 侧 `NdkListen`，连接事件回调里 `NdkGetConnectionData` 取对端私有数据 → `NdkAccept`；
+3. .3 侧 `NdkConnect`（带自己的地址/rkey）→ 对端 accept 后 `NdkCompleteConnect`；
+4. .2 往 buffer 写一个已知模式 → .3 `NdkRead` → 轮询 CQ → **逐字节比对**；
+5. 两端对象按逆序关闭（全部用真实回调，不用 NULL —— §14）。
+
+**仍然待读的确切签名**（下一步第一件事，不猜）：`NdkRegisterMr`、`NDK_FN_CONNECT_EVENT_CALLBACK`、
+`NDK_SGE` 的字段名、`NDK_RESULT` 的字段名。
