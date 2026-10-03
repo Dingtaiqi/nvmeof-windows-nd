@@ -27,6 +27,7 @@
 #include "nvmeof_iscsi_pending.h"
 #include "nvmeof_iscsi.h"          // pulls in winsock2, but no NetworkDirect
 #include "nvmeof_wire.h"           // the NVMe-oF side: capability bits and Identify offsets
+#include "nvmeof_config.h"         // the bridge's config file parser
 
 static int g_failures = 0;
 
@@ -496,6 +497,97 @@ static void test_nvmeof_caps(void) {
     CHECK_EQ_U32(NVMEOF_ID_NS_OFF_LBAF,  128u, "anchor: lbaf[0] is byte 128");
 }
 
+// ---------------------------------------------------------------------------
+//  8c. The config file parser (nvmeof_config.h)
+// ---------------------------------------------------------------------------
+//
+// The product and this test run the SAME parser, which is why the parser is a header and
+// not a few lines inside main().  What is being pinned here is not "it parses a file" but
+// the refusals: a config file that is silently half-applied brings the bridge up with
+// settings nobody chose, so every malformed shape must fail with a line number.
+static void test_config(void) {
+    // A well-formed file: comments, blank lines, CRLF, quotes, a bare switch.
+    {
+        const char* path = "selftest_config_ok.conf";
+        FILE* f = nullptr;
+        if (fopen_s(&f, path, "wb") == 0 && f) {
+            fputs("# bridge.conf\r\n", f);
+            fputs("\r\n", f);
+            fputs("; the other comment character\n", f);
+            fputs("target 192.168.100.5\n", f);
+            fputs("iscsi 3260\n", f);
+            fputs("subnqn \"nqn.2024-01.local.rdma:x\"\n", f);
+            fputs("readwrite\n", f);
+            fclose(f);
+        }
+        nvmeof_config::Loaded c;
+        std::string err;
+        const bool ok = nvmeof_config::load(path, c, err);
+        CHECK(ok, "a well-formed config file loads");
+        if (!ok) printf("       (%s)\n", err.c_str());
+        CHECK_EQ_U32((uint32_t)c.tokens.size(), 7u, "five options, one of them a bare switch");
+        if (c.tokens.size() == 7) {
+            CHECK(c.tokens[0] == "-target" && c.tokens[1] == "192.168.100.5", "key becomes -key, value kept");
+            CHECK(c.tokens[4] == "-subnqn" && c.tokens[5] == "nqn.2024-01.local.rdma:x", "quotes are stripped");
+            CHECK(c.tokens[6] == "-readwrite", "a bare key is a switch");
+        }
+        DeleteFileA(path);
+    }
+    // A UTF-8 BOM must not become part of the first key.  Editors add one silently, and the
+    // error it would otherwise cause names a key nobody typed.
+    {
+        const char* path = "selftest_config_bom.conf";
+        FILE* f = nullptr;
+        if (fopen_s(&f, path, "wb") == 0 && f) {
+            fputs("\xEF\xBB\xBFtarget 10.0.0.1\n", f);
+            fclose(f);
+        }
+        nvmeof_config::Loaded c;
+        std::string err;
+        const bool ok = nvmeof_config::load(path, c, err);
+        CHECK(ok && c.tokens.size() == 2 && c.tokens[0] == "-target", "a UTF-8 BOM is skipped");
+        DeleteFileA(path);
+    }
+    // The refusals.  Each one has a distinct cause and must name its line.
+    //
+    // Note what is NOT here: "target" with no value.  A bare key is a SWITCH at this level
+    // (readwrite is one), so the parser cannot know that this particular option needs a
+    // value - that is the command-line parser's job, and it refuses it there.  The first
+    // version of this test demanded a refusal here and failed; the expectation was wrong,
+    // and the split is worth stating rather than hiding: THIS layer decides what a token
+    // is, the layer below decides whether a token is complete.
+    struct BadCase { const char* text; const char* what; };
+    const BadCase bad[] = {
+        { "target = 192.168.100.5\n",         "key=value is not the shape; '=' is not an option name" },
+        { "= 1\n",                            "'=' is not an option name" },
+        { "-target 10.0.0.1\n",               "the leading dash is refused, not guessed at" },
+        { "target \"10.0.0.1\n",              "an unterminated quote" },
+        { "subnqn nqn a b\n",                 "an unquoted value with spaces" },
+        { "tar get 1\n",                      "two fields where the value must be one" },
+    };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        const char* path = "selftest_config_bad.conf";
+        FILE* f = nullptr;
+        if (fopen_s(&f, path, "wb") == 0 && f) { fputs(bad[i].text, f); fclose(f); }
+        nvmeof_config::Loaded c;
+        std::string err;
+        const bool ok = nvmeof_config::load(path, c, err);
+        CHECK(!ok, bad[i].what);
+        if (ok) printf("       (accepted: %s)\n", bad[i].text);
+        else    CHECK(err.find("line ") != std::string::npos, "the error names the line it came from");
+        DeleteFileA(path);
+    }
+    // A missing file is an error, not an empty configuration: starting with defaults
+    // because a path was mistyped is exactly the silent half-apply this refuses.
+    {
+        nvmeof_config::Loaded c;
+        std::string err;
+        CHECK(!nvmeof_config::load("selftest_config_does_not_exist.conf", c, err),
+              "a missing config file is refused");
+        CHECK(err.find("cannot open") != std::string::npos, "and says so");
+    }
+}
+
 int main(void) {
     printf("nvmeof_iscsi self-test\n");
     test_padding();
@@ -507,11 +599,12 @@ int main(void) {
     test_pending_table();
     test_write_flow();
     test_nvmeof_caps();
+    test_config();
 
     if (g_failures == 0) {
         printf("  iscsi self-test: PASS (padding, BHS, PDU builders, login text, "
                "negotiation rules, R2T burst sizing, parked-write table, "
-               "NVMe-oF capability table)\n");
+               "NVMe-oF capability table, config file parser)\n");
         return 0;
     }
     printf("  iscsi self-test: %d FAILURE(S)\n", g_failures);

@@ -41,6 +41,7 @@
 #include <share.h>     // _SH_DENYNO
 
 #include "nvmeof_wire.h"
+#include "nvmeof_config.h"
 #include "nvmeof_rdma.h"
 #include "nvmeof_auth.h"
 #include "nvmeof_dhchap.h"
@@ -4352,6 +4353,31 @@ static void WINAPI svcMain(DWORD, LPSTR*) {
 }
 
 int main(int argc, char** argv) {
+    // -checkconfig <path>: validate a config file and stop.  Handled HERE, before the mode
+    // is looked at, because it is a mode-less diagnostic: the option parser rejects anything
+    // whose argv[1] is not -target/-initiator/-genkey/..., so an option placed there never
+    // runs - measured, because the first version sat in that loop and answered with the usage
+    // text and exit 2, which is a confusing way to say "your config file is fine".
+    //
+    // Nothing is opened before this point, which is the whole value: it validates a file on
+    // the machine that will run it, and it keeps working when the RDMA stack does not - as
+    // on this machine right now - so a bad config file and a broken provider can never be
+    // mistaken for one another.
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "-checkconfig") == 0) {
+            nvmeof_config::Loaded cfg;
+            std::string err;
+            const char* path = argv[i + 1];
+            if (!nvmeof_config::load(path, cfg, err)) { printf("%s\n", err.c_str()); return 2; }
+            printf("config %s: %zu option(s), all well-formed\n", path, cfg.lines.size());
+            for (size_t k = 0; k < cfg.lines.size(); k++) {
+                printf("  line %4d: %s\n", cfg.lines[k].first, cfg.lines[k].second.c_str());
+            }
+            printf("(validated only: nothing was opened.  -config, which APPLIES the file,\n"
+                   " is not implemented yet - see the note in the option parser.)\n");
+            return 0;
+        }
+    }
     // Pre-scan for the service log BEFORE anything touches stdout.
     //
     // This ordering is the whole fix.  MSVC's stdio latches the OS handle for a
