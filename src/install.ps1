@@ -113,6 +113,12 @@ if ($BackendRetrySeconds -gt 0) { $args += @('-backendretry', "$BackendRetrySeco
 # capped by the INITIATOR's own registry values, which only reload when the
 # ROOT\ISCSIPRT device instance is re-enabled - see the README's tuning section.
 $args += @('-iscsimbl', "$MaxBurstLength", '-iscsichunk', "$MaxSegmentLength")
+# The status file, by default and not behind a switch: a deployed service that cannot be
+# inspected while it runs is the thing this exists to fix (its LOG is held open by the
+# service, so reading it means stopping the service - a second outage used as a diagnostic).
+# tools_bridge_status.ps1 reads this path; keep the two defaults in step.
+$StatusFile = Join-Path $DataDir 'bridge-status.json'
+$args += @('-statusfile', $StatusFile)
 $args += $ExtraArgs
 
 $conf = Join-Path $InstallDir 'bridge.conf'

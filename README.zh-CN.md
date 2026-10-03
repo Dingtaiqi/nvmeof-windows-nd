@@ -37,6 +37,7 @@
 | `src/hygiene.ps1` | CI 的三条仓库级检查——每个源文件有 SPDX 头、每个 `.ps1` 有 UTF-8 BOM、三份文档无乱码——做成脚本，于是**同一份代码既门禁 push 也门禁本地全量**（`run_all.ps1` 第一项就是它）。这些规则原先只写在 `ci.yml` 里，结果一次 push 因为 BOM 变红，而写它的人当时没有任何办法先自查 |
 | `src/tune_initiator.ps1` | 读 / 应用 / 还原 Windows iSCSI initiator 的调优（`MaxTransferLength` / `MaxBurstLength` / `MaxRecvDataSegmentLength`），并用**真正有效**的方式重载驱动。`-Show` / `-Apply` / `-Restore` |
 | `src/nvmeof_iscsi.h`、`src/nvmeof_iscsi_pending.h` | **用户态 iSCSI target**：三段式 login、SendTargets、NOP/Logout/TaskMgmt、SCSI 命令集（INQUIRY/VPD、MODE SENSE、READ CAPACITY、REPORT LUNS、READ/WRITE(10/16) 走 R2T、SYNCHRONIZE CACHE）。每连接一个对象一个线程，backend（一条队列对）用互斥量串行。装不进命令 PDU 的写按 ITT 挂起成状态（`PendingWrite`，窗口 8），不是在 `handleScsi()` 里阻塞等 Data-Out；挂起表有三条规则：**一个 ITT 一条**（重复的回 CHECK CONDITION `0x0B/0x00`）、**表按命令窗口有界**（超了回 `0x04/0x44`）、**60 s 没有任何 Data-Out 就结束会话**——比 initiator 自己的 60 s request hold 加 15 s SRB 超时更长，所以只会打在真的消失了的对端上（DESIGN §8.72） |
+| `src/tools_bridge_status.ps1` | 读正在运行的桥写出的状态文件（`-statusfile`，`install.ps1` 默认已传），并给出监控友好的退出码：0 新鲜、2 缺文件、**3 陈旧**（文件停止更新 —— 进程死了或卡住了，提示里说清怎么区分）、4 不可解析。它存在的原因就是桥自己的日志在服务运行时被占用读不了 |
 | `src/tools_iscsi_write.ps1` | 写路径端到端逐字节检查：确定性图案写入 → initiator 读回 → 自建 SCSI pass-through 发 SYNCHRONIZE CACHE → 比对后端 namespace 文件（三条独立证据） |
 | `src/tools_iscsi_perf.ps1` | 经 Windows 自带 initiator 量桥吞吐：自己起后端与桥、登录、按块大小扫 QD1 与 N 个并发读者，并打印桥自己的每条命令耗时分解 |
 | `src/tools_nd_bw.ps1` | 纯链路基线：驱动官方 NetworkDirect `nd_write_bw` / `nd_read_bw` / `nd_send_bw` / `nd_*_lat` 扫消息尺寸，并按数据行解析（各版本列顺序不同，按 "Gb/s" 关键字抓会抓到表头） |

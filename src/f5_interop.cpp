@@ -225,6 +225,13 @@ static uint8_t     g_targetDhGroup = nvmeof_auth::DHGROUP_2048;
 // schedule) and it already raises this with -reconnectwait, which is why lowering the
 // default is safe rather than a behaviour change for real hosts.
 static uint32_t    g_reconnectWaitMs = 5000;
+
+// The status file's globals live up here with the other options, not next to writeStatus:
+// the command line is parsed long before that function is defined, and a file-scope name
+// has to exist before its first use.
+static const char* g_statusFile    = nullptr;
+static uint64_t    g_statusStarted = 0;
+static uint32_t    g_statusWrites  = 0;
 // ---- file-backed namespace (-nsfile) ----
 static const char* g_nsFile = nullptr;                 // the backing file, or null
 // -initiator only: move the entire namespace to/from these local files, over the
@@ -4646,6 +4653,12 @@ int main(int argc, char** argv) {
             if (s < 1 || s > 3600) { printf("-reconnectwait %d: 1..3600 seconds\n", s); return 2; }
             g_reconnectWaitMs = (ULONGLONG)s * 1000;
         }
+        // -statusfile <path>: the operator-readable state, for the reason in writeStatus.
+        // install.ps1 passes it by default, so a deployed service has one without anybody
+        // having to remember a flag.
+        else if (strcmp(argv[i], "-statusfile") == 0 && i + 1 < argc) {
+            g_statusFile = argv[++i];
+        }
         else if (strcmp(argv[i], "-authdhgroup") == 0 && i + 1 < argc) {
             int g = atoi(argv[++i]);
             if (g == 2048)      g_targetDhGroup = nvmeof_auth::DHGROUP_2048;
@@ -4691,6 +4704,60 @@ int main(int argc, char** argv) {
     return dispatchPayload(argc, argv);
 }
 
+// ---------------------------------------------------------------------------
+//  The status file: what an operator can read WHILE the bridge is running.
+//
+//  The log cannot be read then.  Windows holds it open for the life of the service and
+//  Get-Content answers "used by another process" - the README says so, and it is the first
+//  thing anyone hits on a live deployment.  Stopping the service to read its log is not a
+//  diagnostic procedure; it is a second outage.
+//
+//  So: a small JSON file, rewritten atomically, holding the two things an operator actually
+//  asks - "is it alive?" and "what is it doing, and what went wrong last?" - and nothing
+//  else.  Not a log: no history, no unbounded growth, no rotation to get wrong.  Liveness
+//  comes from the timestamp: a file that stops moving means the process stopped writing,
+//  whether it died or hung, and tools_bridge_status.ps1 reports exactly that.
+// ---------------------------------------------------------------------------
+static void writeStatus(const char* state, int lastRc, unsigned attempt) {
+    if (!g_statusFile) return;
+    if (!g_statusStarted) g_statusStarted = GetTickCount64();
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    char tmp[MAX_PATH + 8];
+    sprintf_s(tmp, sizeof(tmp), "%s.tmp", g_statusFile);
+    FILE* f = nullptr;
+    // "wb" and a rename, not an in-place rewrite: a reader must never catch a half-written
+    // file, and a monitor that reads JSON with a missing brace is worse than no monitor.
+    if (fopen_s(&f, tmp, "wb") != 0 || !f) return;
+    fprintf(f,
+            "{\n"
+            "  \"schema\": 1,\n"
+            "  \"pid\": %lu,\n"
+            "  \"state\": \"%s\",\n"
+            "  \"attempt\": %u,\n"
+            "  \"lastRc\": %d,\n"
+            "  \"uptimeSec\": %llu,\n"
+            "  \"writtenUtc\": \"%04u-%02u-%02uT%02u:%02u:%02uZ\",\n"
+            "  \"statusWrites\": %u\n"
+            "}\n",
+            (unsigned long)GetCurrentProcessId(), state, attempt, lastRc,
+            (unsigned long long)((GetTickCount64() - g_statusStarted) / 1000),
+            (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
+            (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond,
+            g_statusWrites + 1);
+    fclose(f);
+    if (!MoveFileExA(tmp, g_statusFile, MOVEFILE_REPLACE_EXISTING)) {
+        // Say it once, on the console/log, and keep going: a status file that cannot be
+        // written must not take the bridge down with it.  The write counter stops moving,
+        // which is itself visible in the file if it ever gets written again.
+        static bool warned = false;
+        if (!warned) { printf("  [status] cannot write %s\n", g_statusFile); warned = true; }
+        DeleteFileA(tmp);
+        return;
+    }
+    g_statusWrites++;
+}
+
 // The payload, factored out so the service thread and the console path run exactly
 // the same code.  Anything that behaves differently as a service is a bug waiting
 // for a reboot.
@@ -4702,7 +4769,11 @@ static int dispatchPayload(int argc, char** argv) {
     if (strcmp(argv[1], "-target") == 0)
         rc = runTarget(argv[2], (uint16_t)atoi(argv[3]), g_pl.serveControllers);
     else if (strcmp(argv[1], "-initiator") == 0 && argc >= 5) {
+        unsigned attempt = 0;
+        writeStatus("starting", 0, 0);
         for (;;) {
+            attempt++;
+            writeStatus("connecting", 0, attempt);
             rc = runInitiator(argv[2], (uint16_t)atoi(argv[3]), argv[4], g_pl.subnqn,
                               g_pl.hostnqn, g_pl.wantQueues, g_pl.blocks, g_pl.discover,
                               g_pl.initiatorAuthKey, g_pl.initiatorCtrlKey, g_pl.authSkip);
@@ -4710,12 +4781,22 @@ static int dispatchPayload(int argc, char** argv) {
             if (InterlockedCompareExchange(&g_svcStopRequested, 0, 0)) {
                 printf("  [backendretry] stop requested while the peer was unreachable; "
                        "not retrying\n");
+                writeStatus("stopped", rc, attempt);
                 break;
             }
             printf("  [backendretry] backend unreachable (rc %d); retrying in %u s "
                    "(Ctrl+C or Stop-Service to give up)\n", rc, g_backendRetryMs / 1000);
-            Sleep(g_backendRetryMs);
+            // Sleep in slices, writing the status as we go, because the retry wait is the
+            // longest time this process spends doing nothing and therefore the one window
+            // where a monitor has nothing else to go on.  Writing only at the ends would
+            // make a healthy bridge look dead for the whole interval.
+            for (uint32_t left = g_backendRetryMs; left > 0; left -= 1000) {
+                if (InterlockedCompareExchange(&g_svcStopRequested, 0, 0)) break;
+                writeStatus("reconnecting", rc, attempt);
+                Sleep(left < 1000 ? left : 1000);
+            }
         }
+        writeStatus(rc == 0 ? "ended" : "failed", rc, attempt);
     }
     else printf("unknown mode %s\n", argv[1]);
 
