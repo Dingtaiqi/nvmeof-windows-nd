@@ -3872,12 +3872,6 @@ static int runTarget(const char* ip, uint16_t port, int maxControllers) {
     //
     // run_f5.ps1 now waits for this line instead of sleeping.  Keep it on one line and
     // keep the wording: the script matches "listener armed".
-    {
-        char ipStr[INET_ADDRSTRLEN] = {};
-        InetNtopA(AF_INET, &local.sin_addr, ipStr, sizeof(ipStr));
-        printf("[listener armed] %s:%u is accepting connections\n", ipStr, ntohs(local.sin_port));
-        fflush(stdout);
-    }
 
     // =========================================================================
     //  One iteration of this loop is ONE CONTROLLER.
@@ -3911,6 +3905,19 @@ static int runTarget(const char* ip, uint16_t port, int maxControllers) {
         }
 
         hr = listener->GetConnectionRequest(admin.conn, &admin.ov);
+        // PRINTED HERE, AFTER the request is posted, and the order is the point: "armed" has to
+        // mean "a connection will now be accepted".  It used to be printed BEFORE this call, and
+        // anything that waits for the line and then connects lands in the window where the
+        // listener exists but nothing is accepting - measured as an initiator-side
+        // ND_CONNECTION_REFUSED (0xC0000236) with this target logging "ND_TIMEOUT after 5000 ms"
+        // immediately after its own "armed" line.  run_f5.ps1 and run_f1.ps1 wait for this line;
+        // this ordering is what makes that wait correct instead of a race.
+    {
+        char ipStr[INET_ADDRSTRLEN] = {};
+        InetNtopA(AF_INET, &local.sin_addr, ipStr, sizeof(ipStr));
+        printf("[listener armed] %s:%u is accepting connections\n", ipStr, ntohs(local.sin_port));
+        fflush(stdout);
+    }
         if (hr == ND_PENDING) hr = admin.waitOverlapped(listener, (DWORD)g_reconnectWaitMs);
         // -runfor: the target gives ITSELF a deadline.  Added because of the cascade measured
         // in DESIGN 8.78 - a suite that force-kills a target which never served a controller
