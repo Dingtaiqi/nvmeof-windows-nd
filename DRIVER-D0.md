@@ -89,3 +89,59 @@ D1（StorPort 驱动）整条路线就不成立，所以它必须排在所有内
 - **下一步（按顺序）**：① 读完 `ndkpi.h`，把准确的函数名与调用顺序列进这份文档；② 用 D0 步骤 0
   验证工具链能产出 `.sys`；③ 问用户是否允许测试签名/加载；④ 写探针并跑步骤 1–4。
 - **与 RDMA 端点故障无关**：D0 可以在当前"用户态端点坏着"的状态下进行 —— 它测的是内核接口是否可用。
+
+---
+
+## 7. 本轮实测结果（2026-10）：D0 步骤 0 **已完成**
+
+用户已禁用驱动强制签名，于是把步骤 0 做完了 —— 而且**两步都是实测，不是推断**。
+
+### (1) 工具链能产出 `.sys`（不需要 MSBuild 集成）
+
+`src/driver/ndprobe.c` 是一个最小内核驱动，里面**故意没有任何 RDMA**：先排除"工具链产不出东西"和
+"内核不接受它"这两种失败，它们与"提供程序说不行"是完全不同的结论。
+
+能用的命令（手工路径，写下来省得再试）：
+
+```
+cl /nologo /c /kernel /GS- /W4 /D_AMD64_ /I"<kits>\Include\10.0.26100.0\km" ^
+   /I"<kits>\Include\10.0.26100.0\shared" /I"<kits>\Include\10.0.26100.0\ucrt" ndprobe.c
+link /nologo /DRIVER:WDM /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /MACHINE:X64 ^
+   /LIBPATH:"<kits>\Lib\10.0.26100.0\km\x64" ndprobe.obj ntoskrnl.lib hal.lib /OUT:ndprobe.sys
+```
+
+产物 `ndprobe.sys` = **3584 字节**。
+
+**踩到的第一个坑值得记下来**：少了 `/D_AMD64_` 时，`shared\ntdef.h` 用
+`#error "No Target Architecture"` 拒绝编译 —— `VsDevCmd -arch=x64` **不会**定义这个宏，它是 WDK
+构建环境（或命令行）给的。
+
+### (2) 内核接受未签名的驱动
+
+```
+sc create ndprobe type= kernel start= demand binPath= <...>\ndprobe.sys     -> SUCCESS
+sc start  ndprobe                                                            -> STATE: 4 RUNNING
+sc stop / sc delete                                                          -> 已清理
+```
+
+**一个内核驱动用 `sc create type= kernel` 就能加载，不需要 INF。**
+
+### (3) 一个必须知道的注意事项：这个豁免很可能不是持久的
+
+`bcdedit /enum {current}` 里**没有** `testsigning` 行，也没有 `nointegritychecks` —— 也就是说
+禁用签名**没有写进 BCD**，很可能是开机时选的"禁用驱动程序强制签名"（F7），**只对当次启动有效**。
+后果：**重启之后这次加载大概会失败**，报 `577`（镜像哈希无效）。
+
+要让它在重启后仍然可用，二选一（都需要管理员 + 重启）：
+
+```
+bcdedit /set testsigning on          # 持久化测试签名（需要 Secure Boot 关闭 —— 本机已确认是关闭的）
+```
+或者每次开机走 F7。
+
+### (4) 下一步：D0 步骤 1–4（NDKPI 本身）
+
+步骤 0 只证明"这条工具链和这个加载路径能用"。真正的答案在步骤 1：**通过 NDKPI 打开一个 ND 适配器**。
+那需要先把 `ndkpi.h` 读完并列出准确的函数名与调用顺序（本文件 §2 只写了**确认过**的几个，
+`NdkOpenAdapter` 之类的名字尚未确认）。步骤 4 的判据仍然是一次 **RDMA Read 并逐字节比对** ——
+"适配器打开成功"说明不了数据路径可用。
