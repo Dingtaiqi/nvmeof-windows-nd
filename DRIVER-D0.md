@@ -824,3 +824,63 @@ NdkGetConnectionData(conn, &inLimit, &outLimit, buf, &got);   // 数据在这里
 | 2 建对象（PD/CQ/QP/Listener/Connector） | ✅ |
 | 3 两端连接 + 私有数据交换 | ✅ **本轮完成** |
 | 4 一次 RDMA Read 并逐字节比对 | ⬜ 下一步 |
+
+---
+
+## 24. 步骤 4 的实现计划 + 已核实的接口签名（**从内核头文件读出，非猜测**）
+
+### 已核实的签名（`ndkpi.h`，10.0.26100.0）
+
+```c
+// 1) 建 MR 对象
+NTSTATUS (*NDK_FN_CREATE_MR)(NDK_PD *pNdkPd, BOOLEAN FastRegister,
+                             NDK_FN_CREATE_COMPLETION CreateCompletion,
+                             PVOID RequestContext, NDK_MR **ppNdkMr);
+
+// 2) 把内存注册进 MR —— 注意是 MDL，且必须描述"虚拟连续"的内存
+NTSTATUS (*NDK_FN_REGISTER_MR)(NDK_MR *pNdkMr, MDL *Mdl, SIZE_T Length, ULONG Flags,
+                               NDK_FN_REQUEST_COMPLETION RequestCompletion, PVOID RequestContext);
+
+// 3) 取远端 token（rkey）—— 通过 MR 的派发表
+UINT32 (*NDK_FN_GET_REMOTE_TOKEN_FROM_MR)(NDK_MR *pNdkMr);
+//    MR 派发表成员顺序：NdkCloseMr, NdkQueryExtension, NdkRegisterMr, NdkDeregisterMr,
+//                       NdkInitializeFastRegisterMr, NdkGetRemoteTokenFromMr, NdkGetLocalTokenFromMr
+
+// 4) 发起 RDMA Read —— 语义：把远端内存读到本地 SGE 描述的内存
+NTSTATUS (*NDK_FN_READ)(NDK_QP *pNdkQp, PVOID RequestContext, CONST NDK_SGE* pSgl, ULONG nSge,
+                        UINT64 RemoteAddress, UINT32 RemoteToken, ULONG Flags);
+
+// 5) 收割完成（轮询 CQ）
+NTSTATUS (*NDK_FN_GET_CQ_RESULTS)(NDK_CQ *pNdkCq, NDK_RESULT Results[], ULONG nResults);
+
+typedef struct _NDK_SGE {
+    union { PVOID VirtualAddress; NDK_LOGICAL_ADDRESS LogicalAddress; };
+    ULONG  Length;
+    UINT32 MemoryRegionToken;      // 本地 MR 的 token（NdkGetLocalTokenFromMr）
+} NDK_SGE;
+```
+
+### 实现计划（一次运行内完成）
+
+1. **服务端**：分配一个 4 KiB 缓冲区，填入**可校验的模式**（例如每字节 `i & 0xFF`，再在固定偏移写入
+   字符串 `NVMEOF-STEP4`）。用 `IoAllocateMdl` + `MmProbeAndLockPages` 建 MDL →
+   `NdkCreateMr` → `NdkRegisterMr(Mr, Mdl, 4096, 0, ...)` → `NdkGetRemoteTokenFromMr(Mr)` 取 rkey。
+2. **把 `{缓冲区虚拟地址, rkey, 长度}` 放进服务端的私有数据**，随 `NdkAccept` 发给客户端
+   （步骤 3 已证明该通道可用，且**必须**用"先查长度、再按 announced 长度取"的两次调用读）。
+3. **客户端**：分配同样大小的本地缓冲区（先清零），建 MR 并注册（作为 Read 的**落地目标**），
+   `NdkGetLocalTokenFromMr` 取本地 token 填进 `NDK_SGE`。
+4. **客户端发起 `NdkRead`**：`pSgl` 指向本地 SGE（`Length=4096`），`RemoteAddress`/`RemoteToken`
+   来自服务端私有数据。
+5. **轮询 CQ**（`NdkGetCqResults`）等完成，检查 `NDK_RESULT.Status`。
+6. **逐字节比对**：本地缓冲区应当等于服务端的模式。**判据必须是逐字节比较的结果**（与用户态那条
+   铁律一致：13/14 的电池、`stag` 的 `[PASS] payload` 都是字节级证据）。
+7. **失败时的诊断顺序**：先看 `NdkRead` 的返回码，再看 CQ 里 `NDK_RESULT` 的 Status 与
+   `Transferred` 字节数，然后才怀疑内容 —— 这样能把"没发起""没完成""完成了但内容不对"区分开。
+
+### 已知的坑（本轮踩过、写下来避免重踩）
+
+- 私有数据第二次调用**必须**传第一次 announced 的长度，否则 `SUCCESS + len=0` **静默丢数据**；
+- 读私有数据的时机是**连接事件回调里（Accept 之前）**；
+- 同一 `.sys` 文件**不能二次加载**（`sc start` 会回误导性的 exit 2）→ 每次运行用唯一文件名；
+- 不在 `DriverUnload` 里做"未等待的清理"（`0xCE`）；
+- 不强杀持有内核 RDMA 资源的进程（`NDKPing.sys` 的 `0xCE` 教训）。
