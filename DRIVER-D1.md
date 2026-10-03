@@ -1,0 +1,115 @@
+# DRIVER-D1 — Windows 原生 NVMe-oF 内核驱动（StorPort 虚拟微型端口）
+
+> 目标：**让 NVMe-oF 的盘由内核驱动直接呈现为 Windows 原生磁盘** —— 不经用户态进程、不经 iSCSI 桥。
+> 这是"Windows 原生 NVMe-oF"在这台机器上唯一可能的形态（见 §1 的实测依据）。
+
+---
+
+## 1. 为什么必须自研：实测依据（2026-10-04）
+
+| 检查项 | 实测结果 |
+|---|---|
+| 系统 | Windows 11 专业工作站版 **25H2**，Build **26200.9457** |
+| `nvmeof.sys` | **不存在** |
+| `nvmf.sys` | **不存在** |
+| `stornvme.sys` / `storport.sys` | 存在（325 KB / 2569 KB） |
+
+**微软的原生 NVMe-oF initiator 只随 Windows Server 2025 提供**；Win11 25H2 上没有可挂接的 NVMe-oF
+传输层（没有 `nvmeof.sys`/`nvmf.sys` 可供注册）。因此"原生"= **我们自己写一个 StorPort 微型端口**，
+它上接 Windows 存储栈（于是对系统而言就是一块原生磁盘），下说 NVMe-oF。
+
+---
+
+## 2. 架构
+
+```
+   Windows 存储栈（分区/文件系统/卷）
+              │  SRB（SCSI 请求块）
+   ┌──────────▼──────────────────────────────────────┐
+   │  nvmeofnd.sys  —— StorPort 虚拟微型端口（我们写） │
+   │   · StorPortInitialize / VirtualDevice 模型      │
+   │   · SRB ←→ NVMe 命令 翻译（Read/Write/Flush…）    │
+   │   · NVMe-oF 协议：fabrics Connect / AdminQ / I/OQ │
+   └──────────┬──────────────────────────────────────┘
+              │  我们的内核 NDK 通路（D0 已证明可用）
+   ┌──────────▼──────────────────────────────────────┐
+   │  NDKPI：Adapter / PD / CQ / QP / MR / Read/Write  │
+   └──────────┬──────────────────────────────────────┘
+              │  RoCE（mlx4eth63 / CX3）
+        NVMe-oF target（Linux nvmet，或我们的用户态 target）
+```
+
+**为什么用 StorPort 虚拟微型端口**：它是微软为"没有真实硬件的存储设备"（如 iSCSI/虚拟盘）提供的
+标准模型 —— 系统会把它当作一块正常磁盘挂载、分区、格式化，不需要我们碰卷管理。
+
+---
+
+## 3. 复用地图（不重写已经验证过的东西）
+
+| 已证明的成果 | 在 D1 中的用途 |
+|---|---|
+| **D0：内核 NDK 全链路**（适配器/PD/CQ/QP/Listener/Connector + 连接 + 私有数据 + **RDMA Read 逐字节一致**） | D1 的数据面地基，直接复用 |
+| D0 的 MR 用法：`IoAllocateMdl` + `MmProbeAndLockPages` + `NdkCreateMr` + `NdkRegisterMr` + token | NVMe-oF 的 SGL/数据缓冲 |
+| **D2：用户态 NVMe-oF 协议机**（fabrics Connect、AdminQ、Identify、I/O 队列、**Discovery、DH-HMAC-CHAP**） | D1 的协议逻辑蓝本，逐段移植 |
+| D2：`f5_interop -target`（我们的 target）与 Linux `nvmet` | D1 的**对端**（用于验证） |
+| `EVIDENCE-1TB.md` 的字节级对照方法（`fsutil file queryextents` + 对端裸读 + sha256） | D1 的验收方法 |
+
+---
+
+## 4. 分阶段与验收判据（每阶段都要有可复跑的证据）
+
+### D1.1 StorPort 骨架（先不碰网络）
+- **做**：虚拟微型端口初始化成功；用一块**内存盘**做 LUN；SRB 读写落到内存。
+- **验收**：`Get-Disk` 出现我们的磁盘（`FriendlyName` 含我们的标识、`BusType` 为我们的类型）；
+  分区→格式化→读写一个文件成功；**重启后仍能加载**。
+- **为什么先做这个**：把"存储栈这一侧"与"网络这一侧"解耦。StorPort 的失败模式（超时、复位、队列深度）
+  与 RDMA 的失败模式完全不同，混在一起调试会浪费大量时间。
+
+### D1.2 内核侧 NVMe-oF 协议核心
+- **做**：fabrics Connect（含 SGL 里的 rkey RDMA Read 回 1024 字节 Connect data）→ AdminQ → Identify
+  → I/O 队列建立。全部走 D0 的内核 NDK 通路。
+- **验收**：对端（我们的用户态 target 或 Linux `nvmet`）日志显示我们的内核驱动完成 Connect 与 I/OQ 建立；
+  我们侧打印出 `cntlid`、namespace 容量（`nsze`）、LBA 格式 —— 与对端 `id-ns` 一致。
+
+### D1.3 I/O 路径
+- **做**：SRB(Read/Write) → NVMe 命令 → RDMA 传输 → 完成 → SRB 完成。
+- **验收**：**逐字节对照**（`fsutil file queryextents` 取物理块 + 对端裸读 + sha256 一致），
+  与 `EVIDENCE-1TB.md` 同一标准。
+
+### D1.4 产品化必需项（D1 期间逐步补齐）
+- 卸载安全（**未等待的清理 = `0xCE`**，见 DRIVER-D0 §22）；
+- 多队列（NVMe-oF 每 queue 一个 QP）；
+- 超时/重连/控制器复位（StorPort 会要求复位，必须实现）；
+- 认证（DH-HMAC-CHAP，用户态已实现）；
+- 签名与安装包。
+
+---
+
+## 5. 已经付过学费的坑（**不要在 D1 重犯**）
+
+均出自 DRIVER-D0（每条都有转储或实测证据）：
+
+1. **手工构建内核驱动会静默丢掉 WDK 默认开关** → 必须显式 `/guard:cf` + `/GUARD:CF`，否则 CFG 函数表为空，
+   提供程序回调我们时直接 fast-fail 蓝屏（**4 次**）。
+2. **异步完成上下文绝不能放栈上** → 迟到的完成会写失效栈地址（`0x7E`，**1 次**）。
+3. **`STATUS_PENDING` 不是失败** —— 异步接口返回 pending 是正常契约。我曾把它当错误，改掉了唯一能工作的
+   accept 次序，白绕数轮。
+4. **创建类 NDKPI 接口的对象经完成回调的 `Object` 传出**（`e->X = c.Object`）；用错签名会"成功但对象为 NULL"。
+5. **`NdkRegisterMr` 的 `Flags` 决定远端能否读写**：被读方 `ALLOW_REMOTE_READ`(0x2)，落地方 `ALLOW_LOCAL_WRITE`(0x1)。
+   传 0 会在完成时回 `0xC0000005`。
+6. **私有数据（两段式）**：先查长度、**再按 announced 长度取**；传缓冲区大小会 `SUCCESS + len=0`**静默丢数据**。
+   且必须在 **Accept 之前**读。
+7. **accept 必须与客户端挂起的 connect 并发**（在连接事件回调里投递）。
+8. **同一 `.sys` 文件不能加载第二次**（`sc start` 回误导性的 exit 2）→ 每次运行用唯一文件名。
+9. **不在 `DriverUnload` 里做"未等待的清理"**（`0xCE`）。
+10. **不强杀持有内核 RDMA 资源的进程**（`NDKPing.sys` 的 `0xCE` 教训）。
+11. **改动效果必须读回来才算改动** —— 我有两次编辑静默失配（here-string 的 LF vs 文件 CRLF），
+    结果"以为改了、其实没改"；并且**不要无条件打印"已完成"**。
+12. **"不可能为真"的输出要第一优先查** —— `qp` 与 `cq` 打印出同一地址时，根因是多删了一行 `Step3Start(&c);`。
+
+---
+
+## 6. 立即的下一步
+
+**D1.1**：写 `src/driver/nvmeofnd.c` —— StorPort 虚拟微型端口骨架 + 内存 LUN，构建、签名、加载，
+用 `Get-Disk` 看到我们自己的磁盘。**先把存储栈这一侧跑通，再接通网络。**
