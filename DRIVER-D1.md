@@ -113,3 +113,51 @@
 
 **D1.1**：写 `src/driver/nvmeofnd.c` —— StorPort 虚拟微型端口骨架 + 内存 LUN，构建、签名、加载，
 用 `Get-Disk` 看到我们自己的磁盘。**先把存储栈这一侧跑通，再接通网络。**
+
+---
+
+## 38. D1.1 进展：StorPort 虚拟微型端口**已构建并加载**，但 StorPort 不调用 `HwFindAdapter`
+
+### 已完成
+
+- **`src/driver/nvmeofnd.c`**：StorPort 虚拟微型端口（RAM LUN 48 MiB）。接口全部从
+  `storport.h`（WDK 10.0.26100.0）读出后使用：`HW_INITIALIZATION_DATA` 字段表、`SCSI_REQUEST_BLOCK` 布局、
+  `StorPortInitialize` / `StorPortNotification` / `StorPortGetSystemAddress` / `StorPortSetDeviceQueueDepth`、
+  以及 `PORT_CONFIGURATION_INFORMATION.VirtualDevice`。
+- **构建成功**：`cl /kernel /guard:cf` + `link /GUARD:CF storport.lib` → `nvmeofnd.sys`（9 KB），测试证书签名。
+- **加载成功**：`sc create type= kernel group= 'SCSI Miniport'` → `STATE: 4 RUNNING`，**无蓝屏**（转储仍是 10/3）。
+
+### 关键发现（埋点实测，不是推测）
+
+驱动内把每一步写进 `HKLM\Software\NVMeoFProbe` 的 DWORD 值，加载后读回：
+
+```
+TraceDriverEntry      = 1
+TraceStorPortInitRc   = 0x00000000     ← StorPortInitialize 成功
+TraceHwStructSize     = 0xD0 (208)     ← 结构体大小正确
+TraceFindAdapter      未到达 ✗
+TraceInitialize       未到达 ✗
+TraceBusChange        未到达 ✗
+TraceStartIo          未到达 ✗
+磁盘数: 4（与加载前相同，我们的盘没有出现）
+```
+
+**结论**：`StorPortInitialize` 接受了驱动（返回 0），但 **StorPort 从不调用 `HwFindAdapter`**。
+原因是模型差异：**StorPort 是 PnP 驱动模型** —— 适配器的枚举由 **PnP 设备节点的到达**驱动，而不是像老的
+SCSIPORT 那样在 `StorPortInitialize` 里直接回调 `HwFindAdapter`。**裸 `sc create` 一个内核服务不会产生
+设备节点**，所以 FindAdapter 永远不被调用。`group= 'SCSI Miniport'` 也不是它需要的条件（试过了，无效）。
+
+> 这与内核 NDK 探针的经验是同一类：**驱动"加载成功"不等于"代码被调用"**。今天第二次靠埋点把
+> "跑起来了"和"被调用了"区分开（第一次是 NDK 的 `WskControlClient`）。
+
+### 下一步（D1.2）
+
+要让 FindAdapter 被调用，必须有设备节点，标准有两条路：
+
+1. **INF + 根枚举设备**：写 `nvmeofnd.inf`（存储适配器类、根枚举硬件 ID），
+   `pnputil /add-driver nvmeofnd.inf /install` 安装，再用 **`devcon install nvmeofnd.inf root\nvmeofnd`**
+   创建根设备节点（`devcon.exe` 来自 WDK Tools，本机尚未确认存在）。
+2. **软件设备（推荐，不依赖 devcon）**：写一个小用户态程序调用 **`SwDeviceCreate`**（`swdevice.h`），
+   用与 INF 匹配的硬件 ID 创建软件设备节点 —— 这是现代 Windows 上创建无硬件设备的文档化方式。
+
+两条路都需要 **INF 包**（驱动签名 + 类安装）。D1.2 就从写 INF 与软件设备创建工具开始。
