@@ -5,6 +5,19 @@
    option names  : -S / -C
 
 == case 1: connect with the shared host key (the target requires auth)
-could not add new controller: failed to write to nvme-fabrics device
-failed to connect: failed to write to nvme-fabrics device
-  [FAIL] nvme connect with the correct key FAILED - the exchange did not complete
+  [ok] nvme connect succeeded with DH-HMAC-CHAP
+  [ok] device /dev/nvme2n1 (serial NDVMEOF...) - our target, not a real disk
+   [ 7223.877548] nvme nvme2: qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048
+   [ 7226.959797] nvme nvme2: qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048
+   [ 7262.269271] nvme nvme2: qid 0: authenticated with hash hmac(sha256) dhgroup ffdhe2048
+  [ok] the kernel host logged the authentication (see above)
+
+== case 2: write / flush / read back over the authenticated controller
+  [ok] CMP: identical (65536 bytes written, flushed and read back)
+
+== case 4: bidirectional (host key + controller key)
+  [ok] bidirectional connect succeeded - the host verified the target's response
+  [ok] CMP: identical over the bidirectional controller
+  [ok] disconnected
+
+RESULT: PASS - a Linux host authenticated to our target and moved data
