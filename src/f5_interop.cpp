@@ -210,7 +210,21 @@ static uint8_t     g_targetDhGroup = nvmeof_auth::DHGROUP_2048;
 // away.  20 s is the value every existing suite was written against (F7 asserts that
 // a target whose host disappears exits on its own); a real controller reset needs
 // longer, so the interop battery raises it with -reconnectwait.
-static uint32_t    g_reconnectWaitMs = 20000;
+// 5 s, NOT 20 s - and the difference is not a tuning choice, it is a bug that cost most of
+// an afternoon.  This is how long a -target keeps LISTENING for the next controller once
+// the host has gone.  Every self-test suite waits 15-20 s for the target to exit and then
+// calls Kill(); with a 20 s default that race is lost every time, and force-killing a
+// process that owns an RDMA-CM listener leaves that CM state unusable - the NEXT suite's
+// connection is refused, with zero failed assertions to explain it (the client never got
+// far enough to assert anything) and nothing in the process list or netstat to look at.
+// The symptom appeared as "the RDMA suites fail when run back to back and pass on their
+// own", and it survived a reboot because each run recreates it.
+//
+// So the target must give up BEFORE the suite gives up on it.  The interop battery is the
+// case that genuinely needs a long wait (a controller reset reconnects on the kernel's own
+// schedule) and it already raises this with -reconnectwait, which is why lowering the
+// default is safe rather than a behaviour change for real hosts.
+static uint32_t    g_reconnectWaitMs = 5000;
 // ---- file-backed namespace (-nsfile) ----
 static const char* g_nsFile = nullptr;                 // the backing file, or null
 // -initiator only: move the entire namespace to/from these local files, over the
