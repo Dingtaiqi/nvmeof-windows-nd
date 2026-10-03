@@ -61,6 +61,14 @@ namespace nvmeof {
 // against us.  Zero here silently disables RDMA Read entirely.
 static const ULONG kReadLimit   = 16;
 
+// Publish the token UNSWAPPED instead of through ndWireKey().  This exists to answer one question
+// with one variable: the swapped form is measured-good for a Linux target's RDMA READ of our
+// connect data (that is why fabrics Connect passes), yet every command that needs the target to
+// RDMA WRITE into our buffer fails.  If publishing the raw token makes the writes land while
+// breaking Connect's read, the quirk applies to READ transactions only and the fix must choose the
+// key form per transaction direction.  Flipped by -rawwkey; default off so nothing changes silently.
+static bool g_publishRawRkey = false;
+
 // ===========================================================================
 //  The rkey this driver puts on the wire is byte-swapped - compensate here
 // ===========================================================================
@@ -179,7 +187,10 @@ struct Device {
         if (hr == ND_PENDING) hr = waitOverlapped(mr, kWaitMs);
         if (!ndOk(hr)) { char b[64]; printf("Register %s\n", ndStr(hr, b, sizeof(b))); return false; }
         // The token a peer uses: see the note on ndWireKey above.
-        rkey = ndWireKey(mr->GetRemoteToken());
+        const uint32_t rawToken = mr->GetRemoteToken();
+        rkey = g_publishRawRkey ? rawToken : ndWireKey(rawToken);
+        printf("    [key] raw=0x%08X wire=0x%08X published=0x%08X (%s)\n",
+               rawToken, ndWireKey(rawToken), rkey, g_publishRawRkey ? "RAW (-rawwkey)" : "swapped");
         return true;
     }
 

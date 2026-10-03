@@ -29,7 +29,7 @@
                                            ]
                            }
             },
-    "SavedAt":  "2026-10-04T00:53:14",
+    "SavedAt":  "2026-10-04T02:33:47",
     "Ip":  {
                "以太网 24":  [
                               {
@@ -63,9 +63,9 @@
             },
     "Routes":  [
                    {
-                       "InterfaceAlias":  "以太网 20",
-                       "RouteMetric":  50,
-                       "NextHop":  "192.168.1.1"
+                       "InterfaceAlias":  "以太网 25",
+                       "RouteMetric":  0,
+                       "NextHop":  "10.246.250.157"
                    }
                ]
 }

@@ -4656,6 +4656,7 @@ int main(int argc, char** argv) {
             initiatorCtrlKey = g_targetCtrlKey;
         }
         else if (strcmp(argv[i], "-authskip") == 0)                authSkip = true;
+else if (strcmp(argv[i], "-rawwkey") == 0)                 g_publishRawRkey = true;   // experiment, see nvmeof_rdma.h
         // -target only: back the namespace with a FILE instead of a pattern in memory.
         // The file is created at the namespace size if it does not exist, and FLUSH
         // writes it back, so a Linux host can mkfs/mount/keep things on it.

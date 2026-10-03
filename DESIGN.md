@@ -5221,3 +5221,47 @@ D0 内核线已经踩过同一个坑并留下证据（DRIVER-D0 §25）：`NdkRe
 
 注释里第 ③ 条写着：**CX3↔CX3（同一驱动两侧）两种形式都能工作**，所以本项目的全部自测都不可能暴露它；
 只有与 Linux 对端对接才会显形 —— 而 Linux 窗口只剩这一段时间。**这正是现在最该打的地方。**
+
+---
+
+## 31. ★★★ 方向 A 的真正病因是 **MTU 不对齐**：`[PASS] 12 → 40`，I/O 全通
+
+**证据**：`evidence/f5_dirA_after_mtu_alignment_2026-10-05.log`
+
+跑 `interop_link.ps1 -Action LowMtu`（文档第一步里就有这一步，**我先前跳过了它**）之后：
+
+```
+[PASS]=40  [FAIL]=2          （此前 [PASS]=12 [FAIL]=16）
+[PASS] inbound RDMA Write, 4096 B (Get Log Page LID 5 effects) - completion=yes nonzero_bytes=16
+[PASS] Identify Controller
+[PASS] WRITE accepted - 8 blocks x 512 B = 4096 B at slba 0
+[PASS] READ returned exactly the bytes WRITE sent - 0 of 4096 bytes differ
+[PASS] a pipelined I/O burst is answered in full - 32 of 32 commands answered
+[PASS] a parallel read across every queue returns each queue its own data - 4 of 4 queues
+```
+
+**我们自己的 Windows initiator 对真实 Linux `nvmet` 完成了 NVMe-oF 读写 I/O，并逐字节一致。**
+
+### 被推翻的假设（都留了证据，不再重走）
+
+| 假设 | 结果 |
+|---|---|
+| reap 丢弃乱序完成 | **成立并已修**（§28），但只解释了一部分（4 → 12） |
+| rkey 字节序"READ 用交换、WRITE 用原始" | **错**。`-rawwkey` 实验（`evidence/f5_dirA_rawwkey_experiment_negative_2026-10-05.log`）显示发布原始 token 后**连 fabrics Connect 都过不了**（`cntlid=0`，目标 READ 我们的 connect data 失败）。**可用的只有交换值这一种形式** |
+| 内存区域缺远端写权限 | **错**：`nvmeof_rdma.h:174-178` 标志是全的 |
+| 命令缓冲/偏移算错 | **错**：`cap + 24` 读写两侧一致 |
+
+**真因**：**MTU 不对齐**。1024 B 的响应能塞进响应胶囊（不经过 SGL），所以小请求看起来一切正常；
+**4096 B 的传输必须真正走 SGL/分片，MTU 不匹配就在这里断掉** —— 这正是 `f5_interop.cpp` 第 ~1339 行
+注释写的那句 "what made this data arrive at all was matching the peer's MTU" 的含义。**文档里已有的步骤，
+跳过它就要用几轮实验去重新发现它。教训：先照文档把环境对齐，再动协议代码。**
+
+### 剩余 2 项（与协议无关，是能力断言）
+
+```
+[FAIL] the controller advertises deallocate/write-zeroes ... oncs=0x002C dsm=1 write-zeroes=1 compare=0
+[FAIL] the namespace advertises thin provisioning ... nsfeat=0x12 thin=0 dlfeat=0 npdg=7
+```
+
+两者都与**命名空间所指向的设备**有关 —— 当前导出的是**内存盘 `/dev/ram0`**（ramdisk 本来就不支持
+thin provisioning / deallocate）。**下一步用 1 TB 真盘验证**（任务 4），看这两项是否随之通过。
