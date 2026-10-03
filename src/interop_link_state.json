@@ -1,0 +1,71 @@
+﻿{
+    "Mtu":  {
+                "以太网 24":  {
+                               "Jumbo":  [
+                                             "4088"
+                                         ],
+                               "NlMtu":  4074,
+                               "Dhcp":  "Disabled",
+                               "RoceMax":  [
+                                               "2048"
+                                           ]
+                           },
+                "以太网 20":  {
+                               "Jumbo":  [
+                                             "1514"
+                                         ],
+                               "NlMtu":  1500,
+                               "Dhcp":  "Disabled",
+                               "RoceMax":  null
+                           },
+                "以太网 23":  {
+                               "Jumbo":  [
+                                             "4088"
+                                         ],
+                               "NlMtu":  4074,
+                               "Dhcp":  "Disabled",
+                               "RoceMax":  [
+                                               "2048"
+                                           ]
+                           }
+            },
+    "SavedAt":  "2026-10-04T00:53:14",
+    "Ip":  {
+               "以太网 24":  [
+                              {
+                                  "IPAddress":  "192.168.100.2",
+                                  "PrefixLength":  24
+                              }
+                          ],
+               "以太网 20":  [
+                              {
+                                  "IPAddress":  "192.168.1.2",
+                                  "PrefixLength":  24
+                              }
+                          ],
+               "以太网 23":  [
+                              {
+                                  "IPAddress":  "192.168.100.3",
+                                  "PrefixLength":  24
+                              }
+                          ]
+           },
+    "Dns":  {
+                "以太网 24":  [
+
+                           ],
+                "以太网 20":  [
+                               "192.168.1.1"
+                           ],
+                "以太网 23":  [
+
+                           ]
+            },
+    "Routes":  [
+                   {
+                       "InterfaceAlias":  "以太网 20",
+                       "RouteMetric":  50,
+                       "NextHop":  "192.168.1.1"
+                   }
+               ]
+}

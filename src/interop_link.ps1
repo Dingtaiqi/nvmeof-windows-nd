@@ -1,4 +1,4 @@
-﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # ===========================================================================
 #  interop_link.ps1 - put a LAN machine on the same L2 segment as a CX3 port,
@@ -260,17 +260,27 @@ function Invoke-Down([switch]$Quiet) {
     # reports a fault.  Verify the bindings came back and say so, because that
     # message is the one that looks alarming and it is the whole point of -Down.
     Start-Sleep -Seconds 2
+    Start-Sleep -Seconds 2
     $noTcp = @()
     foreach ($n in @($LanAdapter, $RdmaAdapter)) {
         $b = Get-NetAdapterBinding -Name $n -ComponentID ms_tcpip -ErrorAction SilentlyContinue
-        if ($b -and -not $b.Enabled) { $noTcp += $n }
+        if ($b -and -not $b.Enabled) {
+            # RE-ENABLE IT - do not merely report it.  On 2026-10-04 this branch printed
+            # "TCP/IP is still switched off on: 以太网 23" and left it that way: that adapter then had no
+            # protocol stack, New-NetIPAddress answered "Element not found", and only a restart could give
+            # the machine its RDMA test address back.  Reporting a fault the script itself created is not a
+            # rollback, and the LAN adapter is the one carrying the default route.
+            try { Enable-NetAdapterBinding -Name $n -ComponentID ms_tcpip -ErrorAction Stop } catch { }
+            Start-Sleep -Seconds 2
+            $b2 = Get-NetAdapterBinding -Name $n -ComponentID ms_tcpip -ErrorAction SilentlyContinue
+            if (-not $b2.Enabled) { $noTcp += $n }
+        }
     }
     if ($noTcp.Count -eq 0) {
         if (-not $Quiet) { Ok "  TCP/IP is enabled again on '$LanAdapter' and '$RdmaAdapter'" }
     } else {
-        Bad "  TCP/IP is still switched off on: $($noTcp -join ', ')"
+        Bad "  TCP/IP could NOT be re-enabled on: $($noTcp -join ', ') - this needs a restart"
     }
-
     # The address can only go back NOW.  While the NIC was a bridge member,
     # New-NetIPAddress on it failed silently - a bridge member carries no protocol
     # stack of its own - so restoring it before the bridge is gone restores nothing.
