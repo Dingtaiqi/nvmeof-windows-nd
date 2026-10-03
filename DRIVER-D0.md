@@ -352,3 +352,45 @@ status = WskProviderNpi.Dispatch->WskControlClient(
 **教训（写下来）**：手工 cl/link 构建内核驱动，会**静默丢掉 WDK 工程默认的一整套开关**
 （CFG、`/GS`、`/hotpatch`、`/guard:cf` 的链接标志……）。丢掉的那些**不会报错**，只会让驱动在
 别人（这里是提供程序）回调你的时候把整机打蓝。以后手工构建的驱动必须显式列出这些开关。
+
+---
+
+## 13. ★★★ D0 步骤 1 与步骤 2 **全部通过**（2026-10-03，实测，零失败）
+
+修好 CFG、并用测试证书给驱动签名之后（测试模式**要求驱动有签名**；F7 才允许完全未签名 —— 这两者
+的区别让 `577` 又出现了一次），探针一次跑通：
+
+```
+WskRegister                    = 0x00000000
+WskCaptureProviderNPI          = 0x00000000   client=FFFFCD89BDAF5CD0
+WskControlClient('NDKD')       = 0x00000000   Open=FFFFF8044578FB80  Close=FFFFF8044578FB30
+WskOpenNdkAdapter(v2.0, if36)  = 0x00000000   adapter=FFFFCD89BB9EA200
+
+NdkQueryAdapterInfo            = 0x00000000  (104 bytes of 104)
+  provider 2.0  vendor 0x02C9 device 0x1007
+  MaxRegistrationSize=17592186044415 MiB  MaxWindowSize=0 MiB  MaxTransferLength=1048576 KiB
+  MaxInboundReadLimit=16  MaxOutboundReadLimit=128  FRMRPageCount=511
+  MaxReadRequestSge=32  MaxInitiatorRequestSge=32  MaxReceiveRequestSge=32
+  MaxCqDepth=4194303  MaxInitiatorQueueDepth=16351  MaxReceiveQueueDepth=16351
+
+NdkCreatePd                    = 0x00000000  pd=FFFFCD89B3D6B210
+NdkCreateCq (receive, depth 64) = 0x00000000  cq=FFFFCD89708F3EC0
+NdkCreateCq (send, depth 64)    = 0x00000000  cq=FFFFCD89B4927520
+NdkCreateQp (16 recv / 16 send) = 0x00000000  qp=FFFFCD89B7FE38E0
+NdkCreateListener              = 0x00000000  listener=FFFFCD89B4358C40
+NdkCreateConnector             = 0x00000000  connector=FFFFCD89B3D48D20
+```
+
+**这是本项目第一次由我们自己的内核驱动打开 ND 适配器并建立 NDK 对象。** 三个修正是必要条件，缺一
+不可，而每一个都有独立证据：
+
+1. **`sizeof(结构体)` 而不是 `sizeof(指针)`**（§10）—— 否则 `WskControlClient('NDKD')` 回
+   `STATUS_INVALID_PARAMETER`；
+2. **`/guard:cf`**（§12）—— 否则提供程序回调我们时，CFG 函数表为空 → 整机 `0x139` 蓝屏；
+3. **测试证书签名**（本节）—— 测试模式**要求有签名**，未签名只在 F7 启动下放行。
+
+适配器能力与我们**用户态**测到的完全一致（MaxTransferLength 1 MiB、读限制 16/128、SGE 32），
+这从内核侧交叉验证了用户态那套代码一直在读同样的东西。
+
+**一个已知的小问题**：`sc stop` 没有让驱动停下（查询仍为 RUNNING），说明 `DriverUnload` 没被调用
+—— 探针在 DriverEntry 之后不再做任何事，所以无害，重启即清。D1 里必须解决（StorPort 驱动要能停）。
