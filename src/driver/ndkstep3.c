@@ -41,7 +41,30 @@
 
 static const ULONG kServerIf = 36;      // 192.168.100.2
 static const ULONG kClientIf = 41;      // 192.168.100.3
-static const USHORT kPort    = 18520;
+// The port is read from the service's Parameters key so a run can use a fresh one.  That is not
+// ceremony: sc stop does NOT unload this driver (the old instance keeps listening and holding its
+// port), so a second load on the same port answers NdkListen with 0xC0000043 STATUS_SHARING_VIOLATION.
+// Reboots are not a debugging tool on somebody's working machine, so the port moves instead.
+#define STEP3_DEFAULT_PORT 18520
+static USHORT kPort = STEP3_DEFAULT_PORT;
+
+static USHORT Step3ReadPort(void) {
+    UNICODE_STRING name, value;
+    RtlInitUnicodeString(&name, L"\\Registry\\Machine\\Software\\NVMeoFProbe");
+    RtlInitUnicodeString(&value, L"Port");
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    HANDLE h = NULL;
+    if (!NT_SUCCESS(ZwOpenKey(&h, KEY_READ, &oa))) return STEP3_DEFAULT_PORT;
+    UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 8];
+    ULONG len = 0;
+    NTSTATUS st = ZwQueryValueKey(h, &value, KeyValuePartialInformation, buf, sizeof(buf), &len);
+    ZwClose(h);
+    if (!NT_SUCCESS(st)) return STEP3_DEFAULT_PORT;
+    KEY_VALUE_PARTIAL_INFORMATION* info = (KEY_VALUE_PARTIAL_INFORMATION*)buf;
+    if (info->Type != REG_DWORD || info->DataLength < 4) return STEP3_DEFAULT_PORT;
+    return (USHORT)(*(ULONG*)info->Data);
+}
 
 static char   g_log[8192];
 static size_t g_len = 0;
@@ -154,7 +177,14 @@ typedef struct _STEP3_PRIV {
 
 static STEP3_PRIV g_serverPriv;
 static STEP3_PRIV g_clientPriv;
-static STEP3_PRIV g_receivedPriv;            // what the server read out of the client's request
+// The provider delivers private data through an _Inout_ length: the caller passes the CAPACITY and
+// the provider writes back the real size, returning STATUS_BUFFER_TOO_SMALL if 16 bytes were not
+// enough.  Measured: it answered 0xC0000023 with the real size 56, so this is a real buffer now, not
+// a struct the size of what we hoped to receive.
+static UCHAR    g_privBuf[256];
+static NTSTATUS g_serverAcceptStatus   = STATUS_SUCCESS;
+static NTSTATUS g_clientCompleteStatus = STATUS_SUCCESS;
+static NTSTATUS g_clientConnectStatus  = STATUS_SUCCESS;
 
 // ---------------------------------------------------------------------------
 //  The connect-event callback.  DISPATCH_LEVEL: queue and return, nothing else.
@@ -223,16 +253,24 @@ static VOID Step3AcceptWorker(PVOID ctx) {
     UNREFERENCED_PARAMETER(ctx);
 
     ULONG inLimit = 0, outLimit = 0;
-    ULONG privLen = sizeof(g_receivedPriv);
-    RtlZeroMemory(&g_receivedPriv, sizeof(g_receivedPriv));
+    // The provider delivers private data through an _Inout_ length: the caller passes the CAPACITY
+    // and gets back the real size.  Measured: with 16 bytes it answered 0xC0000023
+    // (STATUS_BUFFER_TOO_SMALL) and reported the real size as 56, so what arrives here is a real
+    // buffer, not a struct the size of what we hoped for.
+    ULONG privLen = sizeof(g_privBuf);
+    RtlZeroMemory(g_privBuf, sizeof(g_privBuf));
 
     NTSTATUS st = g_incoming->Dispatch->NdkGetConnectionData(g_incoming, &inLimit, &outLimit,
-                                                             &g_receivedPriv, &privLen);
-    logf("  server: NdkGetConnectionData           = 0x%08X  peerIn=%u peerOut=%u privLen=%u\r\n",
-         st, inLimit, outLimit, privLen);
-    logf("  server: peer private data              = magic=0x%08X rkey=0x%08X addr=0x%llX\r\n",
-         g_receivedPriv.Magic, g_receivedPriv.Rkey,
-         (unsigned long long)g_receivedPriv.Address);
+                                                             g_privBuf, &privLen);
+    logf("  server: NdkGetConnectionData           = 0x%08X  peerIn=%u peerOut=%u privLen=%u (capacity %u)\r\n",
+         st, inLimit, outLimit, privLen, (unsigned)sizeof(g_privBuf));
+    if (NT_SUCCESS(st)) {
+        STEP3_PRIV* pd = (STEP3_PRIV*)g_privBuf;
+        logf("  server: peer private data              = magic=0x%08X rkey=0x%08X addr=0x%llX\r\n",
+             pd->Magic, pd->Rkey, (unsigned long long)pd->Address);
+    } else {
+        logf("  server: peer private data              = NOT READ (0x%08X); step 4 needs it\r\n", st);
+    }
 
         // STATIC ON PURPOSE, and this is the fix for the 0x7E bugcheck this file caused.
     // NdkListen, NdkConnect, NdkCompleteConnect and NdkAccept are ASYNCHRONOUS: they can return
@@ -324,7 +362,8 @@ static VOID Step3Unload(PDRIVER_OBJECT driver) {
 }
 
 static void Step3Run(void) {
-    logf("ndkstep3: D0 step 3 - connect two NDK endpoints from one kernel driver\r\n\r\n");
+    kPort = Step3ReadPort();
+    logf("ndkstep3: D0 step 3 - connect two NDK endpoints from one kernel driver (port %u)\r\n\r\n", kPort);
 
     RtlZeroMemory(&g_wskClientDispatch, sizeof(g_wskClientDispatch));
     g_wskClientDispatch.Version = MAKE_WSK_VERSION(1, 0);
