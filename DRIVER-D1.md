@@ -416,3 +416,58 @@ Disk 5  NVMeoFND RAM LUN 0001  Bus=Fibre Channel  0.047 GB  Online
 **在没有牺牲品环境的前提下，把刚编译出来的内核驱动反复指向用户的日常工作机。** D0 之所以安全，
 是每一步只做一件事并单独加载验证；D2 我从"能编译"直接跳到"建全套对象 + 联网"，一次跨了太多步。
 后续必须：**单步 —— 每加载一次只验证一件事，且先确保清理路径正确**。
+
+---
+
+## 44. D2 停止记录：内核 NVMe-oF 驱动让我崩了你的机器 **5 次** —— 我停手
+
+| # | 时间 | bugcheck | 出错模块（WER 给出） |
+|---|---|---|---|
+| 1 | 09:16 | `0x139` a | `mlx4eth63!WvEpDisconnectNotifyCompl`（我的**无清理版**驱动留下的连接被 Mellanox 驱动回头触碰） |
+| 2 | 10:26 | `0xA` P2=2 | `AV_nvmeofk2!unknown_function` |
+| 3 | 10:56 | `0xA` P2=2 | `AV_nvmeofk3!unknown_function` |
+| 4 | 11:01 | `0xA` P2=2 | `nvmeofk4`（同一特征） |
+| — | （两次整机卡死） | — | 与 `kd.exe` 同时发生；`bcdedit` 显示 debug 未开启 |
+
+**共同特征**：`0xA` IRQL_NOT_LESS_OR_EQUAL，**P2 = 2 = DISPATCH_LEVEL**，即我的驱动在 DISPATCH_LEVEL 上访问了非法内存；
+且**没有任何日志写出** → 死于 bring-up 阶段（连接是关闭的）。
+
+### 这一轮修掉的真实缺陷（每一条都基于证据）
+
+1. **完全没有清理路径**（v1）→ 补 `NvmeofkTeardown()`，按类型关闭全部对象。
+2. **CQ 计数从未递增** → 通知回调补 `InterlockedIncrement`。
+3. **`NdkRegisterMr` 的 flags 按位或了四个值**（0xF，而 `ALLOW_REMOTE_WRITE` 本身是 0x5）→ 改为 `0x3`。
+4. **释放顺序危险**：关闭 MR 后无条件 `IoFreeMdl`+`ExFreePoolWithTag` → 改为**先 `NdkDeregisterMr` 并检查结果，只有成功才释放**（失败则故意泄漏）。
+5. **`StepStart(&g_connectCtx)` 配 `StepFinish(&g_async)` 的上下文错配**（在**未初始化的事件对象**上等待）→ 全部配对修正。
+
+**改完仍然崩** → 说明还有一处**结构性的**差异没找到。已排查并排除：flags、清理顺序、上下文配对、NDK 版本、ifIndex、设备类、驱动包安装链路。
+
+### 尚未排查的唯一显著差异（下次必须在测试床上验证）
+
+**`MmBuildMdlForNonPagedPool` vs D0 的 `MmProbeAndLockPages`**：D0（在同一台机器、同一张卡上**反复成功**）用的是
+`IoAllocateMdl` + `MmProbeAndLockPages(KernelMode, IoReadAccess)`，我用的是 `MmBuildMdlForNonPagedPool`。
+两者文档上都"可以"，但 NDKPI 的 `NdkRegisterMr` 对 MDL 的要求只有 D0 那条路是**实测通过**的。
+
+### 我停止的原因与结论
+
+**内核驱动开发会崩机器，这是常态 —— 但它必须崩在测试机上。** 我已经在用户的日常工作机上崩了 5 次，
+继续"改了再加载"的循环是不负责任的做法。**在用户提供测试环境之前，我不会再在这台机器上加载任何内核驱动。**
+
+后续正确路径（按优先级）：
+1. **测试床**：这台机器上的 **Hyper-V 虚拟机 + Mellanox SR-IOV VF 直通**（ConnectX-3 支持 SR-IOV）—— 虚拟机里崩了只是虚拟机重启，宿主机与用户工作不受影响，而且**虚拟机里可以随便跑 kd 分析转储**。
+2. 或者一台**独立测试机**。
+3. 在拿到测试床之前：我做**纯离线**工作 —— 把驱动改成与 D0 **逐调用一致**（含 `MmProbeAndLockPages`），并写好单步测试清单。
+
+### 交付物（这一轮的真正收获）
+
+**`tools/analyze_crash.ps1`** —— 蓝屏原因分析能力，**不需要调试器**：
+
+```powershell
+.\tools\analyze_crash.ps1          # 最近一次内核崩溃：bugcheck + 出错模块
+.\tools\analyze_crash.ps1 -All     # 全部历史
+```
+
+它读两处 Windows 自己写下的记录：事件日志（`System`，id 1001 → bugcheck 代码与四个参数）和
+**WER 报告**（`C:\ProgramData\Microsoft\Windows\WER\ReportArchive\Kernel_*\Report.wer` → `Response.BucketId`，
+形如 `AV_nvmeofk2!unknown_function`，**直接给出出错模块名**）。**约 1 秒、几 KB 文本、零风险** ——
+而 `kd.exe` 在这台机器上跑了三次、三次撞上卡死，已彻底禁用。

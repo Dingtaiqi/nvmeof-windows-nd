@@ -432,14 +432,14 @@ static NTSTATUS createObjects(void)
     KeInitializeEvent(&g_cqEvent, NotificationEvent, FALSE);
     KeInitializeSpinLock(&g_cqLock);
 
-    StepStart(&g_connectCtx);
+    StepStart(&g_async);
     st = g_adapter->Dispatch->NdkCreatePd(g_adapter, complete, &g_async, &g_pd);
     st = StepFinish(st, &g_async, 10000);
     if (NT_SUCCESS(st) && g_pd == NULL) { g_pd = (NDK_PD*)g_async.object; }
     logf("NdkCreatePd        = 0x%08X pd=%p", st, g_pd);
     if (!NT_SUCCESS(st) || g_pd == NULL) { return STATUS_UNSUCCESSFUL; }
 
-    StepStart(&g_connectCtx);
+    StepStart(&g_async);
     st = g_adapter->Dispatch->NdkCreateCq(g_adapter, 64, cqNotification, &g_cqCount, NULL,
                                           complete, &g_async, &g_cq);
     st = StepFinish(st, &g_async, 10000);
@@ -450,7 +450,7 @@ static NTSTATUS createObjects(void)
     // NdkCreateQp lives on the PD dispatch, not the adapter's, and takes the
     // queue depths and SGE counts as well: (pd, recvCq, initCq, srq, recvDepth,
     // initDepth, recvSge, initSge, inlineData, complete, ctx, &qp).
-    StepStart(&g_connectCtx);
+    StepStart(&g_async);
     st = g_pd->Dispatch->NdkCreateQp(g_pd, g_cq, g_cq, NULL, 16, 16, 4, 4, 0,
                                      complete, &g_async, &g_qp);
     st = StepFinish(st, &g_async, 10000);
@@ -458,7 +458,7 @@ static NTSTATUS createObjects(void)
     logf("NdkCreateQp        = 0x%08X qp=%p", st, g_qp);
     if (!NT_SUCCESS(st) || g_qp == NULL) { return STATUS_UNSUCCESSFUL; }
 
-    StepStart(&g_connectCtx);
+    StepStart(&g_async);
     st = g_adapter->Dispatch->NdkCreateConnector(g_adapter, complete, &g_async, &g_connector);
     st = StepFinish(st, &g_async, 10000);
     if (NT_SUCCESS(st) && g_connector == NULL) { g_connector = (NDK_CONNECTOR*)g_async.object; }
@@ -480,7 +480,7 @@ static NTSTATUS registerRegion(void)
     // The buffer is non-paged pool, so the MDL describes it directly.
     MmBuildMdlForNonPagedPool(g_mdl);
 
-    StepStart(&g_connectCtx);
+    StepStart(&g_async);
     st = g_pd->Dispatch->NdkCreateMr(g_pd, FALSE, complete, &g_async, &g_mr);
     st = StepFinish(st, &g_async, 10000);
     if (NT_SUCCESS(st) && g_mr == NULL) { g_mr = (NDK_MR*)g_async.object; }
@@ -491,7 +491,7 @@ static NTSTATUS registerRegion(void)
     // getting them wrong: with 0, the peer's RDMA access to this region fails with
     // 0xC0000005 and transfers 0 bytes.  The target must be able to READ the
     // Connect data and the Identify buffer we hand it through a keyed SGL.
-    StepStart(&g_connectCtx);
+    StepStart(&g_async);
     st = g_mr->Dispatch->NdkRegisterMr(g_mr, g_mdl, NVMEOFK_REGION_BYTES,
             NDK_MR_FLAG_ALLOW_LOCAL_WRITE | NDK_MR_FLAG_ALLOW_REMOTE_READ |
             NDK_MR_FLAG_ALLOW_REMOTE_WRITE | NDK_MR_FLAG_RDMA_READ_SINK,
@@ -578,7 +578,7 @@ static NTSTATUS connectToTarget(void)
     // NdkConnect takes the completion routine directly, and NDKPI has NO bind step: a
     // connector has its own implicit local endpoint, and D0 found that port 0 is what
     // makes the provider allocate it.
-    StepStart(&g_async);
+    StepStart(&g_connectCtx);
     st = g_connector->Dispatch->NdkConnect(g_connector, g_qp,
                                            (CONST PSOCKADDR)&local, sizeof(local),
                                            (CONST PSOCKADDR)&remote, sizeof(remote),
@@ -599,7 +599,7 @@ static NTSTATUS connectToTarget(void)
          (peerDataLen >= 2) ? *(USHORT*)peerData : 0,
          (peerDataLen >= 4) ? *(USHORT*)(peerData + 2) : 0);
 
-    StepStart(&g_async);
+    StepStart(&g_connectCtx);
     st = g_connector->Dispatch->NdkCompleteConnect(g_connector, NULL, NULL, requestComplete, &g_connectCtx);
     st = StepFinish(st, &g_connectCtx, 20000);
     logf("NdkCompleteConnect = 0x%08X", st);
@@ -772,6 +772,8 @@ static void closeDone(PVOID context, NTSTATUS status)
 }
 
 static BOOLEAN g_tornDown = FALSE;
+static BOOLEAN g_regionSafeToFree = FALSE;   // set only when the MR really deregistered
+static BOOLEAN g_mrRegistered     = FALSE;   // mirrors the register call result for logging
 
 
 static void NvmeofkTeardown(void)
@@ -781,23 +783,49 @@ static void NvmeofkTeardown(void)
     }
     g_tornDown = TRUE;
 
-    // NdkCloseObject takes the OBJECT HEADER and is the first member of each typed
-    // dispatch, so each object is closed through its own dispatch.  D0 never closed
-    // anything at all - which is exactly the hole this function exists to fill.
-    if (g_connector != NULL) { StepStart(&g_shared); (void)g_connector->Dispatch->NdkCloseConnector(&g_connector->Header, closeDone, &g_shared); (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_connector = NULL; }
-    if (g_qp        != NULL) { StepStart(&g_shared); (void)g_qp->Dispatch->NdkCloseQp(&g_qp->Header, closeDone, &g_shared);               (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_qp = NULL; }
-    if (g_cq        != NULL) { StepStart(&g_shared); (void)g_cq->Dispatch->NdkCloseCq(&g_cq->Header, closeDone, &g_shared);               (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_cq = NULL; }
-    if (g_mr        != NULL) { StepStart(&g_shared); (void)g_mr->Dispatch->NdkCloseMr(&g_mr->Header, closeDone, &g_shared);               (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_mr = NULL; }
-    if (g_pd        != NULL) { StepStart(&g_shared); (void)g_pd->Dispatch->NdkClosePd(&g_pd->Header, closeDone, &g_shared);               (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_pd = NULL; }
+    // ORDER MATTERS, and the previous version got it wrong in the way that WER
+    // recorded as AV_nvmeofk2!unknown_function:
+    //   * the MR is DEREGISTERED first and the result is checked.  Closing the MR
+    //     and then freeing the MDL and the pool block unconditionally means that if
+    //     the close had not really completed, the HCA still had the region
+    //     registered and the next access to it faulted at DISPATCH_LEVEL.
+    //   * if the deregister does not succeed the backing memory is deliberately NOT
+    //     freed.  A leaked allocation is a far better outcome than a bugcheck.
+    if (g_mr != NULL) {
+        NTSTATUS drc;
+        StepStart(&g_shared);
+        drc = g_mr->Dispatch->NdkDeregisterMr(g_mr, closeDone, &g_shared);
+        drc = StepFinish(drc, &g_shared, 5000);
+        logf("NdkDeregisterMr   = 0x%08X", drc);
+        if (NT_SUCCESS(drc)) {
+            g_regionSafeToFree = TRUE;
+        } else {
+            logf("!! deregister failed: the region will NOT be freed (leak on purpose)");
+        }
+        StepStart(&g_shared);
+        (void)g_mr->Dispatch->NdkCloseMr(&g_mr->Header, closeDone, &g_shared);
+        (void)StepFinish(STATUS_PENDING, &g_shared, 5000);
+        g_mr = NULL;
+    }
 
-    if (g_mdl != NULL) {
-        IoFreeMdl(g_mdl);
-        g_mdl = NULL;
+    if (g_connector != NULL) { StepStart(&g_shared); (void)g_connector->Dispatch->NdkCloseConnector(&g_connector->Header, closeDone, &g_shared); (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_connector = NULL; }
+    if (g_qp        != NULL) { StepStart(&g_shared); (void)g_qp->Dispatch->NdkCloseQp(&g_qp->Header, closeDone, &g_shared);                   (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_qp = NULL; }
+    if (g_cq        != NULL) { StepStart(&g_shared); (void)g_cq->Dispatch->NdkCloseCq(&g_cq->Header, closeDone, &g_shared);                   (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_cq = NULL; }
+    if (g_pd        != NULL) { StepStart(&g_shared); (void)g_pd->Dispatch->NdkClosePd(&g_pd->Header, closeDone, &g_shared);                   (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_pd = NULL; }
+
+    if (g_regionSafeToFree) {
+        if (g_mdl != NULL) {
+            IoFreeMdl(g_mdl);
+            g_mdl = NULL;
+        }
+        if (g_region != NULL) {
+            ExFreePoolWithTag(g_region, NVMEOFK_TAG);
+            g_region = NULL;
+        }
+    } else if (g_region != NULL) {
+        logf("region %p intentionally leaked (MR was not safely deregistered)", g_region);
     }
-    if (g_region != NULL) {
-        ExFreePoolWithTag(g_region, NVMEOFK_TAG);
-        g_region = NULL;
-    }
+
     if (g_adapter != NULL) {
         g_ndk.WskCloseNdkAdapter(g_wskProvider.Client, g_adapter);
         g_adapter = NULL;
@@ -807,7 +835,7 @@ static void NvmeofkTeardown(void)
         RtlZeroMemory(&g_wskProvider, sizeof(g_wskProvider));
     }
     WskDeregister(&g_registration);
-    logf("teardown complete: every NDK object closed, region freed, WSK released");
+    logf("teardown complete");
 }
 
 // Is the network part of this driver wanted at all?  Default NO: a bare load then
