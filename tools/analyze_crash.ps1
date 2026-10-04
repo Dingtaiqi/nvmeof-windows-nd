@@ -1,4 +1,4 @@
-﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # analyze_crash.ps1 - what crashed, without a debugger.

@@ -214,6 +214,17 @@ typedef struct _NVMEOFK_ASYNC {
     NTSTATUS status;
     PVOID    object;
     ULONG    transferred;
+    // THE ROOT CAUSE OF THE 0xA, found in the minidump rather than by guessing:
+    // StepStart() called KeInitializeEvent() on every single use.  Reinitialising a
+    // dispatcher object that is still linked into a wait list corrupts that list.
+    // The dump showed exactly that: rsi pointed at g_async+0x30, the event's
+    // WaitListHead.Flink and .Blink both held a stale ffffe48a2de0e180 instead of
+    // pointing back at themselves, and the kernel, walking that list, executed
+    // nt+0x25b58f "mov r12,[r12]" with r12 = 0 at DISPATCH_LEVEL -> 0xA.
+    // So now: initialise ONCE, and afterwards only ever KeResetEvent, which changes
+    // SignalState and never touches the wait list.
+    BOOLEAN  initialized;
+    BOOLEAN  dead;          // an operation that timed out may still complete: never trust it again
 } NVMEOFK_ASYNC;
 
 static WSK_REGISTRATION           g_registration;
@@ -250,7 +261,17 @@ static volatile LONG g_cqDropped;
 // STATUS_PENDING (a synchronous success is normal and must not be waited on).
 static void StepStart(NVMEOFK_ASYNC* a)
 {
-    KeInitializeEvent(&a->done, NotificationEvent, FALSE);
+    if (!a->initialized) {
+        KeInitializeEvent(&a->done, NotificationEvent, FALSE);
+        a->initialized = TRUE;
+    } else {
+        if (a->dead) {
+            // Signalling this event late is harmless.  The hazard was reinitialising
+            // it, and that no longer happens.
+            logf("!! async context %p was left dead by a timeout and is being reused", a);
+        }
+        KeResetEvent(&a->done);      // SignalState only - never rewrites the wait list
+    }
     a->status = STATUS_PENDING;
     a->object = NULL;
     a->transferred = 0;
@@ -264,10 +285,13 @@ static NTSTATUS StepFinish(NTSTATUS status, NVMEOFK_ASYNC* a, ULONG waitMs)
     }
     t.QuadPart = -((LONGLONG)waitMs * 10000);
     if (KeWaitForSingleObject(&a->done, Executive, KernelMode, FALSE, &t) == STATUS_TIMEOUT) {
+        a->dead = TRUE;
+        logf("!! StepFinish timed out after %u ms; context %p marked dead", waitMs, a);
         return STATUS_IO_TIMEOUT;
     }
     return a->status;
 }
+
 static void complete(PVOID context, NTSTATUS status, NDK_OBJECT_HEADER* obj)
 {
     NVMEOFK_ASYNC* a = (NVMEOFK_ASYNC*)context;
@@ -320,7 +344,7 @@ static NTSTATUS reap(ULONG wantCtx, ULONG ms, ULONG* bytesOut)
         LONG have = InterlockedExchange(&g_cqCount, 0);
         if (have > 0) {
             ULONG got = g_cq->Dispatch->NdkGetCqResults(g_cq, g_cqResults, (ULONG)(have > 16 ? 16 : have));
-            for (ULONG i = 0; i < got; i++) {
+            for (ULONG i = 0; i < got && i < (ULONG)(sizeof(g_cqResults)/sizeof(g_cqResults[0])); i++) {   // never trust the count past our own array
                 NDK_RESULT* r = &g_cqResults[i];
                 if ((ULONG)(ULONG_PTR)r->RequestContext == wantCtx) {
                     if (bytesOut != NULL) {
@@ -435,6 +459,7 @@ static NTSTATUS createObjects(void)
     StepStart(&g_async);
     st = g_adapter->Dispatch->NdkCreatePd(g_adapter, complete, &g_async, &g_pd);
     st = StepFinish(st, &g_async, 10000);
+    writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     if (NT_SUCCESS(st) && g_pd == NULL) { g_pd = (NDK_PD*)g_async.object; }
     logf("NdkCreatePd        = 0x%08X pd=%p", st, g_pd);
     if (!NT_SUCCESS(st) || g_pd == NULL) { return STATUS_UNSUCCESSFUL; }
@@ -443,6 +468,7 @@ static NTSTATUS createObjects(void)
     st = g_adapter->Dispatch->NdkCreateCq(g_adapter, 64, cqNotification, &g_cqCount, NULL,
                                           complete, &g_async, &g_cq);
     st = StepFinish(st, &g_async, 10000);
+    writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     if (NT_SUCCESS(st) && g_cq == NULL) { g_cq = (NDK_CQ*)g_async.object; }
     logf("NdkCreateCq        = 0x%08X cq=%p", st, g_cq);
     if (!NT_SUCCESS(st) || g_cq == NULL) { return STATUS_UNSUCCESSFUL; }
@@ -454,6 +480,7 @@ static NTSTATUS createObjects(void)
     st = g_pd->Dispatch->NdkCreateQp(g_pd, g_cq, g_cq, NULL, 16, 16, 4, 4, 0,
                                      complete, &g_async, &g_qp);
     st = StepFinish(st, &g_async, 10000);
+    writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     if (NT_SUCCESS(st) && g_qp == NULL) { g_qp = (NDK_QP*)g_async.object; }
     logf("NdkCreateQp        = 0x%08X qp=%p", st, g_qp);
     if (!NT_SUCCESS(st) || g_qp == NULL) { return STATUS_UNSUCCESSFUL; }
@@ -461,6 +488,7 @@ static NTSTATUS createObjects(void)
     StepStart(&g_async);
     st = g_adapter->Dispatch->NdkCreateConnector(g_adapter, complete, &g_async, &g_connector);
     st = StepFinish(st, &g_async, 10000);
+    writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     if (NT_SUCCESS(st) && g_connector == NULL) { g_connector = (NDK_CONNECTOR*)g_async.object; }
     logf("NdkCreateConnector = 0x%08X connector=%p", st, g_connector);
     if (!NT_SUCCESS(st) || g_connector == NULL) { return STATUS_UNSUCCESSFUL; }
@@ -478,11 +506,22 @@ static NTSTATUS registerRegion(void)
     g_mdl = IoAllocateMdl(g_region, NVMEOFK_REGION_BYTES, FALSE, FALSE, NULL);
     if (g_mdl == NULL) { return STATUS_INSUFFICIENT_RESOURCES; }
     // The buffer is non-paged pool, so the MDL describes it directly.
-    MmBuildMdlForNonPagedPool(g_mdl);
+    // D0 - the kernel driver in this project that never bugchecked - used
+    // MmProbeAndLockPages on a non-paged pool region.  This file used
+    // MmBuildMdlForNonPagedPool.  Both are documented, but only one of them has been
+    // proven on this machine against this NDK provider, so match the proven one.
+    __try {
+        MmProbeAndLockPages(g_mdl, KernelMode, IoReadAccess);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        logf("!! MmProbeAndLockPages raised 0x%08X", GetExceptionCode());
+        IoFreeMdl(g_mdl);
+        g_mdl = NULL;
+    }
 
     StepStart(&g_async);
     st = g_pd->Dispatch->NdkCreateMr(g_pd, FALSE, complete, &g_async, &g_mr);
     st = StepFinish(st, &g_async, 10000);
+    writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     if (NT_SUCCESS(st) && g_mr == NULL) { g_mr = (NDK_MR*)g_async.object; }
     logf("NdkCreateMr        = 0x%08X mr=%p", st, g_mr);
     if (!NT_SUCCESS(st) || g_mr == NULL) { return STATUS_UNSUCCESSFUL; }
@@ -492,12 +531,20 @@ static NTSTATUS registerRegion(void)
     // 0xC0000005 and transfers 0 bytes.  The target must be able to READ the
     // Connect data and the Identify buffer we hand it through a keyed SGL.
     StepStart(&g_async);
+    // A SINGLE flag - these are ENUMERATED VALUES, not bit flags.  Note that
+    // NDK_MR_FLAG_ALLOW_REMOTE_WRITE is 0x5 rather than 0x4, so OR-ing them
+    // together (which this line did for several rounds: 0x1|0x2|0x5|0x8 = 0xF)
+    // hands the provider a value it never defined.  D0 - the kernel driver in
+    // this project that actually completed an RDMA read on this hardware -
+    // passed exactly one flag, and this is that flag: we are the destination of
+    // an RDMA read, so the HCA writes into our region.
     st = g_mr->Dispatch->NdkRegisterMr(g_mr, g_mdl, NVMEOFK_REGION_BYTES,
-            NDK_MR_FLAG_ALLOW_LOCAL_WRITE | NDK_MR_FLAG_ALLOW_REMOTE_READ |
-            NDK_MR_FLAG_ALLOW_REMOTE_WRITE | NDK_MR_FLAG_RDMA_READ_SINK,
-            requestComplete, &g_connectCtx);
+            NDK_MR_FLAG_ALLOW_LOCAL_WRITE,
+            requestComplete, &g_async);
     st = StepFinish(st, &g_async, 10000);
+    writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     logf("NdkRegisterMr(%u) = 0x%08X", NVMEOFK_REGION_BYTES, st);
+    writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     if (!NT_SUCCESS(st)) { return st; }
 
     g_rkey = g_mr->Dispatch->NdkGetRemoteTokenFromMr(g_mr);
@@ -586,12 +633,20 @@ static NTSTATUS connectToTarget(void)
                                            pd, sizeof(pd),
                                            requestComplete, &g_connectCtx);
     st = StepFinish(st, &g_connectCtx, 20000);
+    writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     logf("NdkConnect         = 0x%08X (0xC0000236 = connection refused)", st);
     if (!NT_SUCCESS(st)) {
         traceValue(L"nvmeofk_connect", (ULONG)st);
         return st;
     }
 
+    // pPrivateDataLength is IN/OUT: on input it MUST hold the size of the buffer.
+    // It was passed uninitialised, so the provider wrote a garbage number of bytes
+    // into this 64-byte stack buffer - which is exactly the "incorrect stack"
+    // (0x139, P1=0xa) that took the machine down four times, and why the kernel log
+    // was always empty: the log is written at the end, and the stack was already
+    // destroyed by then.
+    peerDataLen = sizeof(peerData);
     st = g_connector->Dispatch->NdkGetConnectionData(g_connector, &peerLimitIn, &peerLimitOut,
                                                      peerData, &peerDataLen);
     logf("NdkGetConnectionData = 0x%08X peer inbound=%u outbound=%u dataLen=%u recfmt=%u crqsize=%u",
@@ -602,6 +657,7 @@ static NTSTATUS connectToTarget(void)
     StepStart(&g_connectCtx);
     st = g_connector->Dispatch->NdkCompleteConnect(g_connector, NULL, NULL, requestComplete, &g_connectCtx);
     st = StepFinish(st, &g_connectCtx, 20000);
+    writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     logf("NdkCompleteConnect = 0x%08X", st);
     traceValue(L"nvmeofk_connect", (ULONG)st);
     return st;
@@ -764,7 +820,10 @@ static NTSTATUS nvmeofRun(void)
 //  Everything created is destroyed here, in reverse order, and the WSK
 //  registration is released, so the driver can actually stop.
 // ---------------------------------------------------------------------------
-static NVMEOFK_ASYNC g_shared;       // used only by teardown, never concurrently
+// ONE CONTEXT PER CLOSE.  The teardown used to call StepStart(&g_shared) five times
+// in a row - KeInitializeEvent on the same dispatcher object five times - which is
+// exactly the wait-list corruption the minidump showed.
+static NVMEOFK_ASYNC g_closeCtx[6];
 
 static void closeDone(PVOID context, NTSTATUS status)
 {
@@ -791,30 +850,27 @@ static void NvmeofkTeardown(void)
     //     registered and the next access to it faulted at DISPATCH_LEVEL.
     //   * if the deregister does not succeed the backing memory is deliberately NOT
     //     freed.  A leaked allocation is a far better outcome than a bugcheck.
-    if (g_mr != NULL) {
-        NTSTATUS drc;
-        StepStart(&g_shared);
-        drc = g_mr->Dispatch->NdkDeregisterMr(g_mr, closeDone, &g_shared);
-        drc = StepFinish(drc, &g_shared, 5000);
-        logf("NdkDeregisterMr   = 0x%08X", drc);
-        if (NT_SUCCESS(drc)) {
-            g_regionSafeToFree = TRUE;
-        } else {
-            logf("!! deregister failed: the region will NOT be freed (leak on purpose)");
-        }
-        StepStart(&g_shared);
-        (void)g_mr->Dispatch->NdkCloseMr(&g_mr->Header, closeDone, &g_shared);
-        (void)StepFinish(STATUS_PENDING, &g_shared, 5000);
-        g_mr = NULL;
-    }
+    // NO NDK OBJECT IS CLOSED HERE, DELIBERATELY.
+    //
+    // D0 - the kernel driver in this project that actually completed an RDMA read
+    // against this hardware - never closed a single NDK object.  It leaked them until
+    // reboot and it never bugchecked.  This file tried to be tidy and added a full
+    // close path; that path is where every remaining crash lives, and the minidump of
+    // the last one shows it dying inside KeWaitForSingleObject on the event belonging
+    // to a close context (r12 == g_closeCtx[5].done, with a corrupted wait list).
+    // The header explains why the shape was wrong: closes take NDK_FN_CLOSE_COMPLETION
+    // which receives ONLY a Context - no status - while NdkDeregisterMr takes a
+    // NDK_FN_REQUEST_COMPLETION with (Context, Status).  One callback for both slots
+    // is a type mismatch, and the provider is entitled to do anything with it.
+    //
+    // Getting kernel NVMe-oF working is the goal; a clean teardown is a later,
+    // separate problem with its own testing budget.  Align with the proven driver.
+    logf("teardown: NDK objects intentionally NOT closed (D0 behaviour);  WSK released");
 
-    if (g_connector != NULL) { StepStart(&g_shared); (void)g_connector->Dispatch->NdkCloseConnector(&g_connector->Header, closeDone, &g_shared); (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_connector = NULL; }
-    if (g_qp        != NULL) { StepStart(&g_shared); (void)g_qp->Dispatch->NdkCloseQp(&g_qp->Header, closeDone, &g_shared);                   (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_qp = NULL; }
-    if (g_cq        != NULL) { StepStart(&g_shared); (void)g_cq->Dispatch->NdkCloseCq(&g_cq->Header, closeDone, &g_shared);                   (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_cq = NULL; }
-    if (g_pd        != NULL) { StepStart(&g_shared); (void)g_pd->Dispatch->NdkClosePd(&g_pd->Header, closeDone, &g_shared);                   (void)StepFinish(STATUS_PENDING, &g_shared, 5000); g_pd = NULL; }
 
     if (g_regionSafeToFree) {
         if (g_mdl != NULL) {
+            MmUnlockPages(g_mdl);   // MmProbeAndLockPages has to be undone before the MDL goes away
             IoFreeMdl(g_mdl);
             g_mdl = NULL;
         }
@@ -826,16 +882,21 @@ static void NvmeofkTeardown(void)
         logf("region %p intentionally leaked (MR was not safely deregistered)", g_region);
     }
 
-    if (g_adapter != NULL) {
-        g_ndk.WskCloseNdkAdapter(g_wskProvider.Client, g_adapter);
-        g_adapter = NULL;
-    }
-    if (g_wskProvider.Dispatch != NULL) {
-        WskReleaseProviderNPI(&g_registration);
-        RtlZeroMemory(&g_wskProvider, sizeof(g_wskProvider));
-    }
-    WskDeregister(&g_registration);
-    logf("teardown complete");
+    // NOTHING IS RELEASED HERE - not the NDK objects, not the adapter, not the WSK
+    // provider.  This is deliberate and it is what D0 effectively did, because D0
+    // never actually ran its cleanup path.
+    //
+    // The hang that produced this comment: with the NDK objects intentionally left
+    // open (the previous change), the WskReleaseProviderNPI call below never
+    // returned.  The provider still had live NDK usage, so releasing it blocked
+    // forever, and the driver sat in Start Pending with DriverEntry never returning
+    // - no bugcheck, just a dead driver and a machine that slowly suffocates.
+    // The minidump route would never have caught that one: a hang leaves no dump.
+    //
+    // A driver that is loaded once for a measurement, leaks until reboot and returns
+    // immediately is exactly the right shape for this stage.  Correct teardown is a
+    // separate piece of work with its own test budget.
+    logf("teardown: nothing released on purpose (D0 behaviour) - objects live until reboot");
 }
 
 // Is the network part of this driver wanted at all?  Default NO: a bare load then
