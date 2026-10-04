@@ -220,3 +220,51 @@ HKR,, "VirtualDevice", %REG_DWORD%, 1
 2. **`Inf2Cat` 的 `DriverVer` 按 UTC 判定"未来日期"**：本机 UTC+8，本地 10/04 的 INF 会被判为未来
    （`22.9.7: DriverVer set to a date in the future`）→ 写**前一天**的日期即可。
 3. `Inf2Cat.exe` 在 `bin\<ver>\x86\`（大写 I），而 `devcon.exe` 在 `Tools\<ver>\x64\` —— **不在同一个目录里**。
+
+---
+
+## 40. D1.1 续：INF/设备链路全部就位，但 PnP 始终不加载驱动（problem 10）—— 已排除的假设清单
+
+### 现在确定的事实
+
+| 项 | 状态 |
+|---|---|
+| 驱动构建/签名 | ✅ `nvmeofnd.sys`，`signtool` 签成功 |
+| 作为服务加载 | ✅ `sc start` → RUNNING，映像可加载（`Get-AuthenticodeSignature` = Valid） |
+| INF + 签名目录 + `pnputil`/`devcon` 安装 | ✅ "Drivers installed successfully"，`Published Name: oem149/150/153.inf` |
+| 设备节点 | ✅ `ROOT\SCSIADAPTER\0001..0003`、`ROOT\HDC\0000`，名称正确显示 |
+| 设备硬件键内容 | ✅ `Service=<我们的驱动>`、`ClassGUID` 正确、**`VirtualDevice=1` 确实已写入** |
+| **设备启动** | ❌ **始终 problem 10 = `CM_PROB_FAILED_START`** |
+| **`HwFindAdapter`** | ❌ 从未被调用；用全新名字时**连 `DriverEntry` 都没跑**（埋点实证） |
+| 蓝屏 | 无（最新转储仍是 10/3） |
+
+### 已排除的假设（每一条都做过实验）
+
+1. ~~`StorPortInitialize` 参数错~~ → 返回 `0x00000000`，`HwInitializationDataSize = 0xD0` 正确。
+2. ~~需要 `SCSI Miniport` 组~~ → 加了组，无效。
+3. ~~只签 `.sys` 就够~~ → 不对：测试签名模式下 INF 驱动包**必须有签名过的 `.cat`**（`setupapi.dev.log`：
+   "Driver package does not contain a catalog file, and Code Integrity is in Test Signing mode. Error = 0xE000022F"）。已修。
+4. ~~`DriverVer` 写未来日期~~ → `Inf2Cat` 按 **UTC** 判定，本机 UTC+8，本地当天会被判未来 → 写前一天。已修。
+5. ~~`VirtualDevice` 写在软件键~~ → 已移入 `.HW` 段，**并实测确认它出现在设备硬件键里**（`...\Enum\ROOT\SCSIADAPTER\0001` 及
+   `0001\Device Parameters` 都有 `VirtualDevice=1`）—— **但仍 problem 10**，所以这不是唯一原因。
+6. ~~`AddService` 标志应为 `0x200`~~ → **错，`SPSVCINST_ASSOCSERVICE = 0x00000002`**（`0x200` 是
+   `NOCLOBBER_REQUIREDPRIVILEGES`）；用 0x200 会让安装直接失败并报
+   "No INF AddService directives contained the flag SPSVCINST_ASSOCSERVICE"。**最初写的 0x2 本来就是对的。**
+7. ~~设备类应为 `SCSIAdapter`~~ → 本机真正工作的 StorPort 微型端口（`storahci`/`stornvme`）在 **`HDC` 类
+   `{4D36E96A-E325-11CE-BFC1-08002BE10318}`**。改成 HDC 后设备节点变成 `ROOT\HDC\0000`，
+   **但仍是 problem 10** —— 也不是它。
+8. ~~手工往硬件键写 `VirtualDevice`~~ → `Enum` 键受保护，`reg add` 报成功但读回为空；不过 INF 的 `.HW` 段
+   已经把它写进去了（见 5）。
+
+### 下一轮要试的三件事（按性价比排序）
+
+1. **`devcon enable root\nvmeofndv`** —— 设备目前是 stopped 状态，可能只是需要显式启用（最便宜，先试）。
+2. **`StartType = 0`（boot）+ `ErrorControl = 3`**：参考 INF `stornvme.inf` 用的是 `%SERVICE_BOOT_START%` +
+   `%SERVICE_ERROR_CRITICAL%`，而我一直用 demand(3)/normal(1)。根枚举设备在启动时就会 start，若 PnP 假定
+   存储微型端口是 boot 启动，demand 可能让它找不到已启动的服务。
+3. **拿到官方样例 INF 原文**（`Windows-driver-samples/storage/storport/virtualminiport/virtualminiport.inf`）逐段对照 ——
+   `raw.githubusercontent.com` 被挡，改试 `learn.microsoft.com` 或其它镜像。
+   **这一招在本项目里每次都奏效**（NDKD 的 `sizeof(struct)`、MTU 对齐、rkey 方向都是靠读能工作的实现解决的）。
+
+> 另一条备选路线（若 1–3 都不通）：**放弃 StorPort，改走 `SwDeviceCreate` 软件设备 + 自写 FDO**，
+> 或先做**纯用户态可见的成果**（`f5_interop -target` 常驻 + iSCSI 桥路线的产品化），把盘符作为后续目标。
