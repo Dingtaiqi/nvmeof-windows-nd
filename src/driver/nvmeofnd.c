@@ -42,6 +42,12 @@
 #define NVMEOFND_OPC_READ6            0x08
 #define NVMEOFND_OPC_WRITE6           0x0A
 #define NVMEOFND_OPC_REPORT_LUNS      0xA0
+#define NVMEOFND_OPC_MODE_SENSE6     0x1A
+#define NVMEOFND_OPC_START_STOP_UNIT 0x1B
+#define NVMEOFND_OPC_VERIFY10        0x2F
+#define NVMEOFND_OPC_MODE_SENSE10    0x5A
+#define NVMEOFND_OPC_SYNC_CACHE16    0x91
+#define NVMEOFND_OPC_SERVICE_IN16    0x9E
 #define NVMEOFND_STAT_GOOD            0x00
 #define NVMEOFND_STAT_CHECK_COND      0x02
 #define NVMEOFND_SENSE_ILLEGAL_REQ    0x05
@@ -70,6 +76,14 @@ typedef struct _NVMEOFND_EXTENSION {
     ULONGLONG Writes;
     ULONGLONG BytesIn;
     ULONGLONG BytesOut;
+    // SCSI I/O runs at DISPATCH_LEVEL, where ZwSetValueKey (PASSIVE only) fails silently.
+    // That is exactly why the first version of this driver looked like it received no
+    // commands at all while Windows was in fact reading INQUIRY and READ CAPACITY from it.
+    // Counters therefore live here and are published from the WMI SRB path, which is the
+    // one place StorPort calls the miniport at PASSIVE level.
+    ULONG   OpCount[256];
+    ULONG   TotalSrbs;
+    ULONGLONG IoBytes;
 } NVMEOFND_EXTENSION, *PNVMEOFND_EXTENSION;
 
 // ---------------------------------------------------------------------------
@@ -215,57 +229,62 @@ static BOOLEAN NvmeofndInitialize(PVOID DeviceExtension)
 // ---------------------------------------------------------------------------
 //  HwStartIo - one SCSI command at a time, answered from the RAM LUN.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  Counters are published from here: the WMI path is the one entry point
+//  StorPort uses at PASSIVE_LEVEL, so registry writes are legal in it and
+//  illegal (and silently lost) in the I/O path below.
+// ---------------------------------------------------------------------------
+static VOID NvmeofndPublishStats(PVOID DeviceExtension)
+{
+    PNVMEOFND_EXTENSION ext = (PNVMEOFND_EXTENSION)DeviceExtension;
+    static const UCHAR interesting[] = {
+        0x00, 0x03, 0x12, 0x1A, 0x1B, 0x25, 0x28, 0x2A, 0x2F, 0x35,
+        0x5A, 0x88, 0x8A, 0x91, 0x9E, 0xA0
+    };
+    WCHAR name[32];
+    ULONG i;
+
+    NvmeofndTrace(L"StatTotal", ext->TotalSrbs);
+    NvmeofndTrace(L"StatReads", (ULONG)ext->Reads);
+    NvmeofndTrace(L"StatWrites", (ULONG)ext->Writes);
+    for (i = 0; i < sizeof(interesting) / sizeof(interesting[0]); i++) {
+        UCHAR op = interesting[i];
+        if (ext->OpCount[op] == 0) {
+            continue;
+        }
+        {   // build "StatOp_XX" by hand: no ntstrsafe dependency for nine characters
+            static const WCHAR hexd[] = L"0123456789ABCDEF";
+            name[0] = L'S'; name[1] = L't'; name[2] = L'a'; name[3] = L't';
+            name[4] = L'O'; name[5] = L'p'; name[6] = L'_';
+            name[7] = hexd[(op >> 4) & 0x0F];
+            name[8] = hexd[op & 0x0F];
+            name[9] = 0;
+            NvmeofndTrace(name, ext->OpCount[op]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  HwStartIo - the SCSI command set Windows actually uses against a disk.
+//  Every command the host may legally send has a case here; anything else is
+//  refused WITH sense data rather than silently, because a host that gets a
+//  bare failure retries forever.
+// ---------------------------------------------------------------------------
 static BOOLEAN NvmeofndStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
 {
-    NvmeofndTrace(L"TraceStartIo", 1);
-    {
-        static ULONG s_calls = 0;
-        s_calls++;
-        NvmeofndTrace(L"TraceStartIoCnt", s_calls);
-        NvmeofndTrace(L"TraceSrbFn",     (ULONG)Srb->Function);
-        NvmeofndTrace(L"TraceSrbLun",    ((ULONG)Srb->PathId << 16) | ((ULONG)Srb->TargetId << 8) | Srb->Lun);
-        NvmeofndTrace(L"TraceSrbCdbLen", Srb->CdbLength);
-        NvmeofndTrace(L"TraceSrbLen",    Srb->DataTransferLength);
-        if (Srb->CdbLength > 0) {
-            NvmeofndTrace(L"TraceSrbCdb0", (ULONG)Srb->Cdb[0]);
-        }
+    PNVMEOFND_EXTENSION ext = (PNVMEOFND_EXTENSION)DeviceExtension;
+    PUCHAR cdb;
+    PVOID  buffer = NULL;
+    UCHAR  op;
 
-    // WMI SRBs come through StartIo too, and until this was traced from the TOP of the
-    // function (not after the "not EXECUTE_SCSI, return" branch) their content was invisible.
+    ext->TotalSrbs++;
+
     if (Srb->Function == SRB_FUNCTION_WMI) {
-        PSCSI_WMI_REQUEST_BLOCK w = (PSCSI_WMI_REQUEST_BLOCK)Srb;
-        NvmeofndTrace(L"TraceWmiSubFn",  (ULONG)w->WMISubFunction);
-        NvmeofndTrace(L"TraceWmiFlags",  (ULONG)w->WMIFlags);
-        if (Srb->DataBuffer != NULL && Srb->DataTransferLength >= 8) {
-            PUCHAR b = (PUCHAR)Srb->DataBuffer;
-            NvmeofndTrace(L"TraceWmiBuf0", ((ULONG)b[0] << 24) | ((ULONG)b[1] << 16) | ((ULONG)b[2] << 8) | b[3]);
-            NvmeofndTrace(L"TraceWmiBuf4", ((ULONG)b[4] << 24) | ((ULONG)b[5] << 16) | ((ULONG)b[6] << 8) | b[7]);
-        }
-        // Answer adapter-level WMI requests with success: refusing them was legal but it is
-        // also the only thing StorPort ever asked before it stopped talking to us.
-        NvmeofndTrace(L"TraceWmiAnswered", 1);
+        NvmeofndPublishStats(DeviceExtension);
         Srb->SrbStatus = SRB_STATUS_SUCCESS;
         StorPortNotification(RequestComplete, DeviceExtension, Srb);
         return TRUE;
     }
-
-    // The adapter is running by the time StorPort talks to us, so RE-ANNOUNCE the device
-    // here.  Announcing from inside HwInitialize did not produce a scan - measured: the
-    // only request that ever arrives is one WMI SRB and no INQUIRY ever follows.
-    {
-        static BOOLEAN announced = FALSE;
-        if (!announced) {
-            announced = TRUE;
-            NvmeofndTrace(L"TraceAnnounce2", 1);
-            StorPortNotification(BusChangeDetected, DeviceExtension, 0, 0, 0);
-        }
-    }
-    }
-    PNVMEOFND_EXTENSION ext = (PNVMEOFND_EXTENSION)DeviceExtension;
-    PUCHAR  cdb;
-    PVOID   buffer = NULL;
-    ULONG   status;
-
     if (Srb->Function != SRB_FUNCTION_EXECUTE_SCSI) {
         NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_INVALID_REQUEST);
         return TRUE;
@@ -276,41 +295,83 @@ static BOOLEAN NvmeofndStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
         return TRUE;
     }
     cdb = Srb->Cdb;
+    op = cdb[0];
+    ext->OpCount[op]++;
 
-    status = StorPortGetSystemAddress(DeviceExtension, Srb, &buffer);
-    if (status != STOR_STATUS_SUCCESS && (cdb[0] == NVMEOFND_OPC_READ10 || cdb[0] == NVMEOFND_OPC_READ16 || cdb[0] == NVMEOFND_OPC_READ6 || cdb[0] == NVMEOFND_OPC_WRITE10 || cdb[0] == NVMEOFND_OPC_WRITE16 || cdb[0] == NVMEOFND_OPC_WRITE6 ||
-                                          cdb[0] == NVMEOFND_OPC_READ10 || cdb[0] == NVMEOFND_OPC_WRITE10 ||
-                                          cdb[0] == NVMEOFND_OPC_INQUIRY)) {
-        NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_ERROR);
-        return TRUE;
+    if (Srb->DataTransferLength > 0 &&
+        StorPortGetSystemAddress(DeviceExtension, Srb, &buffer) != STOR_STATUS_SUCCESS) {
+        buffer = NULL;
     }
 
-    switch (cdb[0]) {
+    switch (op) {
 
     case NVMEOFND_OPC_TEST_UNIT_READY:
+    case NVMEOFND_OPC_START_STOP_UNIT:          // a RAM LUN is always spinning
         Srb->ScsiStatus = NVMEOFND_STAT_GOOD;
+        NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_SUCCESS);
+        return TRUE;
+
+    case NVMEOFND_OPC_VERIFY10:
+        Srb->ScsiStatus = NVMEOFND_STAT_GOOD;   // nothing to verify: successful no-op
         NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_SUCCESS);
         return TRUE;
 
     case NVMEOFND_OPC_INQUIRY: {
-        ULONG want = Srb->DataTransferLength;
-        ULONG give = sizeof(g_Inquiry);
-        if (cdb[1] & 0x01) {                     // EVPD: no vital product pages here
-            NvmeofndSetSense(DeviceExtension, Srb, NVMEOFND_SENSE_ILLEGAL_REQ, 0x24, 0x00);
+        BOOLEAN evpd = (cdb[1] & 0x01) != 0;
+        UCHAR   page = cdb[2];
+        ULONG   want = Srb->DataTransferLength;
+        ULONG   give = 0;
+
+        if (buffer == NULL) {
             NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_ERROR);
             return TRUE;
         }
-        if (buffer != NULL) {
-            ULONG n = (want < give) ? want : give;
-            RtlZeroMemory(buffer, want);
-            RtlCopyMemory(buffer, g_Inquiry, n);
+        RtlZeroMemory(buffer, want);
+        if (!evpd) {
+            give = (want < sizeof(g_Inquiry)) ? want : sizeof(g_Inquiry);
+            RtlCopyMemory(buffer, g_Inquiry, give);
+            Srb->DataTransferLength = give;
+        } else if (page == 0x00) {
+            static const UCHAR pages[3] = { 0x00, 0x80, 0x83 };
+            give = (want < 7) ? want : 7;
+            ((PUCHAR)buffer)[1] = 0x00;
+            ((PUCHAR)buffer)[3] = 3;
+            RtlCopyMemory((PUCHAR)buffer + 4, pages, 3);
+            Srb->DataTransferLength = give;
+        } else if (page == 0x80) {
+            static const char serial[] = "NVMEOFND0000000000001";
+            give = (want < (ULONG)(5 + sizeof(serial) - 1)) ? want : (ULONG)(5 + sizeof(serial) - 1);
+            ((PUCHAR)buffer)[1] = 0x80;
+            ((PUCHAR)buffer)[3] = (UCHAR)(sizeof(serial) - 1);
+            RtlCopyMemory((PUCHAR)buffer + 4, serial, sizeof(serial) - 1);
+            Srb->DataTransferLength = give;
+        } else if (page == 0x83) {
+            // One identification descriptor: T10 vendor id "NVMEOFND" + serial.
+            static const char vpd83[] = "NVMEOFND:0000000000000000001";
+            ULONG dlen = (ULONG)(sizeof(vpd83) - 1);
+            if (want >= 8 + dlen) {
+                PUCHAR d = (PUCHAR)buffer + 4;
+                d[0] = 0x02;                    // code set: ASCII
+                d[1] = 0x01;                    // identifier type: T10 vendor ID
+                d[3] = (UCHAR)dlen;
+                RtlCopyMemory(d + 4, vpd83, dlen);
+                ((PUCHAR)buffer)[1] = 0x83;
+                ((PUCHAR)buffer)[3] = (UCHAR)(4 + dlen);
+                Srb->DataTransferLength = 8 + dlen;
+            } else {
+                Srb->DataTransferLength = 4;
+            }
+        } else {
+            NvmeofndSetSense(DeviceExtension, Srb, NVMEOFND_SENSE_ILLEGAL_REQ, 0x24, 0x00);
+            NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_ERROR);
+            return TRUE;
         }
         Srb->ScsiStatus = NVMEOFND_STAT_GOOD;
         NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_SUCCESS);
         return TRUE;
     }
 
-    case NVMEOFND_OPC_READ_CAPACITY10: {                 // 10-byte form: last LBA + block size
+    case NVMEOFND_OPC_READ_CAPACITY10: {
         PUCHAR out = (PUCHAR)buffer;
         ULONG  lastLba = ext->Blocks - 1;
         if (out == NULL || Srb->DataTransferLength < 8) {
@@ -326,27 +387,84 @@ static BOOLEAN NvmeofndStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
         return TRUE;
     }
 
+    case NVMEOFND_OPC_SERVICE_IN16: {
+        // SERVICE ACTION IN(16), service action 0x10 = READ CAPACITY(16).
+        PUCHAR out = (PUCHAR)buffer;
+        ULONGLONG last = (ULONGLONG)(ext->Blocks - 1);
+        if ((cdb[1] & 0x1F) != 0x10 || out == NULL || Srb->DataTransferLength < 32) {
+            NvmeofndSetSense(DeviceExtension, Srb, NVMEOFND_SENSE_ILLEGAL_REQ, 0x20, 0x00);
+            NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_ERROR);
+            return TRUE;
+        }
+        RtlZeroMemory(out, 32);
+        out[0] = (UCHAR)(last >> 56); out[1] = (UCHAR)(last >> 48);
+        out[2] = (UCHAR)(last >> 40); out[3] = (UCHAR)(last >> 32);
+        out[4] = (UCHAR)(last >> 24); out[5] = (UCHAR)(last >> 16);
+        out[6] = (UCHAR)(last >> 8);  out[7] = (UCHAR)(last);
+        out[8] = (UCHAR)(ext->BlockBytes >> 24); out[9] = (UCHAR)(ext->BlockBytes >> 16);
+        out[10] = (UCHAR)(ext->BlockBytes >> 8); out[11] = (UCHAR)(ext->BlockBytes);
+        Srb->DataTransferLength = 32;
+        Srb->ScsiStatus = NVMEOFND_STAT_GOOD;
+        NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_SUCCESS);
+        return TRUE;
+    }
+
+    case NVMEOFND_OPC_MODE_SENSE6:
+    case NVMEOFND_OPC_MODE_SENSE10: {
+        BOOLEAN ten = (op == NVMEOFND_OPC_MODE_SENSE10);
+        ULONG hdr = ten ? 8 : 4;
+        PUCHAR out = (PUCHAR)buffer;
+        if (out == NULL || Srb->DataTransferLength < hdr) {
+            NvmeofndSetSense(DeviceExtension, Srb, NVMEOFND_SENSE_ILLEGAL_REQ, 0x20, 0x00);
+            NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_ERROR);
+            return TRUE;
+        }
+        RtlZeroMemory(out, hdr);
+        if (ten) {
+            out[1] = (UCHAR)(hdr - 2);          // mode data length = everything after this field
+        } else {
+            out[0] = (UCHAR)(hdr - 1);
+        }
+        Srb->DataTransferLength = hdr;          // no block descriptor, no pages
+        Srb->ScsiStatus = NVMEOFND_STAT_GOOD;
+        NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_SUCCESS);
+        return TRUE;
+    }
+
     case NVMEOFND_OPC_READ6:
     case NVMEOFND_OPC_WRITE6:
     case NVMEOFND_OPC_READ10:
-    case NVMEOFND_OPC_WRITE10: {
-        BOOLEAN isRead = (cdb[0] == NVMEOFND_OPC_READ10 || cdb[0] == NVMEOFND_OPC_READ16 || cdb[0] == NVMEOFND_OPC_READ6 || cdb[0] == NVMEOFND_OPC_READ10);
-        ULONG lba, blocks, offset, bytes;
+    case NVMEOFND_OPC_WRITE10:
+    case NVMEOFND_OPC_READ16:
+    case NVMEOFND_OPC_WRITE16: {
+        BOOLEAN isRead = (op == NVMEOFND_OPC_READ6 || op == NVMEOFND_OPC_READ10 ||
+                          op == NVMEOFND_OPC_READ16);
+        ULONG lba = 0, blocks = 0, offset, bytes;
+        ULONGLONG lba64 = 0;
 
-        if (cdb[0] == NVMEOFND_OPC_READ10 || cdb[0] == NVMEOFND_OPC_READ16 || cdb[0] == NVMEOFND_OPC_READ6 || cdb[0] == NVMEOFND_OPC_WRITE10 || cdb[0] == NVMEOFND_OPC_WRITE16 || cdb[0] == NVMEOFND_OPC_WRITE6) {   // 6-byte CDB
+        if (op == NVMEOFND_OPC_READ6 || op == NVMEOFND_OPC_WRITE6) {
             lba    = ((ULONG)(cdb[1] & 0x1F) << 16) | ((ULONG)cdb[2] << 8) | cdb[3];
             blocks = (cdb[4] == 0) ? 256u : (ULONG)cdb[4];
-        } else {                                                  // 10-byte CDB
+        } else if (op == NVMEOFND_OPC_READ10 || op == NVMEOFND_OPC_WRITE10) {
             lba    = ((ULONG)cdb[2] << 24) | ((ULONG)cdb[3] << 16) | ((ULONG)cdb[4] << 8) | cdb[5];
             blocks = ((ULONG)cdb[7] << 8) | cdb[8];
+        } else {
+            lba64  = ((ULONGLONG)cdb[2] << 56) | ((ULONGLONG)cdb[3] << 48) |
+                     ((ULONGLONG)cdb[4] << 40) | ((ULONGLONG)cdb[5] << 32) |
+                     ((ULONGLONG)cdb[6] << 24) | ((ULONGLONG)cdb[7] << 16) |
+                     ((ULONGLONG)cdb[8] << 8)  | (ULONGLONG)cdb[9];
+            blocks = ((ULONG)cdb[10] << 24) | ((ULONG)cdb[11] << 16) |
+                     ((ULONG)cdb[12] << 8)  | (ULONG)cdb[13];
+            lba    = (lba64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (ULONG)lba64;
         }
+
         if (blocks == 0) {
             Srb->ScsiStatus = NVMEOFND_STAT_GOOD;
             NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_SUCCESS);
             return TRUE;
         }
-        if (lba >= ext->Blocks || blocks > (ext->Blocks - lba)) {
-            NvmeofndSetSense(DeviceExtension, Srb, NVMEOFND_SENSE_ILLEGAL_REQ, 0x21, 0x00); // LBA out of range
+        if (lba64 > 0xFFFFFFFFull || lba >= ext->Blocks || blocks > (ext->Blocks - lba)) {
+            NvmeofndSetSense(DeviceExtension, Srb, NVMEOFND_SENSE_ILLEGAL_REQ, 0x21, 0x00);
             NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_ERROR);
             return TRUE;
         }
@@ -366,6 +484,7 @@ static BOOLEAN NvmeofndStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
                 ext->BytesIn += bytes;
             }
         }
+        ext->IoBytes += bytes;
         Srb->DataTransferLength = bytes;
         Srb->ScsiStatus = NVMEOFND_STAT_GOOD;
         NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_SUCCESS);
@@ -373,8 +492,7 @@ static BOOLEAN NvmeofndStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
     }
 
     case NVMEOFND_OPC_SYNC_CACHE10:
-        // A RAM LUN has nothing to flush; answering "done" is the truth here,
-        // and a driver that claims otherwise makes every format take minutes.
+    case NVMEOFND_OPC_SYNC_CACHE16:
         Srb->ScsiStatus = NVMEOFND_STAT_GOOD;
         NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_SUCCESS);
         return TRUE;
@@ -385,6 +503,7 @@ static BOOLEAN NvmeofndStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
             RtlZeroMemory(out, 18);
             out[0] = 0x70;
             out[7] = 10;
+            Srb->DataTransferLength = 18;
         }
         Srb->ScsiStatus = NVMEOFND_STAT_GOOD;
         NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_SUCCESS);
@@ -395,8 +514,8 @@ static BOOLEAN NvmeofndStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
         PUCHAR out = (PUCHAR)buffer;
         if (out != NULL && Srb->DataTransferLength >= 16) {
             RtlZeroMemory(out, 16);
-            out[3] = 8;                        // one LUN, 8 bytes of it
-            out[9] = 0;                        // LUN 0
+            out[3] = 8;
+            Srb->DataTransferLength = 16;
         }
         Srb->ScsiStatus = NVMEOFND_STAT_GOOD;
         NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_SUCCESS);

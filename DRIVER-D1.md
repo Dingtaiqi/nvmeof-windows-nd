@@ -327,3 +327,54 @@ PASSIVE_LEVEL）→ **I/O 级别的埋点静默失败**，只有适配器级 WMI
 1. **把统计放进设备扩展**（`StartIo` 里只做计数，不做注册表写入），在收到 WMI SRB 时（PASSIVE）**一次性发布**到注册表 → 才能看到真实的命令组合；
 2. 补齐命令集：`READ(16)/WRITE(16)`(0x88/0x8A)、`READ CAPACITY(16)`/SERVICE ACTION IN(0x9E)、`MODE SENSE(6/10)`、`SYNCHRONIZE CACHE(16)`、`START STOP UNIT` 等，并给不支持的命令回**规范 sense**；
 3. 然后 `Initialize-Disk` → `New-Partition -AssignDriveLetter` → `Format-Volume` → **盘符出现**。
+
+---
+
+## 42. ★★★★★ D1 **完成**：`nvmeofnd.sys` 呈现的磁盘在 Windows 里拿到了盘符
+
+```
+E  NVMEOFND                    32 MB  NTFS  Healthy
+Disk 5  NVMeoFND RAM LUN 0001  Bus=Fibre Channel  0.047 GB  Online
+
+  PartitionStyle : GPT          Partition 1  Basic  32 MB  offset 65536  drive E
+  SerialNumber   : NVMEOFND0000000000001        ← 我们回答的 INQUIRY VPD page 0x80
+  Path           : \\?\scsi#disk&ven_nvmeofnd&prod_ram_lun_0001#1&24ec9aed&0&000000#{53f56307-…}
+
+  wrote E:\hello-nvmeof.txt          → read back: "written by powershell, served by nvmeofnd.sys"
+  wrote E:\second-file.bin (8192 B)  → read back byte-for-byte identical: True
+  volume: 22.21 MB free of 32 MB
+```
+
+证据：`evidence/d1_drive_letter_E_2026-10-04.log`。
+
+**这就是"Windows 原生 NVMe-oF"的地基**：一个用 WDK 编译、我们自己写的 **StorPort 虚拟微型端口**，
+不借助任何第三方付费/阉割组件，被 Windows 存储栈当成真盘接受 —— 分区、格式化、挂载、读写文件全部正常。
+
+### 最后两个真因（都不是"协议写错"）
+
+1. **`ConfigInfo->NumberOfBuses = 1` 缺失**：我在"最小化 ConfigInfo"时把它一起删了。没有它 StorPort 认为
+   **零条总线** —— 适配器 `Driver is running`、StorPort 也在跟微型端口说话，**但永远不会扫描设备**。
+   补回后 `StartIo` 调用数从 1 涨到 50，磁盘立刻出现。
+   教训：**最小化到一个字段都不剩，比多设字段更危险**——少一个字段不会报错，只会静默地什么都不做。
+2. **重复的适配器**：我为了绕开"同一文件不能二次加载"的限制，反复用新名字（x/z/v/w/u/s/r/q/o/n/m/l/j/i…）
+   安装驱动，于是**同一个 LUN 被多块盘同时暴露**。此时 `Initialize-Disk` 报成功但读回仍是旧表、
+   `New-Partition` 报 "Not enough available capacity"。清掉旧适配器、只留一个之后，同样的命令一次成功。
+
+### 本轮同时修好的（都在 `src/driver/nvmeofnd.c`）
+
+- **统计搬进设备扩展**：`StartIo` 跑在 **DISPATCH_LEVEL**，而 `ZwSetValueKey` 要求 PASSIVE —— 原来的埋点在
+  I/O 路径上**静默失败**，所以我一直"看不到命令"。现在 I/O 只累加扩展里的计数，在 **WMI SRB（PASSIVE）**
+  路径一次性发布。第一次看到真实组合就抓到了本质：`StatReads=2  StatWrites=0`。
+- **补齐 SCSI 命令集**：`READ/WRITE(6/10/16)`、`READ CAPACITY(10)`、`SERVICE ACTION IN(16)`=`READ CAPACITY(16)`、
+  `MODE SENSE(6/10)`、`INQUIRY`（含 VPD `0x00`/`0x80`/`0x83`）、`REPORT LUNS`、`SYNCHRONIZE CACHE(10/16)`、
+  `START STOP UNIT`、`VERIFY(10)`，不支持的命令回**规范 sense** 而不是裸失败。
+- `HwAdapterControl` 的 **`ScsiQuerySupportedControlTypes` 握手**必须回填列表（StorPort 会问，且必须回答）。
+
+### 过程中的一条方法论（值得单独记）
+
+**仪器必须先自证**：前几轮"埋点未到达 ⇒ 驱动没被调用"的结论**全部是错的**，因为 INF 的 `CopyFiles`
+装的是**加埋点之前**的 `nvmeofnd.sys`。验证一行就够：
+
+```powershell
+[System.IO.File]::ReadAllText($sys, [System.Text.Encoding]::Unicode).Contains('TraceFindAdapter')
+```
