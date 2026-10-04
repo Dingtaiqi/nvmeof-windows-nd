@@ -142,30 +142,33 @@ static ULONG NvmeofndFindAdapter(PVOID DeviceExtension, PVOID HwContext, PVOID B
                                  PCHAR ArgumentString, PPORT_CONFIGURATION_INFORMATION ConfigInfo,
                                  PBOOLEAN Again)
 {
-    NvmeofndTrace(L"TraceFindAdapter", 1);
     UNREFERENCED_PARAMETER(DeviceExtension);
     UNREFERENCED_PARAMETER(HwContext);
     UNREFERENCED_PARAMETER(BusInformation);
     UNREFERENCED_PARAMETER(ArgumentString);
     UNREFERENCED_PARAMETER(Again);
 
-    ConfigInfo->VirtualDevice            = TRUE;
-    ConfigInfo->AdapterInterfaceType     = Internal;
-    ConfigInfo->MaximumTransferLength    = 1024u * 1024u;
-    ConfigInfo->NumberOfPhysicalBreaks   = 0x20;
-    ConfigInfo->AlignmentMask            = 0;
-    ConfigInfo->MaximumNumberOfTargets   = NVMEOFND_MAX_TARGETS;
-    ConfigInfo->MaximumNumberOfLogicalUnits = NVMEOFND_MAX_LUNS;
-    ConfigInfo->NumberOfBuses            = 1;
-    ConfigInfo->ScatterGather            = TRUE;
-    ConfigInfo->Master                   = TRUE;
-    ConfigInfo->CachesData               = FALSE;
-    ConfigInfo->MapBuffers               = STOR_MAP_ALL_BUFFERS;
-    ConfigInfo->NeedPhysicalAddresses    = FALSE;
-    ConfigInfo->TaggedQueuing            = TRUE;
-    ConfigInfo->AutoRequestSense         = TRUE;
-    ConfigInfo->SrbType                  = SRB_TYPE_SCSI_REQUEST_BLOCK;
-    ConfigInfo->AddressType              = STORAGE_ADDRESS_TYPE_BTL8;
+    NvmeofndTrace(L"TraceFindAdapter", 1);
+
+    // MINIMAL ConfigInfo, deliberately.  The previous version set a dozen fields from
+    // memory of the sample, and the adapter start failed between HwFindAdapter and
+    // HwInitialize with no indication which field was unacceptable.  StorPort fills in
+    // what it wants for a virtual device; a miniport should state only what it must.
+    ConfigInfo->VirtualDevice                  = TRUE;
+    ConfigInfo->MaximumTransferLength          = 1024u * 1024u;
+    ConfigInfo->MaximumNumberOfTargets         = NVMEOFND_MAX_TARGETS;
+    ConfigInfo->MaximumNumberOfLogicalUnits    = NVMEOFND_MAX_LUNS;
+    ConfigInfo->SrbType                        = SRB_TYPE_SCSI_REQUEST_BLOCK;
+    ConfigInfo->AddressType                    = STORAGE_ADDRESS_TYPE_BTL8;
+    // NumberOfBuses is what tells StorPort how many buses to scan for devices.  Leaving
+    // it out (as the first minimal version did) gives ZERO buses, so the adapter runs and
+    // is never asked for a single SCSI command - measured exactly that way.
+    ConfigInfo->NumberOfBuses                = 1;
+
+    NvmeofndTrace(L"TraceCfgVirtual",    ConfigInfo->VirtualDevice ? 1 : 0);
+    NvmeofndTrace(L"TraceCfgMaxXfer",    ConfigInfo->MaximumTransferLength);
+    NvmeofndTrace(L"TraceCfgMaxLuns",    ConfigInfo->MaximumNumberOfLogicalUnits);
+    NvmeofndTrace(L"TraceCfgMaxTargets", ConfigInfo->MaximumNumberOfTargets);
     NvmeofndTrace(L"TraceFindAdapterDone", 1);
     return SP_RETURN_FOUND;
 }
@@ -200,7 +203,11 @@ static BOOLEAN NvmeofndInitialize(PVOID DeviceExtension)
     StorPortSetDeviceQueueDepth(DeviceExtension, 0, 0, 0, 32);
     // Announce the LUN: until this fires, the storage stack does not know the
     // device exists and nothing else in this file is ever called.
-    StorPortNotification(BusChangeDetected, DeviceExtension, 0);
+    // StorPort takes PathId, TargetId AND Lun here.  With only one argument the
+    // other two are read off the stack, so the device at (0,0,0) is never announced and
+    // StorPort never scans it - measured as a running adapter that receives no SCSI
+    // command at all, only one WMI SRB.
+    StorPortNotification(BusChangeDetected, DeviceExtension, 0, 0, 0);
     NvmeofndTrace(L"TraceBusChange", 1);
     return TRUE;
 }
@@ -211,6 +218,49 @@ static BOOLEAN NvmeofndInitialize(PVOID DeviceExtension)
 static BOOLEAN NvmeofndStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
 {
     NvmeofndTrace(L"TraceStartIo", 1);
+    {
+        static ULONG s_calls = 0;
+        s_calls++;
+        NvmeofndTrace(L"TraceStartIoCnt", s_calls);
+        NvmeofndTrace(L"TraceSrbFn",     (ULONG)Srb->Function);
+        NvmeofndTrace(L"TraceSrbLun",    ((ULONG)Srb->PathId << 16) | ((ULONG)Srb->TargetId << 8) | Srb->Lun);
+        NvmeofndTrace(L"TraceSrbCdbLen", Srb->CdbLength);
+        NvmeofndTrace(L"TraceSrbLen",    Srb->DataTransferLength);
+        if (Srb->CdbLength > 0) {
+            NvmeofndTrace(L"TraceSrbCdb0", (ULONG)Srb->Cdb[0]);
+        }
+
+    // WMI SRBs come through StartIo too, and until this was traced from the TOP of the
+    // function (not after the "not EXECUTE_SCSI, return" branch) their content was invisible.
+    if (Srb->Function == SRB_FUNCTION_WMI) {
+        PSCSI_WMI_REQUEST_BLOCK w = (PSCSI_WMI_REQUEST_BLOCK)Srb;
+        NvmeofndTrace(L"TraceWmiSubFn",  (ULONG)w->WMISubFunction);
+        NvmeofndTrace(L"TraceWmiFlags",  (ULONG)w->WMIFlags);
+        if (Srb->DataBuffer != NULL && Srb->DataTransferLength >= 8) {
+            PUCHAR b = (PUCHAR)Srb->DataBuffer;
+            NvmeofndTrace(L"TraceWmiBuf0", ((ULONG)b[0] << 24) | ((ULONG)b[1] << 16) | ((ULONG)b[2] << 8) | b[3]);
+            NvmeofndTrace(L"TraceWmiBuf4", ((ULONG)b[4] << 24) | ((ULONG)b[5] << 16) | ((ULONG)b[6] << 8) | b[7]);
+        }
+        // Answer adapter-level WMI requests with success: refusing them was legal but it is
+        // also the only thing StorPort ever asked before it stopped talking to us.
+        NvmeofndTrace(L"TraceWmiAnswered", 1);
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        StorPortNotification(RequestComplete, DeviceExtension, Srb);
+        return TRUE;
+    }
+
+    // The adapter is running by the time StorPort talks to us, so RE-ANNOUNCE the device
+    // here.  Announcing from inside HwInitialize did not produce a scan - measured: the
+    // only request that ever arrives is one WMI SRB and no INQUIRY ever follows.
+    {
+        static BOOLEAN announced = FALSE;
+        if (!announced) {
+            announced = TRUE;
+            NvmeofndTrace(L"TraceAnnounce2", 1);
+            StorPortNotification(BusChangeDetected, DeviceExtension, 0, 0, 0);
+        }
+    }
+    }
     PNVMEOFND_EXTENSION ext = (PNVMEOFND_EXTENSION)DeviceExtension;
     PUCHAR  cdb;
     PVOID   buffer = NULL;
@@ -362,6 +412,7 @@ static BOOLEAN NvmeofndStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
 
 static BOOLEAN NvmeofndResetBus(PVOID DeviceExtension, ULONG PathId)
 {
+    NvmeofndTrace(L"TraceResetBus", PathId);
     UNREFERENCED_PARAMETER(DeviceExtension);
     UNREFERENCED_PARAMETER(PathId);
     return TRUE;
@@ -372,7 +423,28 @@ static SCSI_ADAPTER_CONTROL_STATUS NvmeofndAdapterControl(PVOID DeviceExtension,
                                                           PVOID Parameters)
 {
     PNVMEOFND_EXTENSION ext = (PNVMEOFND_EXTENSION)DeviceExtension;
-    UNREFERENCED_PARAMETER(Parameters);
+    NvmeofndTrace(L"TraceAdapterControl", (ULONG)ControlType);
+
+    // ScsiQuerySupportedControlTypes is a REQUIRED handshake, not a courtesy call.
+    // StorPort asks which control types the miniport handles and the miniport must
+    // ANSWER by writing into the caller's list.  Returning success while leaving
+    // that list untouched makes the adapter fail to start - measured here as problem
+    // 10 with HwFindAdapter completing and HwInitialize never being reached.
+    if (ControlType == ScsiQuerySupportedControlTypes) {
+        PSCSI_SUPPORTED_CONTROL_TYPE_LIST list = (PSCSI_SUPPORTED_CONTROL_TYPE_LIST)Parameters;
+        ULONG i;
+        if (list == NULL) {
+            return ScsiAdapterControlUnsuccessful;
+        }
+        NvmeofndTrace(L"TraceCtlListMax", list->MaxControlType);
+        for (i = 0; i < list->MaxControlType; i++) {
+            list->SupportedTypeList[i] = FALSE;
+        }
+        if (list->MaxControlType > (ULONG)ScsiStopAdapter) {
+            list->SupportedTypeList[ScsiStopAdapter] = TRUE;   // we free the RAM LUN on stop
+        }
+        return ScsiAdapterControlSuccess;
+    }
 
     if (ControlType == ScsiStopAdapter && ext->Lun != NULL) {
         StorPortFreePool(DeviceExtension, ext->Lun);

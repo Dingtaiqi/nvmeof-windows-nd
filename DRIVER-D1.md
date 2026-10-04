@@ -268,3 +268,62 @@ HKR,, "VirtualDevice", %REG_DWORD%, 1
 
 > 另一条备选路线（若 1–3 都不通）：**放弃 StorPort，改走 `SwDeviceCreate` 软件设备 + 自写 FDO**，
 > 或先做**纯用户态可见的成果**（`f5_interop -target` 常驻 + iSCSI 桥路线的产品化），把盘符作为后续目标。
+
+---
+
+## 41. ★★★ D1.1 里程碑：**Windows 里出现了我们的盘**（`Disk 4  NVMeoFND RAM LUN 0001`）
+
+```
+Disk 1  ST1000DM003-1SB102        Bus=SATA           931.513 GB
+Disk 2  GIGABYTE GP-GSM2NE3256GNTD Bus=NVMe          238.475 GB
+Disk 3  YCY_256GB                 Bus=NVMe           238.475 GB
+Disk 4  NVMeoFND RAM LUN 0001     Bus=Fibre Channel    0.047 GB   ← ★ 我们的内核驱动呈现的盘
+Disk 0  WDC WD10EZEX-08WN4A0      Bus=SATA           931.513 GB
+```
+
+`Get-Disk` 里的名字 `NVMeoFND RAM LUN 0001` 正是我们驱动里 `g_Inquiry` 的 vendor/product/revision
+——**所以 INQUIRY 是被我们回答的**，Windows 认下了这块盘。盘符还差最后一步（分区/格式化）。
+
+### 这一轮真正的收获：**我一直在用瞎掉的仪器做实验**
+
+前几轮所有"埋点未到达 ⇒ 驱动没被调用"的结论**全部无效**，因为 INF 的 `CopyFiles` 装的一直是
+`nvmeofnd.sys`（**加埋点之前**的构建），而带埋点的是 `nvmeofndC/D.sys`。验证方式很简单也很值得记住：
+
+```powershell
+[System.IO.File]::ReadAllText($sys, [System.Text.Encoding]::Unicode).Contains('TraceFindAdapter')
+```
+
+换装带埋点的构建后，真相立刻不同：**`HwFindAdapter` 一直在被调用**。
+
+### 逐个排除并修复的真实缺陷（每个都有实测）
+
+| # | 缺陷 | 证据 | 修复 |
+|---|---|---|---|
+| 1 | `ScsiQuerySupportedControlTypes` 握手没有填列表 | `TraceAdapterControl = 0`（StorPort 在问）却无 `TraceInitialize` | 按 `SCSI_SUPPORTED_CONTROL_TYPE_LIST` 逐项填 TRUE/FALSE |
+| 2 | **`ConfigInfo` 里凭记忆多设了十几个字段**，其中一个不被 StorPort 接受 → 设备 `problem 10` | 最小化后 `TraceInitialize/BusChange/StartIo` 全部到达，设备变 `Driver is running` | 只设 `VirtualDevice / MaximumTransferLength / MaximumNumberOfTargets / MaximumNumberOfLogicalUnits / SrbType / AddressType / NumberOfBuses` |
+| 3 | **`ConfigInfo->NumberOfBuses` 被我在最小化时删掉** → StorPort 认为**零条总线**，适配器在跑却零扫描 | 补回 `= 1` 后 `TraceStartIoCnt` 从 1 涨到 50，**Disk 4 出现** | `ConfigInfo->NumberOfBuses = 1` |
+| 4 | `StorPortNotification(BusChangeDetected, …)` 只传了 1 个参数 | StorPort 的该通知要 **PathId, TargetId, Lun** 三个 | 改为 `(…, 0, 0, 0)` |
+| 5 | 非 `EXECUTE_SCSI` 的 SRB 一律 `INVALID_REQUEST` | StorPort 唯一发来的 SRB 是 `SRB_FUNCTION_WMI`(0x17)，`WMISubFunction=8`、`WMIFlags=1`（适配器级） | 顶部单独处理并回 SUCCESS |
+| 6 | INF 缺少**签名目录** | `setupapi`：`Driver package does not contain a catalog file, and Code Integrity is in Test Signing mode. Error = 0xE000022F` | `Inf2Cat` + `signtool` 签 `.cat` |
+| 7 | `Inf2Cat` 的 `DriverVer` 按 **UTC** 判定未来 | 本机 UTC+8 | 写前一天日期 |
+| 8 | 我自己搞错的常量与类：`SPSVCINST_ASSOCSERVICE` 是 **0x2**（不是 0x200）；真实 StorPort 微型端口在 **HDC 类** `{4D36E96A-…}` | SetupAPI 报 "No INF AddService directives contained the flag SPSVCINST_ASSOCSERVICE"；对照 `storahci` 的 `ClassGUID` | 用 0x2 与 HDC 类 |
+
+### 还差最后一步：盘符（分区/格式化）
+
+现状与线索：
+
+```
+Initialize-Disk -PartitionStyle GPT  → 报成功，但读回仍是 MBR、LargestFreeExtent=0
+经 \\.\PhysicalDrive4 读扇区 0      → 是 Windows 写的**真正 MBR**（33 C0 8E D0 … + 55 AA）✓ 说明读写通路是通的
+Get-Disk 报 Size = 48 MB            → 来自我们回答的 READ CAPACITY(10) ✓
+TraceSrbCdb0 始终未到达              → 但 INQUIRY/READ CAPACITY 明显被回答过
+```
+
+**关键推断**：`StartIo` 里的 SCSI I/O 运行在 **DISPATCH_LEVEL**，而我的埋点用 `ZwSetValueKey`（要求
+PASSIVE_LEVEL）→ **I/O 级别的埋点静默失败**，只有适配器级 WMI SRB（PASSIVE）被记录 ✓ 这解释了
+"50 次调用却没有任何 CDB 记录"与"名字/容量确实来自我们"的矛盾。
+
+**下一步（下一轮）**：
+1. **把统计放进设备扩展**（`StartIo` 里只做计数，不做注册表写入），在收到 WMI SRB 时（PASSIVE）**一次性发布**到注册表 → 才能看到真实的命令组合；
+2. 补齐命令集：`READ(16)/WRITE(16)`(0x88/0x8A)、`READ CAPACITY(16)`/SERVICE ACTION IN(0x9E)、`MODE SENSE(6/10)`、`SYNCHRONIZE CACHE(16)`、`START STOP UNIT` 等，并给不支持的命令回**规范 sense**；
+3. 然后 `Initialize-Disk` → `New-Partition -AssignDriveLetter` → `Format-Volume` → **盘符出现**。
