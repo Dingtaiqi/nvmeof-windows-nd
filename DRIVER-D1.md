@@ -378,3 +378,41 @@ Disk 5  NVMeoFND RAM LUN 0001  Bus=Fibre Channel  0.047 GB  Online
 ```powershell
 [System.IO.File]::ReadAllText($sys, [System.Text.Encoding]::Unicode).Contains('TraceFindAdapter')
 ```
+
+---
+
+## 43. D2 事故记录：内核 NVMe-oF 驱动让机器崩了三次（诚实记录）
+
+| # | 时间 | bugcheck | 参数 | 判断 |
+|---|---|---|---|---|
+| 1 | 09:16 | **0x139** KERNEL_SECURITY_CHECK_FAILURE | P1=0xa | `nvmeofk.sys` **第一版**（无任何清理路径）首次联网尝试后 |
+| 2 | ~10:11 | （整机卡死、D 盘消失） | — | 与 `kd.exe` 解析转储同时发生；`bcdedit` 显示 **debug 未开启**，所以不是本地内核调试冻结；更可能是第 1 次留下的 NDK 状态让 mlx4/NDK 栈不稳，重负载即崩 |
+| 3 | ~10:26 | **0x0000000A** IRQL_NOT_LESS_OR_EQUAL | P1=0x0, **P2=0x2 (DISPATCH_LEVEL)**, P4=0xfffff803f5018219 | `nvmeofk2.sys` 第二阶段加载（仅 bring-up + teardown，未联网）；**没有任何日志写出**，说明死在 bring-up 途中 |
+
+### 已确认的代码缺陷（第二个版本已修 4 项，仍有 1 项待修）
+
+1. **完全没有清理路径**（第一版）：连接被拒后 QP/CQ/PD/Connector/MR 与锁住的 MDL 全部留在内核，
+   `DriverUnload` 是空函数 → 驱动永不卸载、状态永不释放。**已修**：`NvmeofkTeardown()` 按类型关闭
+   全部对象（`NdkCloseConnector`/`NdkCloseQp`/`NdkCloseCq`/`NdkCloseMr`/`NdkClosePd`）、释放 MDL 与
+   区域、`WskCloseNdkAdapter` + `WskReleaseProviderNPI` + `WskDeregister`，且 `DriverUnload` 会调用它。
+2. **CQ 计数从未递增**（`reap()` 因此永远读不到完成项）。**已修**：通知回调里 `InterlockedIncrement`。
+3. **单一静态上下文被多个重叠异步操作共用**。**已修**：拆成 `g_connectCtx`/`g_sendCtx`/`g_recvCtx`/`g_shared`。
+4. **不能只在加载时联网**。**已修**：`nvmeofk_doconnect` 开关（默认关闭），未开时只做 bring-up + teardown。
+5. **⚠ 待修（第 3 次崩溃的头号嫌疑）**：`NdkRegisterMr` 的 flags 我用了四个标志的按位或
+   （`ALLOW_LOCAL_WRITE|ALLOW_REMOTE_READ|ALLOW_REMOTE_WRITE|RDMA_READ_SINK` = 0xF），
+   而其中 `ALLOW_REMOTE_WRITE` 本身就是 `0x5`（组合值）。**D0 里每次注册只用一个标志**
+   （源用 `ALLOW_REMOTE_READ`、汇用 `ALLOW_LOCAL_WRITE`）并且实测可用。**下次必须照 D0 的单标志写法**，
+   并且先只做"打开适配器 + 建 PD + 关闭"这种最小步进，每步单独加载验证。
+
+### 现场处置（已完成）
+
+- 12 个设备节点全部 `devcon remove` 移除；`nvmeofndi`/`nvmeofk`/`nvmeofkb` 及其余 14 个遗留服务
+  注册全部删除；**确认系统中不再有任何我方服务或设备节点，开机不会加载我的任何内核代码**。
+- 磁盘 SMART 全部 Healthy（D 盘所在 YCY_256GB 40°C 正常），D/C/F 卷健康 —— 排除硬件故障。
+- **不再在这台机器上运行 `kd.exe`**（两次卡死与它同时发生，无论原因如何，都停止使用）。
+
+### 我犯的流程错误
+
+**在没有牺牲品环境的前提下，把刚编译出来的内核驱动反复指向用户的日常工作机。** D0 之所以安全，
+是每一步只做一件事并单独加载验证；D2 我从"能编译"直接跳到"建全套对象 + 联网"，一次跨了太多步。
+后续必须：**单步 —— 每加载一次只验证一件事，且先确保清理路径正确**。
