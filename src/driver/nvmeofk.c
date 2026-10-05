@@ -567,6 +567,9 @@ static void fillPrivateData(UCHAR* pd, USHORT qid, USHORT depth, USHORT cntlid)
     *(USHORT*)(pd + 8) = cntlid;
 }
 
+// forward declaration: the call site sits above the definition
+static void closeConnectorNow(void);
+
 static NTSTATUS connectToTarget(void)
 {
     NTSTATUS st;
@@ -637,6 +640,7 @@ static NTSTATUS connectToTarget(void)
     logf("NdkConnect         = 0x%08X (0xC0000236 = connection refused)", st);
     if (!NT_SUCCESS(st)) {
         traceValue(L"nvmeofk_connect", (ULONG)st);
+        closeConnectorNow();   // do not leave a failed connection dangling
         return st;
     }
 
@@ -828,6 +832,46 @@ static NVMEOFK_ASYNC g_closeCtx[6];
 static void closeDone(PVOID context, NTSTATUS status)
 {
     requestComplete(context, status);
+}
+
+// ---------------------------------------------------------------------------
+//  Correct close path.  Two facts from ndkpi.h drive all of this:
+//
+//   * NDK_FN_CLOSE_COMPLETION takes ONLY a Context - no status.  The old closeDone
+//     below has two parameters, which is a type mismatch against every close method
+//     (NdkCloseConnector/Qp/Cq/Pd/Mr are all NDK_FN_CLOSE_OBJECT).
+//   * A connection attempt that FAILS still leaves CM state inside the provider.  The
+//     driver used to return and leave it there ("leak everything, like D0").  D0 got
+//     away with that because its connection SUCCEEDED and ended cleanly; a failed one
+//     dangles, and about ninety seconds later mlx4eth63 trips
+//     KERNEL_SECURITY_CHECK_FAILURE (0x139, P1=0xa).  That is what every one of the
+//     delayed bugchecks in this project was.
+//
+//  So: on any failure after the connector exists, close it - and wait for the close
+//  completion before returning, so nothing is left half-torn-down.
+// ---------------------------------------------------------------------------
+static void closeDone1(PVOID context)
+{
+    NVMEOFK_ASYNC* a = (NVMEOFK_ASYNC*)context;
+    if (a == NULL) {
+        return;
+    }
+    a->status = STATUS_SUCCESS;      // a close completion carries no status of its own
+    KeSetEvent(&a->done, IO_NO_INCREMENT, FALSE);
+}
+
+// Close the connector after a failed connect (or on the way out).  Separate context,
+// waits for the completion, never re-initialises an event that is already live.
+static void closeConnectorNow(void)
+{
+    if (g_connector == NULL) {
+        return;
+    }
+    StepStart(&g_closeCtx[0]);
+    (void)g_connector->Dispatch->NdkCloseConnector(&g_connector->Header, closeDone1, &g_closeCtx[0]);
+    (void)StepFinish(STATUS_PENDING, &g_closeCtx[0], 10000);
+    logf("connector closed after the failed connect (this is what stops the delayed 0x139)");
+    g_connector = NULL;
 }
 
 static BOOLEAN g_tornDown = FALSE;
