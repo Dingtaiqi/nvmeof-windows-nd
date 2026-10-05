@@ -50,6 +50,42 @@ cd <repo>\src
 .\run_all.ps1
 ```
 
+## The Windows kernel driver
+
+The user-mode stack above is the mature half of this project. The other half is a real
+Windows kernel driver, because a user-mode process cannot put a volume into the Windows
+storage stack — only a driver can, and that is what a drive letter in Explorer ultimately
+requires.
+
+| Stage | What it does | State |
+|---|---|---|
+| **D0** | Kernel driver that opens the NDK provider, registers a memory region and completes an **RDMA read against this hardware** | ✅ byte-identical, 4096 bytes |
+| **D1** | **StorPort miniport** presenting a virtual LUN, so Windows sees a real disk | ✅ `Disk 4 NVMeoFND RAM LUN 0001`, BusType Fibre Channel, GPT + NTFS, **drive letter `X:`** with files written and read back through the volume stack |
+| **D2** | The **NVMe-oF initiator in kernel mode**: adapter → PD → CQ → QP → connector → MR → registered region (rkey/lkey), all `STATUS_SUCCESS` | ✅ bring-up green and reproducible; the fabrics exchange is blocked on a live RDMA target |
+
+Three things from that work are worth knowing even if you never load the driver:
+
+- **A hypervisor blocks the Mellanox NDK provider.** With Hyper-V active, `NdkOpenAdapter`
+  returns `0xC0010011` and anything that reaches the connection path bugchecks with `0x139`
+  (`P1 = 0xa`, incorrect stack). With `bcdedit /set hypervisorlaunchtype off` the adapter
+  opens and the whole path behaves. The hypervisor takes over DMA remapping; a 2020 WinOF
+  driver on this card cannot establish itself underneath it. It blocks the **user-mode**
+  NetworkDirect API too, not just the kernel one.
+- **A failed RDMA connection must be closed, and the close callback takes one argument.**
+  `NDK_FN_CLOSE_COMPLETION` is `VOID (PVOID Context)` — no status — while
+  `NdkDeregisterMr` takes `(Context, Status)`. Using one two-parameter callback for both is
+  a type mismatch, and a connection attempt that fails leaves state inside `mlx4eth63` that
+  trips `KERNEL_SECURITY_CHECK_FAILURE` roughly **ninety seconds later**. That delay, and a
+  reported stack that cannot be unwound, is why those crashes resisted a minidump for so
+  long. See [TEARDOWN-FIX-PROVEN.md](TEARDOWN-FIX-PROVEN.md).
+- **A single HCA cannot connect to itself.** `NdkConnect` from `192.168.100.2` to
+  `192.168.100.2` — and the same with the user-mode initiator — is refused immediately with
+  `0xC0000236 ND_CONNECTION_REFUSED`, while the target never sees the request. A second
+  machine, or a second RDMA-capable port with its own address, is required.
+
+The recorded state of that work, including what is still open, is in
+[KERNEL-NVMEOF-STATUS.md](KERNEL-NVMEOF-STATUS.md) and
+[FACTS-2026-10-05-1200.md](FACTS-2026-10-05-1200.md).
 ## What is implemented
 
 - **Fabrics**: Connect (with the private-data checks Linux performs), Property Get/Set,
@@ -395,7 +431,7 @@ drops the link.
 | [EVIDENCE-1TB.md](EVIDENCE-1TB.md) | Raw evidence for the 1 TB disk on Windows, including the teardown record |
 | [DRIVER-D0.md](DRIVER-D0.md) | Preparation for the kernel-mode route (D0/D1): what is already proven about this machine (the WDK is installed, ndkpi.h and storport.h are present), what the probe must prove, how to build and load a driver here, and the risks in the order that decides whether the route exists at all |
 | [ROADMAP.md](ROADMAP.md) | What is still missing for a complete NVMe-oF, as a work plan: per-item scope, dependencies, effort estimate and — for every item — an acceptance criterion, plus milestones, the critical path and the decisions that change the ordering |
-| [COMMERCIAL.md](COMMERCIAL.md) | Commercial licensing (AGPL dual licensing) and license-compatibility notes |
+| [COMMERCIAL.md](COMMERCIAL.md) | Commercial licensing (Apache-2.0 dual licensing) and license-compatibility notes |
 
 These are written in Chinese; `README.md` (this file) is the English entry point.
 
@@ -409,7 +445,7 @@ These are written in Chinese; `README.md` (this file) is the English entry point
 
 ## License
 
-**GNU Affero General Public License v3.0 or later** ([LICENSE](LICENSE)) — the verbatim
+**Apache License 2.0)) — the verbatim
 official text, 34,523 bytes, sha256
 `8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef`.
 
@@ -417,12 +453,12 @@ official text, 34,523 bytes, sha256
 Copyright (C) 2026 Dingtaiqi
 
 This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published by
+it under the terms of the Apache License 2.0
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 ```
 
-**AGPL permits commercial use**; what it regulates is *closed source*:
+**Apache-2.0 permits commercial use**; what it regulates is *closed source*:
 
 - Using it inside a company, making money with it, running it as a service — all allowed,
   free of charge.
@@ -436,7 +472,7 @@ the Free Software Foundation, either version 3 of the License, or
 Two compatibility traps:
 
 1. The two Linux kernel headers under `ref/` are **GPL-2.0** and are read for comparison
-   only; they are never compiled. **GPL-2.0-only and AGPL-3.0 are incompatible** — do not
+   only; they are never compiled. **GPL-2.0-only and Apache-2.0-3.0 are incompatible** — do not
    merge their code into this project. If you truly must, the whole project would have to
    become GPL-2.0.
 2. Linking the vendor NetworkDirect library (`ndutil`/NDSPI) changes nothing: it is not a
