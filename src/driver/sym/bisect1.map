@@ -1,0 +1,416 @@
+ bisect1
+
+ Timestamp is 6ac27c52 (Mon Oct  5 00:18:26 2026)
+
+ Preferred load address is 0000000140000000
+
+ Start         Length     Name                   Class
+ 0001:00000000 00002b00H .text$mn                CODE
+ 0001:00002b00 00000040H .text$mn$00             CODE
+ 0001:00002b40 00000740H .text$mn$21             CODE
+ 0001:00003280 00000015H .text$x                 CODE
+ 0002:00000000 00001000H fothk$fogrp             CODE
+ 0003:00000000 000000b0H .idata$5                DATA
+ 0003:000000b0 00000180H .00cfg                  DATA
+ 0003:00000230 00000030H .gfids                  DATA
+ 0003:00000258 00000000H .gfids$y                DATA
+ 0003:00000260 000002a0H .rdata                  DATA
+ 0003:00000500 00000080H .rdata$CastGuardVftablesA DATA
+ 0003:00000580 00000080H .rdata$CastGuardVftablesC DATA
+ 0003:00000600 00000018H .rdata$voltmd           DATA
+ 0003:00000618 00000230H .rdata$zzzdbg           DATA
+ 0003:00000848 00000184H .xdata                  DATA
+ 0004:00000000 00000d50H .data                   DATA
+ 0004:00000d50 000022c8H .bss                    DATA
+ 0005:00000000 000001d4H .pdata                  DATA
+ 0006:00000000 00000028H .idata$2                DATA
+ 0006:00000028 00000018H .idata$3                DATA
+ 0006:00000040 000000b0H .idata$4                DATA
+ 0006:000000f0 00000184H .idata$6                DATA
+
+  Address         Publics by Value              Rva+Base               Lib:Object
+
+ 0000:00000000       __AbsoluteZero             0000000000000000     <absolute>
+ 0000:00000000       ___safe_se_handler_count   0000000000000000     <absolute>
+ 0000:00000000       ___safe_se_handler_table   0000000000000000     <absolute>
+ 0000:00000000       __arm64x_extra_rfe_table   0000000000000000     <absolute>
+ 0000:00000000       __arm64x_extra_rfe_table_size 0000000000000000     <absolute>
+ 0000:00000000       __arm64x_native_entrypoint 0000000000000000     <absolute>
+ 0000:00000000       __arm64x_redirection_metadata 0000000000000000     <absolute>
+ 0000:00000000       __arm64x_redirection_metadata_count 0000000000000000     <absolute>
+ 0000:00000000       __enclave_config           0000000000000000     <absolute>
+ 0000:00000000       __guard_check_icall_a64n_fptr 0000000000000000     <absolute>
+ 0000:00000000       __guard_eh_cont_count      0000000000000000     <absolute>
+ 0000:00000000       __guard_eh_cont_table      0000000000000000     <absolute>
+ 0000:00000000       __guard_iat_count          0000000000000000     <absolute>
+ 0000:00000000       __guard_iat_table          0000000000000000     <absolute>
+ 0000:00000000       __guard_longjmp_count      0000000000000000     <absolute>
+ 0000:00000000       __guard_longjmp_table      0000000000000000     <absolute>
+ 0000:00000000       __hybrid_auxiliary_delayload_iat 0000000000000000     <absolute>
+ 0000:00000000       __hybrid_auxiliary_delayload_iat_copy 0000000000000000     <absolute>
+ 0000:00000000       __hybrid_auxiliary_iat     0000000000000000     <absolute>
+ 0000:00000000       __hybrid_auxiliary_iat_copy 0000000000000000     <absolute>
+ 0000:00000000       __hybrid_code_map          0000000000000000     <absolute>
+ 0000:00000000       __hybrid_code_map_count    0000000000000000     <absolute>
+ 0000:00000000       __hybrid_image_info_bitfield 0000000000000000     <absolute>
+ 0000:00000000       __x64_code_ranges_to_entry_points 0000000000000000     <absolute>
+ 0000:00000000       __x64_code_ranges_to_entry_points_count 0000000000000000     <absolute>
+ 0000:0000000a       __guard_fids_count         000000000000000a     <absolute>
+ 0000:00014500       __guard_flags              0000000000014500     <absolute>
+ 0000:00000000       __ImageBase                0000000140000000     <linker-defined>
+ 0001:00002620       DriverEntry                0000000140003620 f   bisect1.obj
+ 0001:000027d0       RtlInitUnicodeString       00000001400037d0 f   ntoskrnl:ntoskrnl.exe
+ 0001:000027d6       KeInitializeEvent          00000001400037d6 f   ntoskrnl:ntoskrnl.exe
+ 0001:000027dc       KeResetEvent               00000001400037dc f   ntoskrnl:ntoskrnl.exe
+ 0001:000027e2       KeSetEvent                 00000001400037e2 f   ntoskrnl:ntoskrnl.exe
+ 0001:000027e8       KeWaitForSingleObject      00000001400037e8 f   ntoskrnl:ntoskrnl.exe
+ 0001:000027ee       KeInitializeSpinLock       00000001400037ee f   ntoskrnl:ntoskrnl.exe
+ 0001:000027f4       ExAllocatePoolWithTag      00000001400037f4 f   ntoskrnl:ntoskrnl.exe
+ 0001:000027fa       ExFreePoolWithTag          00000001400037fa f   ntoskrnl:ntoskrnl.exe
+ 0001:00002800       MmProbeAndLockPages        0000000140003800 f   ntoskrnl:ntoskrnl.exe
+ 0001:00002806       MmUnlockPages              0000000140003806 f   ntoskrnl:ntoskrnl.exe
+ 0001:0000280c       IoAllocateMdl              000000014000380c f   ntoskrnl:ntoskrnl.exe
+ 0001:00002812       IoFreeMdl                  0000000140003812 f   ntoskrnl:ntoskrnl.exe
+ 0001:00002818       ZwClose                    0000000140003818 f   ntoskrnl:ntoskrnl.exe
+ 0001:0000281e       ZwCreateKey                000000014000381e f   ntoskrnl:ntoskrnl.exe
+ 0001:00002824       ZwOpenKey                  0000000140003824 f   ntoskrnl:ntoskrnl.exe
+ 0001:0000282a       ZwQueryValueKey            000000014000382a f   ntoskrnl:ntoskrnl.exe
+ 0001:00002830       ZwSetValueKey              0000000140003830 f   ntoskrnl:ntoskrnl.exe
+ 0001:00002836       __C_specific_handler       0000000140003836 f   ntoskrnl:ntoskrnl.exe
+ 0001:0000283c       ReadNoFence64              000000014000383c f i ntoskrnl:guard_support.obj
+ 0001:00002844       ReadPointerNoFence         0000000140003844 f i ntoskrnl:guard_support.obj
+ 0001:0000284c       __castguard_check_failure_debugbreak 000000014000384c f i ntoskrnl:guard_support.obj
+ 0001:00002868       __castguard_check_failure_fastfail 0000000140003868 f i ntoskrnl:guard_support.obj
+ 0001:0000288c       __castguard_check_failure_nop 000000014000388c f i ntoskrnl:guard_support.obj
+ 0001:00002890       __castguard_check_failure_os_handled 0000000140003890 f i ntoskrnl:guard_support.obj
+ 0001:00002914       __castguard_slow_path_check_debugbreak 0000000140003914 f i ntoskrnl:guard_support.obj
+ 0001:0000294c       __castguard_slow_path_check_fastfail 000000014000394c f i ntoskrnl:guard_support.obj
+ 0001:00002988       __castguard_slow_path_check_nop 0000000140003988 f i ntoskrnl:guard_support.obj
+ 0001:0000298c       __castguard_slow_path_check_os_handled 000000014000398c f i ntoskrnl:guard_support.obj
+ 0001:00002a00       _guard_icall_checks_enforced 0000000140003a00 f i ntoskrnl:guard_support.obj
+ 0001:00002a18       _guard_rf_checks_enforced  0000000140003a18 f i ntoskrnl:guard_support.obj
+ 0001:00002a20       __cpu_features_init        0000000140003a20 f   ntoskrnl:cpuinfo.obj
+ 0001:00002ae0       _guard_check_icall_nop     0000000140003ae0 f i ntoskrnl:guard_check.obj
+ 0001:00002af0       WskRegister                0000000140003af0 f   netio:NETIO.SYS
+ 0001:00002af6       WskCaptureProviderNPI      0000000140003af6 f   netio:NETIO.SYS
+ 0001:00002b10       _guard_dispatch_icall_nop  0000000140003b10 f   ntoskrnl:guard_dispatch.obj
+ 0001:00002b30       _guard_xfg_dispatch_icall_nop 0000000140003b30 f   ntoskrnl:guard_xfg_dispatch.obj
+ 0001:00002b40       memcpy                     0000000140003b40 f   ntoskrnl:memcpy.obj
+ 0001:00002b40       memmove                    0000000140003b40 f   ntoskrnl:memcpy.obj
+ 0001:00002e00       memset                     0000000140003e00 f   ntoskrnl:memset.obj
+ 0001:00002e00       memset_$fo_default$        0000000140003e00     ntoskrnl:memset.obj
+ 0001:00002f40       __memset_repmovs           0000000140003f40 f   ntoskrnl:memset.obj
+ 0001:00002fc0       __memset_query             0000000140003fc0 f   ntoskrnl:memset.obj
+ 0001:00003000       __memset_spec_ermsb        0000000140004000 f   ntoskrnl:memset_spec_ermsb.obj
+ 0001:00003140       __memset_spec_ermsb_repmovsb 0000000140004140 f   ntoskrnl:memset_spec_ermsb.obj
+ 0001:00003180       __memset_spec_plain        0000000140004180 f   ntoskrnl:memset_spec_plain.obj
+ 0003:00000000       __imp_WskCaptureProviderNPI 0000000140006000     netio:NETIO.SYS
+ 0003:00000008       __imp_WskRegister          0000000140006008     netio:NETIO.SYS
+ 0003:00000010       \177NETIO_NULL_THUNK_DATA  0000000140006010     netio:NETIO.SYS
+ 0003:00000018       __imp_KeSetEvent           0000000140006018     ntoskrnl:ntoskrnl.exe
+ 0003:00000020       __imp_KeWaitForSingleObject 0000000140006020     ntoskrnl:ntoskrnl.exe
+ 0003:00000028       __imp_KeInitializeSpinLock 0000000140006028     ntoskrnl:ntoskrnl.exe
+ 0003:00000030       __imp_ExAllocatePoolWithTag 0000000140006030     ntoskrnl:ntoskrnl.exe
+ 0003:00000038       __imp_ExFreePoolWithTag    0000000140006038     ntoskrnl:ntoskrnl.exe
+ 0003:00000040       __imp_MmProbeAndLockPages  0000000140006040     ntoskrnl:ntoskrnl.exe
+ 0003:00000048       __imp_MmUnlockPages        0000000140006048     ntoskrnl:ntoskrnl.exe
+ 0003:00000050       __imp_KeResetEvent         0000000140006050     ntoskrnl:ntoskrnl.exe
+ 0003:00000058       __imp_IoFreeMdl            0000000140006058     ntoskrnl:ntoskrnl.exe
+ 0003:00000060       __imp_ZwClose              0000000140006060     ntoskrnl:ntoskrnl.exe
+ 0003:00000068       __imp_ZwCreateKey          0000000140006068     ntoskrnl:ntoskrnl.exe
+ 0003:00000070       __imp_ZwOpenKey            0000000140006070     ntoskrnl:ntoskrnl.exe
+ 0003:00000078       __imp_ZwQueryValueKey      0000000140006078     ntoskrnl:ntoskrnl.exe
+ 0003:00000080       __imp_ZwSetValueKey        0000000140006080     ntoskrnl:ntoskrnl.exe
+ 0003:00000088       __imp___C_specific_handler 0000000140006088     ntoskrnl:ntoskrnl.exe
+ 0003:00000090       __imp_KeInitializeEvent    0000000140006090     ntoskrnl:ntoskrnl.exe
+ 0003:00000098       __imp_IoAllocateMdl        0000000140006098     ntoskrnl:ntoskrnl.exe
+ 0003:000000a0       __imp_RtlInitUnicodeString 00000001400060a0     ntoskrnl:ntoskrnl.exe
+ 0003:000000a8       \177ntoskrnl_NULL_THUNK_DATA 00000001400060a8     ntoskrnl:ntoskrnl.exe
+ 0003:000000b0       __guard_check_icall_fptr   00000001400060b0     ntoskrnl:guard_support.obj
+ 0003:000000b8       __guard_dispatch_icall_fptr 00000001400060b8     ntoskrnl:guard_support.obj
+ 0003:000000c0       __guard_xfg_check_icall_fptr 00000001400060c0     ntoskrnl:guard_support.obj
+ 0003:000000c8       __guard_xfg_dispatch_icall_fptr 00000001400060c8     ntoskrnl:guard_support.obj
+ 0003:000000d0       __guard_xfg_table_dispatch_icall_fptr 00000001400060d0     ntoskrnl:guard_support.obj
+ 0003:000000d8       __castguard_check_failure_os_handled_fptr 00000001400060d8     ntoskrnl:guard_support.obj
+ 0003:000000e0       __uma_functions            00000001400060e0     ntstrsafe:loadcfg.obj
+ 0003:00000230       __guard_fids_table         0000000140006230     <linker-defined>
+ 0003:000002c0       RtlNtPathSeperatorString   00000001400062c0     ntstrsafe:loadcfg.obj
+ 0003:000002d0       ??_C@_13FPGAJAPJ@?$AA?2@   00000001400062d0     ntstrsafe:loadcfg.obj
+ 0003:000002d8       RtlDosPathSeperatorsString 00000001400062d8     ntstrsafe:loadcfg.obj
+ 0003:000002e8       ??_C@_15MNCACJLI@?$AA?2?$AA?1@ 00000001400062e8     ntstrsafe:loadcfg.obj
+ 0003:000002f0       RtlAlternateDosPathSeperatorString 00000001400062f0     ntstrsafe:loadcfg.obj
+ 0003:00000300       ??_C@_13CGOKJPIL@?$AA?1@   0000000140006300     ntstrsafe:loadcfg.obj
+ 0003:00000310       _load_config_used          0000000140006310     ntstrsafe:loadcfg.obj
+ 0003:00000500       __CastGuardVftablesStart   0000000140006500     ntoskrnl:guard_support.obj
+ 0003:00000580       __CastGuardVftablesEnd     0000000140006580     ntoskrnl:guard_support.obj
+ 0003:00000600       __volatile_metadata        0000000140006600     <linker-defined>
+ 0004:00000cc0       __isa_info                 0000000140007cc0     ntoskrnl:cpuinfo.obj
+ 0004:00000d00       __security_cookie          0000000140007d00     ntstrsafe:gs_cookie.obj
+ 0004:00000d40       __security_cookie_complement 0000000140007d40     ntstrsafe:gs_cookie.obj
+ 0004:00000d50       ExPoolZeroingNativelySupported 0000000140007d50     bisect1.obj
+ 0006:00000000       __IMPORT_DESCRIPTOR_ntoskrnl 000000014000c000     ntoskrnl:ntoskrnl.exe
+ 0006:00000014       __IMPORT_DESCRIPTOR_NETIO  000000014000c014     netio:NETIO.SYS
+ 0006:00000028       __NULL_IMPORT_DESCRIPTOR   000000014000c028     ntoskrnl:ntoskrnl.exe
+
+ entry point at        0001:00002620
+
+ Static symbols
+
+ 0003:ffffa000       __guard_fids_createObjects 0000000140000000     bisect1.obj
+ 0000:ffff2000       .debug$S                   0000000140000000     netio:NETIO.SYS
+ 0000:ffff2000       .debug$S                   0000000140000000     netio:NETIO.SYS
+ 0003:ffffa000       __guard_fids__             0000000140000000     ntoskrnl:guard_support.obj
+ 0003:ffffa000       __guard_fids__             0000000140000000     ntoskrnl:guard_support.obj
+ 0003:ffffa000       __guard_fids__guard_icall_checks_enforced 0000000140000000     ntoskrnl:guard_support.obj
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0000:ffff2000       .debug$S                   0000000140000000     ntoskrnl:ntoskrnl.exe
+ 0003:ffffa014       __guard_fids_registerRegion 0000000140000014     bisect1.obj
+ 0003:ffffa01c       __guard_fids_connectToTarget 000000014000001c     bisect1.obj
+ 0003:ffffa024       __guard_fids_DriverEntry   0000000140000024     bisect1.obj
+ 0001:00000000       logRaw                     0000000140001000 f   bisect1.obj
+ 0001:00000070       logNum                     0000000140001070 f   bisect1.obj
+ 0001:000001b0       logf                       00000001400011b0 f   bisect1.obj
+ 0001:00000578       $LN30                      0000000140001578     bisect1.obj
+ 0001:0000059c       $LN29                      000000014000159c     bisect1.obj
+ 0001:00000600       writeLog                   0000000140001600 f   bisect1.obj
+ 0001:00000750       traceValue                 0000000140001750 f   bisect1.obj
+ 0001:00000850       StepStart                  0000000140001850 f   bisect1.obj
+ 0001:000008f0       StepFinish                 00000001400018f0 f   bisect1.obj
+ 0001:00000990       complete                   0000000140001990 f   bisect1.obj
+ 0001:000009f0       requestComplete            00000001400019f0 f   bisect1.obj
+ 0001:00000a40       cqNotification             0000000140001a40 f   bisect1.obj
+ 0001:00000a80       reap                       0000000140001a80 f   bisect1.obj
+ 0001:00000bf0       openAdapter                0000000140001bf0 f   bisect1.obj
+ 0001:00000fc0       createObjects              0000000140001fc0 f   bisect1.obj
+ 0001:00001370       registerRegion             0000000140002370 f   bisect1.obj
+ 0001:00001650       fillPrivateData            0000000140002650 f   bisect1.obj
+ 0001:000016d0       connectToTarget            00000001400026d0 f   bisect1.obj
+ 0001:00001ca0       sglKeyed                   0000000140002ca0 f   bisect1.obj
+ 0001:00001d60       sglNull                    0000000140002d60 f   bisect1.obj
+ 0001:00001da0       submitCapsule              0000000140002da0 f   bisect1.obj
+ 0001:00001fa0       responseStatus             0000000140002fa0 f   bisect1.obj
+ 0001:00001fd0       nvmeofRun                  0000000140002fd0 f   bisect1.obj
+ 0001:00002400       NvmeofkTeardown            0000000140003400 f   bisect1.obj
+ 0001:000024c0       connectWanted              00000001400034c0 f   bisect1.obj
+ 0001:00002600       nvmeofkUnload              0000000140003600 f   bisect1.obj
+ 0001:000028d0       __castguard_check_failure_os_handled_wrapper 00000001400038d0 f   ntoskrnl:guard_support.obj
+ 0001:000028f4       __castguard_compat_check   00000001400038f4 f   ntoskrnl:guard_support.obj
+ 0001:000029e4       __castguard_slow_path_compat_check 00000001400039e4 f   ntoskrnl:guard_support.obj
+ 0001:00002b10       $$000000                   0000000140003b10     ntoskrnl:guard_dispatch.obj
+ 0001:00002b30       $$000000                   0000000140003b30     ntoskrnl:guard_xfg_dispatch.obj
+ 0001:00002b40       $$000000                   0000000140003b40     ntoskrnl:memcpy.obj
+ 0001:00002b60       mcpy00                     0000000140003b60     ntoskrnl:memcpy.obj
+ 0001:00002b80       mcpy10                     0000000140003b80     ntoskrnl:memcpy.obj
+ 0001:00002b9a       mcpy20                     0000000140003b9a     ntoskrnl:memcpy.obj
+ 0001:00002ba0       mcpy30                     0000000140003ba0     ntoskrnl:memcpy.obj
+ 0001:00002bc0       xcpy00                     0000000140003bc0     ntoskrnl:memcpy.obj
+ 0001:00002bf1       xcpy10                     0000000140003bf1     ntoskrnl:memcpy.obj
+ 0001:00002c40       xcpy13                     0000000140003c40     ntoskrnl:memcpy.obj
+ 0001:00002c6f       xcpy15                     0000000140003c6f     ntoskrnl:memcpy.obj
+ 0001:00002c91       xcpy20                     0000000140003c91     ntoskrnl:memcpy.obj
+ 0001:00002ca5       xcpy30                     0000000140003ca5     ntoskrnl:memcpy.obj
+ 0001:00002cc0       lcpy00                     0000000140003cc0     ntoskrnl:memcpy.obj
+ 0001:00002d00       lcpy10                     0000000140003d00     ntoskrnl:memcpy.obj
+ 0001:00002d40       xmov00                     0000000140003d40     ntoskrnl:memcpy.obj
+ 0001:00002d6d       xmov10                     0000000140003d6d     ntoskrnl:memcpy.obj
+ 0001:00002d80       xmov13                     0000000140003d80     ntoskrnl:memcpy.obj
+ 0001:00002daf       xmov15                     0000000140003daf     ntoskrnl:memcpy.obj
+ 0001:00002dd1       xmov20                     0000000140003dd1     ntoskrnl:memcpy.obj
+ 0001:00002de6       xmov30                     0000000140003de6     ntoskrnl:memcpy.obj
+ 0001:00002e00       $$000000                   0000000140003e00     ntoskrnl:memset.obj
+ 0001:00002e22       mset10                     0000000140003e22     ntoskrnl:memset.obj
+ 0001:00002e38       mset20                     0000000140003e38     ntoskrnl:memset.obj
+ 0001:00002e61       mset30                     0000000140003e61     ntoskrnl:memset.obj
+ 0001:00002e90       mset45                     0000000140003e90     ntoskrnl:memset.obj
+ 0001:00002e96       mset46                     0000000140003e96     ntoskrnl:memset.obj
+ 0001:00002ec0       mset47                     0000000140003ec0     ntoskrnl:memset.obj
+ 0001:00002ef0       mset48                     0000000140003ef0     ntoskrnl:memset.obj
+ 0001:00002f06       mset50                     0000000140003f06     ntoskrnl:memset.obj
+ 0001:00002f40       $$000000                   0000000140003f40     ntoskrnl:memset.obj
+ 0001:00002f4a       repmovs10                  0000000140003f4a     ntoskrnl:memset.obj
+ 0001:00002f7c       repmovs20                  0000000140003f7c     ntoskrnl:memset.obj
+ 0001:00002fc0       $$000000                   0000000140003fc0     ntoskrnl:memset.obj
+ 0001:00003000       $$000000                   0000000140004000     ntoskrnl:memset_spec_ermsb.obj
+ 0001:0000302f       mset20                     000000014000402f     ntoskrnl:memset_spec_ermsb.obj
+ 0001:00003058       mset30                     0000000140004058     ntoskrnl:memset_spec_ermsb.obj
+ 0001:00003090       mset45                     0000000140004090     ntoskrnl:memset_spec_ermsb.obj
+ 0001:00003096       mset46                     0000000140004096     ntoskrnl:memset_spec_ermsb.obj
+ 0001:000030c0       mset47                     00000001400040c0     ntoskrnl:memset_spec_ermsb.obj
+ 0001:000030f0       mset48                     00000001400040f0     ntoskrnl:memset_spec_ermsb.obj
+ 0001:00003106       mset50                     0000000140004106     ntoskrnl:memset_spec_ermsb.obj
+ 0001:00003140       $$000000                   0000000140004140     ntoskrnl:memset_spec_ermsb.obj
+ 0001:00003180       $$000000                   0000000140004180     ntoskrnl:memset_spec_plain.obj
+ 0001:000031a2       mset20                     00000001400041a2     ntoskrnl:memset_spec_plain.obj
+ 0001:000031cb       mset30                     00000001400041cb     ntoskrnl:memset_spec_plain.obj
+ 0001:00003200       mset45                     0000000140004200     ntoskrnl:memset_spec_plain.obj
+ 0001:00003206       mset46                     0000000140004206     ntoskrnl:memset_spec_plain.obj
+ 0001:00003230       mset47                     0000000140004230     ntoskrnl:memset_spec_plain.obj
+ 0001:00003260       mset48                     0000000140004260     ntoskrnl:memset_spec_plain.obj
+ 0001:00003276       mset50                     0000000140004276     ntoskrnl:memset_spec_plain.obj
+ 0001:00003280       registerRegion$filt$0      0000000140004280 f   bisect1.obj
+ 0003:00000260       kSubsysNqn                 0000000140006260     bisect1.obj
+ 0003:00000288       kHostNqn                   0000000140006288     bisect1.obj
+ 0003:00000848       $unwind$logRaw             0000000140006848     bisect1.obj
+ 0003:00000850       $unwind$logNum             0000000140006850     bisect1.obj
+ 0003:00000858       $unwind$logf               0000000140006858     bisect1.obj
+ 0003:00000860       $unwind$writeLog           0000000140006860     bisect1.obj
+ 0003:00000868       $unwind$traceValue         0000000140006868     bisect1.obj
+ 0003:00000870       $unwind$StepStart          0000000140006870     bisect1.obj
+ 0003:00000878       $unwind$StepFinish         0000000140006878     bisect1.obj
+ 0003:00000880       $unwind$complete           0000000140006880     bisect1.obj
+ 0003:00000888       $unwind$requestComplete    0000000140006888     bisect1.obj
+ 0003:00000890       $unwind$cqNotification     0000000140006890     bisect1.obj
+ 0003:00000898       $unwind$reap               0000000140006898     bisect1.obj
+ 0003:000008a0       $unwind$openAdapter        00000001400068a0     bisect1.obj
+ 0003:000008a8       $unwind$createObjects      00000001400068a8     bisect1.obj
+ 0003:000008b0       $unwind$registerRegion     00000001400068b0     bisect1.obj
+ 0003:000008d0       $unwind$registerRegion$filt$0 00000001400068d0     bisect1.obj
+ 0003:000008d8       $unwind$fillPrivateData    00000001400068d8     bisect1.obj
+ 0003:000008e0       $unwind$connectToTarget    00000001400068e0     bisect1.obj
+ 0003:000008ec       $unwind$sglKeyed           00000001400068ec     bisect1.obj
+ 0003:000008f4       $unwind$sglNull            00000001400068f4     bisect1.obj
+ 0003:000008fc       $unwind$submitCapsule      00000001400068fc     bisect1.obj
+ 0003:00000904       $unwind$responseStatus     0000000140006904     bisect1.obj
+ 0003:0000090c       $unwind$nvmeofRun          000000014000690c     bisect1.obj
+ 0003:00000914       $unwind$NvmeofkTeardown    0000000140006914     bisect1.obj
+ 0003:0000091c       $unwind$connectWanted      000000014000691c     bisect1.obj
+ 0003:00000924       $unwind$nvmeofkUnload      0000000140006924     bisect1.obj
+ 0003:0000092c       $unwind$DriverEntry        000000014000692c     bisect1.obj
+ 0003:00000938       $xdatasym$memcpy           0000000140006938     ntoskrnl:memcpy.obj
+ 0003:00000940       $xdatasym$memset           0000000140006940     ntoskrnl:memset.obj
+ 0003:00000948       $xdatasym$__memset_repmovs 0000000140006948     ntoskrnl:memset.obj
+ 0003:00000958       $xdatasym$__memset_query   0000000140006958     ntoskrnl:memset.obj
+ 0003:0000096c       $unwind$__castguard_check_failure_os_handled_wrapper 000000014000696c     ntoskrnl:guard_support.obj
+ 0003:00000978       $unwind$__castguard_check_failure_os_handled 0000000140006978     ntoskrnl:guard_support.obj
+ 0003:00000984       $unwind$__castguard_slow_path_check_os_handled 0000000140006984     ntoskrnl:guard_support.obj
+ 0003:00000990       $unwind$__cpu_features_init 0000000140006990     ntoskrnl:cpuinfo.obj
+ 0003:000009a0       $xdatasym$_guard_dispatch_icall_nop 00000001400069a0     ntoskrnl:guard_dispatch.obj
+ 0003:000009a8       $xdatasym$_guard_xfg_dispatch_icall_nop 00000001400069a8     ntoskrnl:guard_xfg_dispatch.obj
+ 0003:000009b0       $xdatasym$__memset_spec_ermsb 00000001400069b0     ntoskrnl:memset_spec_ermsb.obj
+ 0003:000009b8       $xdatasym$__memset_spec_ermsb_repmovsb 00000001400069b8     ntoskrnl:memset_spec_ermsb.obj
+ 0003:000009c8       $xdatasym$__memset_spec_plain 00000001400069c8     ntoskrnl:memset_spec_plain.obj
+ 0004:00000000       $SG43064                   0000000140007000     bisect1.obj
+ 0004:00000018       $SG43065                   0000000140007018     bisect1.obj
+ 0004:0000002c       $SG43185                   000000014000702c     bisect1.obj
+ 0004:00000030       $SG43189                   0000000140007030     bisect1.obj
+ 0004:00000034       $SG43192                   0000000140007034     bisect1.obj
+ 0004:0000003c       $SG43195                   000000014000703c     bisect1.obj
+ 0004:00000040       $SG43197                   0000000140007040     bisect1.obj
+ 0004:00000044       $SG43198                   0000000140007044     bisect1.obj
+ 0004:00000050       $SG43216                   0000000140007050     bisect1.obj
+ 0004:000000a0       $SG43218                   00000001400070a0     bisect1.obj
+ 0004:000000b8       $SG43219                   00000001400070b8     bisect1.obj
+ 0004:000000d0       $SG43236                   00000001400070d0     bisect1.obj
+ 0004:00000120       $SG43278                   0000000140007120     bisect1.obj
+ 0004:00000168       $SG43291                   0000000140007168     bisect1.obj
+ 0004:000001a8       $SG43348                   00000001400071a8     bisect1.obj
+ 0004:000001c8       $SG43396                   00000001400071c8     bisect1.obj
+ 0004:000001e8       $SG43398                   00000001400071e8     bisect1.obj
+ 0004:00000210       $SG43399                   0000000140007210     bisect1.obj
+ 0004:00000240       $SG43402                   0000000140007240     bisect1.obj
+ 0004:00000290       $SG43404                   0000000140007290     bisect1.obj
+ 0004:000002b0       $SG43407                   00000001400072b0     bisect1.obj
+ 0004:000002d0       $SG43408                   00000001400072d0     bisect1.obj
+ 0004:000002f0       $SG43411                   00000001400072f0     bisect1.obj
+ 0004:00000338       $SG43412                   0000000140007338     bisect1.obj
+ 0004:00000378       $SG43413                   0000000140007378     bisect1.obj
+ 0004:00000398       $SG43414                   0000000140007398     bisect1.obj
+ 0004:000003b8       $SG43447                   00000001400073b8     bisect1.obj
+ 0004:000003e0       $SG43451                   00000001400073e0     bisect1.obj
+ 0004:00000408       $SG43455                   0000000140007408     bisect1.obj
+ 0004:00000430       $SG43459                   0000000140007430     bisect1.obj
+ 0004:00000460       $SG43483                   0000000140007460     bisect1.obj
+ 0004:00000488       $SG43485                   0000000140007488     bisect1.obj
+ 0004:000004b0       $SG43488                   00000001400074b0     bisect1.obj
+ 0004:000004d0       $SG43490                   00000001400074d0     bisect1.obj
+ 0004:00000520       $SG43491                   0000000140007520     bisect1.obj
+ 0004:00000540       $SG43492                   0000000140007540     bisect1.obj
+ 0004:00000560       $SG43557                   0000000140007560     bisect1.obj
+ 0004:000005b0       $SG43559                   00000001400075b0     bisect1.obj
+ 0004:000005d0       $SG43562                   00000001400075d0     bisect1.obj
+ 0004:000005f0       $SG43565                   00000001400075f0     bisect1.obj
+ 0004:00000628       $SG43566                   0000000140007628     bisect1.obj
+ 0004:00000668       $SG43568                   0000000140007668     bisect1.obj
+ 0004:00000688       $SG43570                   0000000140007688     bisect1.obj
+ 0004:000006b0       $SG43571                   00000001400076b0     bisect1.obj
+ 0004:00000710       $SG43572                   0000000140007710     bisect1.obj
+ 0004:00000730       $SG43573                   0000000140007730     bisect1.obj
+ 0004:00000750       $SG43612                   0000000140007750     bisect1.obj
+ 0004:00000770       $SG43614                   0000000140007770     bisect1.obj
+ 0004:00000788       $SG43616                   0000000140007788     bisect1.obj
+ 0004:000007a0       $SG43618                   00000001400077a0     bisect1.obj
+ 0004:000007c0       $SG43662                   00000001400077c0     bisect1.obj
+ 0004:000007e8       $SG43663                   00000001400077e8     bisect1.obj
+ 0004:00000800       $SG43665                   0000000140007800     bisect1.obj
+ 0004:00000860       $SG43666                   0000000140007860     bisect1.obj
+ 0004:00000890       $SG43667                   0000000140007890     bisect1.obj
+ 0004:000008b0       $SG43670                   00000001400078b0     bisect1.obj
+ 0004:000008d8       $SG43671                   00000001400078d8     bisect1.obj
+ 0004:000008e8       $SG43673                   00000001400078e8     bisect1.obj
+ 0004:00000920       $SG43674                   0000000140007920     bisect1.obj
+ 0004:00000938       $SG43675                   0000000140007938     bisect1.obj
+ 0004:00000960       $SG43677                   0000000140007960     bisect1.obj
+ 0004:00000980       $SG43695                   0000000140007980     bisect1.obj
+ 0004:000009d0       $SG43701                   00000001400079d0     bisect1.obj
+ 0004:00000a10       $SG43702                   0000000140007a10     bisect1.obj
+ 0004:00000a70       $SG43724                   0000000140007a70     bisect1.obj
+ 0004:00000ac0       $SG43726                   0000000140007ac0     bisect1.obj
+ 0004:00000ae8       $SG43750                   0000000140007ae8     bisect1.obj
+ 0004:00000b18       $SG43752                   0000000140007b18     bisect1.obj
+ 0004:00000b38       $SG43754                   0000000140007b38     bisect1.obj
+ 0004:00000b58       $SG43756                   0000000140007b58     bisect1.obj
+ 0004:00000b80       $SG43758                   0000000140007b80     bisect1.obj
+ 0004:00000bd0       $SG43759                   0000000140007bd0     bisect1.obj
+ 0004:00000c28       $SG43761                   0000000140007c28     bisect1.obj
+ 0004:00000c48       $SG43762                   0000000140007c48     bisect1.obj
+ 0004:00000c68       $SG43764                   0000000140007c68     bisect1.obj
+ 0004:00000c80       $SG43765                   0000000140007c80     bisect1.obj
+ 0004:00000ca0       $SG43767                   0000000140007ca0     bisect1.obj
+ 0004:00000d60       g_log                      0000000140007d60     bisect1.obj
+ 0004:00002d60       g_len                      0000000140009d60     bisect1.obj
+ 0004:00002d68       g_registration             0000000140009d68     bisect1.obj
+ 0004:00002d80       g_wskClient                0000000140009d80     bisect1.obj
+ 0004:00002d90       g_wskDispatch              0000000140009d90     bisect1.obj
+ 0004:00002da0       g_wskProvider              0000000140009da0     bisect1.obj
+ 0004:00002db0       g_ndk                      0000000140009db0     bisect1.obj
+ 0004:00002dc0       g_async                    0000000140009dc0     bisect1.obj
+ 0004:00002df0       g_connectCtx               0000000140009df0     bisect1.obj
+ 0004:00002e20       g_adapter                  0000000140009e20     bisect1.obj
+ 0004:00002e28       g_pd                       0000000140009e28     bisect1.obj
+ 0004:00002e30       g_cq                       0000000140009e30     bisect1.obj
+ 0004:00002e38       g_qp                       0000000140009e38     bisect1.obj
+ 0004:00002e40       g_connector                0000000140009e40     bisect1.obj
+ 0004:00002e48       g_mr                       0000000140009e48     bisect1.obj
+ 0004:00002e50       g_mdl                      0000000140009e50     bisect1.obj
+ 0004:00002e58       g_region                   0000000140009e58     bisect1.obj
+ 0004:00002e60       g_lkey                     0000000140009e60     bisect1.obj
+ 0004:00002e64       g_rkey                     0000000140009e64     bisect1.obj
+ 0004:00002e68       g_cqEvent                  0000000140009e68     bisect1.obj
+ 0004:00002e80       g_cqLock                   0000000140009e80     bisect1.obj
+ 0004:00002e88       $SG43664                   0000000140009e88     bisect1.obj
+ 0004:00002e89       $SG43672                   0000000140009e89     bisect1.obj
+ 0004:00002e8a       g_tornDown                 0000000140009e8a     bisect1.obj
+ 0004:00002e8b       g_regionSafeToFree         0000000140009e8b     bisect1.obj
+ 0004:00002e8c       $SG43763                   0000000140009e8c     bisect1.obj
+ 0004:00002e8d       $SG43766                   0000000140009e8d     bisect1.obj
+ 0004:00002e90       g_cqResults                0000000140009e90     bisect1.obj
+ 0004:00003010       g_cqCount                  000000014000a010     bisect1.obj
+ 0004:00003014       g_cqDropped                000000014000a014     bisect1.obj
+ 0006:00000236       .idata$6                   000000014000c236     ntoskrnl:ntoskrnl.exe
+ 0006:0000026a       .idata$6                   000000014000c26a     netio:NETIO.SYS
