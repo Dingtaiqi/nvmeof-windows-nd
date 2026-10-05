@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // ---------------------------------------------------------------------------
 //  iSCSI/SCSI protocol self-test.  NO HARDWARE, NO INITIATOR, NO RDMA CARD.
 //

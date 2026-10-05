@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // f1_bringup.cpp - F1/F2 milestone: a real NVMe over Fabrics admin-queue
 // exchange between our own initiator and our own target, over NetworkDirect.
 //

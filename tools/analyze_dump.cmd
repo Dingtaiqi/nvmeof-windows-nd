@@ -1,6 +1,6 @@
 @echo off
 rem SPDX-FileCopyrightText: 2026 Dingtaiqi
-rem SPDX-License-Identifier: AGPL-3.0-or-later
+rem SPDX-License-Identifier: Apache-2.0
 rem
 rem analyze_dump.cmd - analyse a crash dump SAFELY and repeatably.
 rem

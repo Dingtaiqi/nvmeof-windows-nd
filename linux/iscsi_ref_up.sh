@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 #
 # iscsi_ref_up.sh - bring up a THROWAWAY iSCSI target on this host, and capture it.
 #

@@ -1,5 +1,5 @@
-﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: Apache-2.0
 # Cross-check our NVMe wire constants against the reference header.
 #
 # This is the cheap one: no adapter, no processes, no timing.  It exists because

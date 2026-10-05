@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 # ===========================================================================
 #  rxe_counts.sh - dump rxe's hw counters, optionally diffing against a snapshot.
 #

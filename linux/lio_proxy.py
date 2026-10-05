@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 # ===========================================================================
 #  lio_proxy.py - a byte-for-byte tap in front of the reference iSCSI target.
 #

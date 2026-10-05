@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 # ===========================================================================
 #  f5_linux_up.sh - bring the Linux peer up in one command.
 #

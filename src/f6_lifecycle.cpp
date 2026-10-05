@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // f6_lifecycle.cpp - F6: bringing a controller up and taking it down the way a
 // real NVMe-oF host does it.
 //

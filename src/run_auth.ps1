@@ -1,5 +1,5 @@
-﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: Apache-2.0
 # ===========================================================================
 #  run_auth.ps1 - DH-HMAC-CHAP, with no NIC anywhere in the picture.
 #

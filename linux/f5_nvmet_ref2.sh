@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 # ===========================================================================
 #  f5_nvmet_ref2.sh - part two of the reference table: every log page id and the
 #  data-structure features, so "our target deviates here" is a measured statement

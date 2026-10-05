@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // ===========================================================================
 //  F5 - interoperability with an independent NVMe-oF/RDMA peer
 //

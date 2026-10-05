@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 //
 //  Hardware-free self-test entry point: the DH-HMAC-CHAP primitives and protocol
 //  pieces, with no NIC, no NetworkDirect SDK and no peer.

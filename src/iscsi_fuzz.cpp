@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // ---------------------------------------------------------------------------
 //  iSCSI wire fuzz.  NO NIC, NO TARGET, NO INITIATOR - and it runs in CI.
 //

@@ -1,5 +1,5 @@
-﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: Apache-2.0
 # ===========================================================================
 #  run_authselftest.ps1 - check the CNG Diffie-Hellman plumbing against an
 #  independent implementation.

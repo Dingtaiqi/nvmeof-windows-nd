@@ -1,5 +1,5 @@
-﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: Apache-2.0
 # Build and run the wire-format self-test.
 #
 # It is built TWICE on purpose - once as C and once as C++ - because the file is

@@ -1,5 +1,5 @@
-﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Dingtaiqi
+# SPDX-License-Identifier: Apache-2.0
 param(
     [int]   $Port    = 3260,
     [int]   $Seconds = 25,

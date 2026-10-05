@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 # ===========================================================================
 #  peer_ref_acl.sh - let the Windows initiator actually LOG IN to the LIO
 #  reference target, so the NORMAL-session login bytes can be captured.

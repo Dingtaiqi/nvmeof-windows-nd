@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // ---------------------------------------------------------------------------
 //  The bridge's configuration file.  Header-only and dependency-free so that the
 //  NO-HARDWARE suites can gate it (iscsi_selftest.cpp, run_iscsi.ps1, CI) - the product

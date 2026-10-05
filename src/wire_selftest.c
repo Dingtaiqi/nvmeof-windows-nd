@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // Compile-time and small runtime self-test for nvmeof_wire.h.
 //
 // The point of this file is that the wire header's static_asserts actually get

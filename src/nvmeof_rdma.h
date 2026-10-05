@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // nvmeof_rdma.h - NetworkDirect transport for the NVMe-oF implementation.
 //
 // One Device (adapter + registered region) can carry several Queues (one queue

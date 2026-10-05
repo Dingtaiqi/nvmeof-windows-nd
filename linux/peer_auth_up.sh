@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 # Rebuild the peer's nvmet target with DH-HMAC-CHAP required, at the RoCE address.
 #
 # Runs as an ordinary user: every root action below goes through the peer's NOPASSWD

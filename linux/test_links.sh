@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 # The two symlink creations in nvmet_setup.sh, against a fake configfs whose `ln`
 # behaves like the real one.
 #

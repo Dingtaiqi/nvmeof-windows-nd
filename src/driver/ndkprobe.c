@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // ---------------------------------------------------------------------------
 //  D0 step 1: can a kernel driver open an ND adapter at all?
 //

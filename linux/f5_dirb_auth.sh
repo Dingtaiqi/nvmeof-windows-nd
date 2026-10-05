@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 # ===========================================================================
 #  f5_dirb_auth.sh - direction B with DH-HMAC-CHAP: a real Linux host logs in
 #  to OUR Windows target using in-band authentication.

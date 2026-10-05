@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 // f3_io.cpp - F3 milestone: NVMe-oF I/O queues and Read/Write commands.
 //
 // WHAT IS NEW HERE COMPARED WITH f1_bringup.cpp

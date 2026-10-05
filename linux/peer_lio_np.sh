@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Dingtaiqi
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 IQN="iqn.2024-01.local.rdma:linuxtarget"
 CFG=/sys/kernel/config/target
 echo 0 > "$CFG/iscsi/$IQN/tpgt_1/enable" 2>/dev/null || true

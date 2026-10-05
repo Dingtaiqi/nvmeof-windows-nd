@@ -1,5 +1,5 @@
-﻿// SPDX-FileCopyrightText: 2026 Dingtaiqi
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-License-Identifier: Apache-2.0
 // ---------------------------------------------------------------------------
 //  The parked-write table, on its own so it can be tested without hardware.
 //
