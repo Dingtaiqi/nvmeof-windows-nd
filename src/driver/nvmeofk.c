@@ -868,7 +868,7 @@ static void closeConnectorNow(void)
         return;
     }
     StepStart(&g_closeCtx[0]);
-    (void)g_connector->Dispatch->NdkCloseConnector(&g_connector->Header, closeDone1, &g_closeCtx[0]);
+    (void)g_connector->Dispatch->NdkCloseConnector(g_connector, closeDone1, &g_closeCtx[0]);
     (void)StepFinish(STATUS_PENDING, &g_closeCtx[0], 10000);
     logf("connector closed after the failed connect (this is what stops the delayed 0x139)");
     g_connector = NULL;
@@ -881,67 +881,75 @@ static BOOLEAN g_mrRegistered     = FALSE;   // mirrors the register call result
 
 static void NvmeofkTeardown(void)
 {
+    // Close in reverse order of creation, each with its OWN context (reusing one
+    // context five times in a row is what corrupted the wait list in the first place),
+    // each with the one-parameter NDK_FN_CLOSE_COMPLETION that ndkpi.h actually declares,
+    // and each waited for.  This replaces the old "leak everything on purpose" path:
+    // leaking was only ever safe because D0 connected successfully and never repeated.
     if (g_tornDown) {
         return;
     }
     g_tornDown = TRUE;
 
-    // ORDER MATTERS, and the previous version got it wrong in the way that WER
-    // recorded as AV_nvmeofk2!unknown_function:
-    //   * the MR is DEREGISTERED first and the result is checked.  Closing the MR
-    //     and then freeing the MDL and the pool block unconditionally means that if
-    //     the close had not really completed, the HCA still had the region
-    //     registered and the next access to it faulted at DISPATCH_LEVEL.
-    //   * if the deregister does not succeed the backing memory is deliberately NOT
-    //     freed.  A leaked allocation is a far better outcome than a bugcheck.
-    // NO NDK OBJECT IS CLOSED HERE, DELIBERATELY.
-    //
-    // D0 - the kernel driver in this project that actually completed an RDMA read
-    // against this hardware - never closed a single NDK object.  It leaked them until
-    // reboot and it never bugchecked.  This file tried to be tidy and added a full
-    // close path; that path is where every remaining crash lives, and the minidump of
-    // the last one shows it dying inside KeWaitForSingleObject on the event belonging
-    // to a close context (r12 == g_closeCtx[5].done, with a corrupted wait list).
-    // The header explains why the shape was wrong: closes take NDK_FN_CLOSE_COMPLETION
-    // which receives ONLY a Context - no status - while NdkDeregisterMr takes a
-    // NDK_FN_REQUEST_COMPLETION with (Context, Status).  One callback for both slots
-    // is a type mismatch, and the provider is entitled to do anything with it.
-    //
-    // Getting kernel NVMe-oF working is the goal; a clean teardown is a later,
-    // separate problem with its own testing budget.  Align with the proven driver.
-    logf("teardown: NDK objects intentionally NOT closed (D0 behaviour);  WSK released");
-
-
-    if (g_regionSafeToFree) {
-        if (g_mdl != NULL) {
-            MmUnlockPages(g_mdl);   // MmProbeAndLockPages has to be undone before the MDL goes away
-            IoFreeMdl(g_mdl);
-            g_mdl = NULL;
-        }
-        if (g_region != NULL) {
-            ExFreePoolWithTag(g_region, NVMEOFK_TAG);
-            g_region = NULL;
-        }
-    } else if (g_region != NULL) {
-        logf("region %p intentionally leaked (MR was not safely deregistered)", g_region);
+    if (g_connector != NULL) {
+        StepStart(&g_closeCtx[0]);
+        (void)g_connector->Dispatch->NdkCloseConnector(g_connector, closeDone1, &g_closeCtx[0]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[0], 10000);
+        logf("teardown: connector closed");
+        g_connector = NULL;
     }
-
-    // NOTHING IS RELEASED HERE - not the NDK objects, not the adapter, not the WSK
-    // provider.  This is deliberate and it is what D0 effectively did, because D0
-    // never actually ran its cleanup path.
-    //
-    // The hang that produced this comment: with the NDK objects intentionally left
-    // open (the previous change), the WskReleaseProviderNPI call below never
-    // returned.  The provider still had live NDK usage, so releasing it blocked
-    // forever, and the driver sat in Start Pending with DriverEntry never returning
-    // - no bugcheck, just a dead driver and a machine that slowly suffocates.
-    // The minidump route would never have caught that one: a hang leaves no dump.
-    //
-    // A driver that is loaded once for a measurement, leaks until reboot and returns
-    // immediately is exactly the right shape for this stage.  Correct teardown is a
-    // separate piece of work with its own test budget.
-    logf("teardown: nothing released on purpose (D0 behaviour) - objects live until reboot");
+    if (g_qp != NULL) {
+        StepStart(&g_closeCtx[1]);
+        (void)g_qp->Dispatch->NdkCloseQp(g_qp, closeDone1, &g_closeCtx[1]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[1], 10000);
+        logf("teardown: qp closed");
+        g_qp = NULL;
+    }
+    if (g_cq != NULL) {
+        StepStart(&g_closeCtx[2]);
+        (void)g_cq->Dispatch->NdkCloseCq(g_cq, closeDone1, &g_closeCtx[2]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[2], 10000);
+        logf("teardown: cq closed");
+        g_cq = NULL;
+    }
+    if (g_mr != NULL) {
+        StepStart(&g_closeCtx[3]);
+        (void)g_mr->Dispatch->NdkCloseMr(g_mr, closeDone1, &g_closeCtx[3]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[3], 10000);
+        logf("teardown: mr closed");
+        g_mr = NULL;
+    }
+    if (g_pd != NULL) {
+        StepStart(&g_closeCtx[4]);
+        (void)g_pd->Dispatch->NdkClosePd(g_pd, closeDone1, &g_closeCtx[4]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[4], 10000);
+        logf("teardown: pd closed");
+        g_pd = NULL;
+    }
+    writeLog();
+    logf("teardown complete: every NDK object was closed, nothing leaked");
+    writeLog();
 }
+
+// History, kept short because it cost fourteen bugchecks to learn:
+//
+//   The version of this file before the rewrite above did NOT close anything, on the
+//   theory that D0 - the kernel driver in this project that really did complete an RDMA
+//   read on this hardware - never closed an NDK object either and never bugchecked.
+//
+//   That reasoning was wrong in one specific way.  D0 connected SUCCESSFULLY and its
+//   connection ended cleanly, so nothing was left behind.  This driver also had to
+//   survive a connection that FAILED, and a failed connection leaves RDMA-CM state
+//   inside mlx4eth63.  About ninety seconds later that state trips
+//   KERNEL_SECURITY_CHECK_FAILURE (0x139, P1 = 0xa, FAST_FAIL_INCORRECT_STACK), which
+//   is uninspectable precisely because the stack it reports cannot be unwound.  Every
+//   delayed bugcheck in this project had that shape.
+//
+//   So: close the connector the moment a connect fails (closeConnectorNow, above), and
+//   close everything on the way out (this function).  Both use closeDone1, whose
+//   signature matches NDK_FN_CLOSE_COMPLETION - one Context, no status - because the
+//   old two-parameter callback was a type mismatch against every close method.
+
 
 // Is the network part of this driver wanted at all?  Default NO: a bare load then
 // only opens the adapter and builds the objects, which is a test that cannot touch
