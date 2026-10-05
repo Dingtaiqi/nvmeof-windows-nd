@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 <#
   Repository hygiene: the three checks that CI runs on every push, in one place so a
   developer can run the SAME code before pushing.

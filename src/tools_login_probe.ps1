@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: Apache-2.0
 # ===========================================================================
 #  tools_login_probe.ps1 - send a REAL login request at a target and dump the

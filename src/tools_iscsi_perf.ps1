@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 <#
   iSCSI bridge throughput, measured through Windows' own initiator.
 

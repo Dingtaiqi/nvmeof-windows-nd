@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: Apache-2.0
 <#
   Tune (or restore) the Microsoft iSCSI initiator's burst parameters.

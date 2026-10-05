@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: Apache-2.0
 # ===========================================================================
 #  gen_dhgroups.ps1 - fetch the FFDHE groups from RFC 7919 and emit them as C++.

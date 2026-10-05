@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: Apache-2.0
 # ===========================================================================
 #  interop_link.ps1 - put a LAN machine on the same L2 segment as a CX3 port,

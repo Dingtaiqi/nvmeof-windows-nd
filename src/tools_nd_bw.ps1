@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 <#
   Pure-link bandwidth: the OFFICIAL NetworkDirect tools, no protocol layer at all.
 

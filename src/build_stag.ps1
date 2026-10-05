@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: Apache-2.0
 $ErrorActionPreference = "Continue"
 # Build the NVMe-oF STag smoke test against the same NDSPI stack rdmaio uses.
