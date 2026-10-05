@@ -445,35 +445,19 @@ These are written in Chinese; `README.md` (this file) is the English entry point
 
 ## License
 
-**Apache License 2.0)) — the verbatim
-official text, 34,523 bytes, sha256
-`8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef`.
+**Apache License 2.0** ([LICENSE](LICENSE)) - the verbatim official text, with the
+copyright in [NOTICE](NOTICE).
 
-```
-Copyright (C) 2026 Dingtaiqi
+Apache 2.0 rather than a copyleft licence, and deliberately so. This is a Windows driver
+and protocol stack: it leans on WDK and NDIS sample material, on the NVMe and RDMA
+specifications' reference code, and on the surrounding ecosystem's conventions, all of
+which sit under Apache 2.0 or a compatible permissive licence. Its **explicit patent
+grant** is the clause that actually matters for an implementation of somebody else's
+protocol, and it permits commercial and closed-source use without a separate agreement.
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the Apache License 2.0
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-```
+Material that is read for reference but never compiled or linked is listed in
+[THIRD-PARTY.md](THIRD-PARTY.md) with its own licence. Where that material is
+**GPL-2.0-only it is incompatible** with what this repository ships and stays
+reference-only.
 
-**Apache-2.0 permits commercial use**; what it regulates is *closed source*:
-
-- Using it inside a company, making money with it, running it as a service — all allowed,
-  free of charge.
-- The price is giving back: if you distribute this project or a derivative work — **including
-  offering it over a network** — you must provide the complete corresponding source.
-  Section 13 (`LICENSE` L540) is the network clause, and it is the one substantive difference
-  from the GPL: it is what stops "take open code, run a closed cloud service".
-- A company that genuinely needs to stay closed (embedding it in a proprietary product, or a
-  closed-source SaaS) can take a commercial license instead — see [COMMERCIAL.md](COMMERCIAL.md).
-
-Two compatibility traps:
-
-1. The two Linux kernel headers under `ref/` are **GPL-2.0** and are read for comparison
-   only; they are never compiled. **GPL-2.0-only and Apache-2.0-3.0 are incompatible** — do not
-   merge their code into this project. If you truly must, the whole project would have to
-   become GPL-2.0.
-2. Linking the vendor NetworkDirect library (`ndutil`/NDSPI) changes nothing: it is not a
    copyleft license.

@@ -322,33 +322,44 @@ Get-Disk | Where-Object BusType -eq 'iSCSI'
 - 互操作需要一个**本地** Linux 对端（普通机器 + 软件 RoCE `rxe` 就够；
   云服务器不行——RoCE 不过路由，见 `INTEROP_F5.md`）。
 
+## Windows 内核驱动
+
+上面的用户态栈是这个项目成熟的一半。另一半是真正的 Windows 内核驱动 —— 用户态进程无法把卷
+注入 Windows 存储栈，**只有驱动可以**，而资源管理器里出现盘符最终靠的正是这个。
+
+| 阶段 | 做了什么 | 状态 |
+|---|---|---|
+| **D0** | 内核驱动打开 NDK 提供程序、注册内存区域，并在这块硬件上**完成一次 RDMA 读** | ✅ 4096 字节逐字节一致 |
+| **D1** | **StorPort 微型端口驱动**呈现虚拟 LUN，Windows 因此看到一块真盘 | ✅ `Disk 4 NVMeoFND RAM LUN 0001`、BusType Fibre Channel、GPT + NTFS、**盘符 `X:`**，文件写入读出都经过卷栈 |
+| **D2** | **内核态的 NVMe-oF 发起端**：adapter → PD → CQ → QP → connector → MR → 注册内存（rkey/lkey）全部 `STATUS_SUCCESS` | ✅ bring-up 全绿可复现；fabrics 交换卡在缺少一个在线的 RDMA 目标 |
+
+即使你从不加载这个驱动，这三点也值得知道：
+
+- **hypervisor 会挡住 Mellanox 的 NDK 提供程序。** Hyper-V 开着时 `NdkOpenAdapter` 返回
+  `0xC0010011`，任何走到连接路径的代码都会以 `0x139`（`P1 = 0xa`，incorrect stack）崩溃。
+  `bcdedit /set hypervisorlaunchtype off` 之后适配器打开、整条路径行为正常：hypervisor 接管了
+  DMA 重映射，2020 年的 WinOF 驱动在这块卡上无法在其下立足。**用户态的 NetworkDirect 同样被挡**。
+- **失败的 RDMA 连接必须关闭，而关闭回调只收一个参数。** `NDK_FN_CLOSE_COMPLETION` 是
+  `VOID (PVOID Context)`（没有 status），而 `NdkDeregisterMr` 收 `(Context, Status)`；共用
+  一个两参数回调是类型不匹配。失败的连接会在 `mlx4eth63` 里留下状态，约**九十秒后**触发
+  `KERNEL_SECURITY_CHECK_FAILURE`。那个延迟加上无法展开的栈，正是这些崩溃长期躲过转储分析的原因。
+  见 [TEARDOWN-FIX-PROVEN.md](TEARDOWN-FIX-PROVEN.md)。
+- **单块 HCA 不能连自己。** 从 `192.168.100.2` 连到 `192.168.100.2`（用户态发起端同样）被立刻
+  拒绝：`0xC0000236 ND_CONNECTION_REFUSED`，目标端什么也没收到。要演示必须第二台机器，或者
+  第二个有独立地址的 RDMA 端口。
+
+完整记录与仍未解决的问题见 [KERNEL-NVMEOF-STATUS.md](KERNEL-NVMEOF-STATUS.md)。
+
 ## 许可
 
-**Apache License 2.0
-34,523 字节，sha256 `8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef`。
+**Apache License 2.0**（`LICENSE`）—— 逐字官方原文，版权声明见 [NOTICE](NOTICE)。
 
-```
-Copyright (C) 2026 Dingtaiqi
+选 Apache 而非 copyleft 是有意的。这是一个 Windows 驱动与协议栈：它依赖 WDK/NDIS 的示例
+材料、NVMe 与 RDMA 规范的参考代码，以及周边生态的惯例，而这些都在 Apache 2.0 或兼容的
+宽松协议之下。**显式的专利授权**条款，对"实现别人的协议"这件事才是真正重要的那一条；
+同时它允许商业使用与闭源使用，无需另行签署协议。
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the Apache License 2.0
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-```
-
-**Apache-2.0 允许商业使用**，它管的是"闭源"：
-
-- 公司内部使用、拿它赚钱、做成服务 —— **都可以，免费**。
-- 代价是回馈：分发本工程或派生作品（**包括通过网络提供服务**）时必须给出完整对应源码。
-  第 13 条（`LICENSE` L540）就是专门管网络服务的那一条，也是 Apache-2.0 与 GPL 的唯一实质区别
-  —— 对付"拿开源代码做闭源云服务"靠的就是它。
-- 确实需要闭源（嵌进闭源产品、做闭源 SaaS）的公司，可以走 `COMMERCIAL.md` 的商业授权（双授权）。
-
-两个兼容性坑：
-
-1. `ref/` 下两份 Linux 内核头（`linux_nvme.h`、`linux_nvme_rdma.h`）是 **GPL-2.0**，
-   **只作对照阅读、不参与编译**。**GPL-2.0-only 与 Apache-2.0-3.0 不兼容**，
-   不要把它们的代码并进本工程；实在要并，本工程得整体改成 GPL-2.0。
-2. 链接厂商的 NetworkDirect 库（`ndutil`/NDSPI）没有影响——它们不是 copyleft 许可。
+仅作对照阅读、**不参与编译或链接**的第三方材料列在 [THIRD-PARTY.md](THIRD-PARTY.md) 中，
+并附各自的协议。其中 `GPL-2.0-only` 的材料与本仓库所发布的许可**不兼容**，只能作参考。
 
 
