@@ -647,18 +647,100 @@ static NTSTATUS NvtcpkSocketClose(PNVMEOF_TCPK_CONN c)
     return st;
 }
 
+/* ------------------------------------------------------------------------- */
+/*  TEMPORARY DIAGNOSTICS - the D1.2 "first I/O" failure.                     */
+/*                                                                           */
+/*  A send that fails with 0xC000020D (STATUS_INVALID_BUFFER_SIZE) is either  */
+/*  a WSK_BUF/MDL that does not match the buffer or a refusal from the        */
+/*  provider, and the status alone cannot tell those apart.  So every send    */
+/*  records what it actually handed to WskSend (length, MDL byte count, the   */
+/*  MDL's own start address, the downcall status and the IRP status), and the */
+/*  last eight commands are kept in a small ring that is dumped on a failure. */
+/*  Nothing here changes behaviour except the guarded MDL repair below, which  */
+/*  only runs when the MDL is provably not the one this file built.           */
+/* ------------------------------------------------------------------------- */
+
+typedef struct _NVMEOF_TCPK_DIAG {
+    USHORT   cid;
+    UCHAR    opcode;
+    ULONG    inBytes;
+    ULONG    outBytes;
+    ULONG    total;
+    ULONG    mdlBytes;
+    NTSTATUS callSt;
+    NTSTATUS irpSt;
+} NVMEOF_TCPK_DIAG;
+
+static NVMEOF_TCPK_DIAG  g_diagRing[8];
+static ULONG             g_diagAt = 0;
+static ULONG             g_diagSeen = 0;
+static ULONG             g_sendSeen = 0;
+static ULONG             g_rspSeen = 0;
+static NVMEOF_TCPK_DIAG* g_diagCur = NULL;
+
+static void NvtcpkDiagDump(PNVMEOF_TCPK_CONN c, const char* why)
+{
+    ULONG n = (g_diagSeen < 8) ? g_diagSeen : 8;
+    ULONG i;
+
+    NvtcpkLogF("--- %s after %u commands: conn %p cidNext=%u ok=%u in=%u out=%u"
+               " broken=%u poisoned=%u",
+               why, g_diagSeen, c, (unsigned)c->cidNext, c->commands, c->bytesIn,
+               c->bytesOut, (unsigned)c->broken, (unsigned)c->poisoned);
+    NvtcpkLogF("    buffers: pduBuf=%p pduMdl=%p rspBuf=%p rspMdl=%p",
+               c->pduBuf, c->pduMdl, c->rspBuf, c->rspMdl);
+    {
+        NVMEOF_TCP_HDR ph;
+        nvmeofTcpReadHdr((const uint8_t*)c->pduBuf, &ph);
+        NvtcpkLogF("    capsule still in pduBuf: type=0x%02X flags=0x%02X hlen=%u pdo=%u plen=%u",
+                   (unsigned)ph.type, (unsigned)ph.flags, (unsigned)ph.hlen,
+                   (unsigned)ph.pdo, (unsigned)ph.plen);
+    }
+    for (i = 0; i < n; i++) {
+        NVMEOF_TCPK_DIAG* d = &g_diagRing[(g_diagAt + 8 - n + i) & 7u];
+        NvtcpkLogF("    cid=%u op=0x%02X in=%u out=%u total=%u mdl=%u callSt=0x%08X irpSt=0x%08X",
+                   (unsigned)d->cid, (unsigned)d->opcode, d->inBytes, d->outBytes,
+                   d->total, d->mdlBytes, (unsigned)d->callSt, (unsigned)d->irpSt);
+    }
+}
+
 /* Send exactly `len` bytes of c->pduBuf.  A connection-oriented WSK send takes
  * the whole buffer, so one call is one PDU - no partial-send loop, because a
  * second copy of bytes the peer already has is silent data corruption. */
 static NTSTATUS NvtcpkSend(PNVMEOF_TCPK_CONN c, ULONG len)
 {
     NTSTATUS st;
+    NTSTATUS callSt;
     PIRP irp;
     WSK_BUF buf;
+    ULONG mdlBytes;
     const WSK_PROVIDER_CONNECTION_DISPATCH* d;
 
     if (len == 0 || len > NVMEOF_TCPK_BUF_BYTES) {
         return STATUS_INVALID_PARAMETER;
+    }
+    /* The MDL handed to WskSend must describe the buffer this file allocated and
+     * must cover at least `len` bytes of it.  Checked on every send: if the
+     * provider really is refusing the buffer, these three numbers say whether it
+     * is right to. */
+    mdlBytes = (c->pduMdl != NULL) ? MmGetMdlByteCount(c->pduMdl) : 0;
+    if (c->pduMdl == NULL || mdlBytes < len ||
+        MmGetMdlVirtualAddress(c->pduMdl) != c->pduBuf) {
+        NvtcpkLogF("!! send: the PDU MDL does not describe pduBuf (mdl=%p bytes=%u va=%p"
+                   " buf=%p len=%u); rebuilding it",
+                   c->pduMdl, mdlBytes,
+                   (c->pduMdl != NULL) ? MmGetMdlVirtualAddress(c->pduMdl) : NULL,
+                   c->pduBuf, len);
+        if (c->pduMdl != NULL) {
+            IoFreeMdl(c->pduMdl);
+            c->pduMdl = NULL;
+        }
+        c->pduMdl = IoAllocateMdl(c->pduBuf, NVMEOF_TCPK_BUF_BYTES, FALSE, FALSE, NULL);
+        if (c->pduMdl == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        MmBuildMdlForNonPagedPool(c->pduMdl);
+        mdlBytes = MmGetMdlByteCount(c->pduMdl);
     }
     irp = NvtcpkIrpNew(&c->async);
     if (irp == NULL) {
@@ -670,7 +752,20 @@ static NTSTATUS NvtcpkSend(PNVMEOF_TCPK_CONN c, ULONG len)
     buf.Length = len;
     NvtcpkStepStart(&c->async);
     st = d->WskSend(c->socket, &buf, WSK_FLAG_NODELAY, irp);
+    callSt = st;
     st = NvtcpkStepFinish(st, &c->async, NVMEOF_TCPK_SEND_MS, "WskSend");
+    if (g_diagCur != NULL) {
+        g_diagCur->callSt = callSt;
+        g_diagCur->irpSt = c->async.status;
+    }
+    if (g_sendSeen < 8 || !NT_SUCCESS(st)) {
+        NvtcpkLogF("  send #%u len=%u off=%u mdlBytes=%u bufferBytes=%u irql=%u"
+                   " callSt=0x%08X irpSt=0x%08X info=%u",
+                   g_sendSeen, len, (unsigned)buf.Offset, mdlBytes,
+                   (unsigned)NVMEOF_TCPK_BUF_BYTES, (unsigned)KeGetCurrentIrql(),
+                   (unsigned)callSt, (unsigned)c->async.status, (unsigned)c->async.info);
+    }
+    g_sendSeen++;
     if (st == STATUS_IO_TIMEOUT) {
         NvtcpkSetPoisoned(c);
         return st;                      /* IRP, MDL and buffer stay with WSK */
@@ -730,6 +825,9 @@ static NTSTATUS NvtcpkRecv(PNVMEOF_TCPK_CONN c, ULONG off, ULONG want)
         if (!NT_SUCCESS(st)) {
             IoFreeIrp(irp);
             c->broken = TRUE;
+            NvtcpkLogF("  recv off=%u want=%u st=0x%08X info=%u rspMdl=%p mdlBytes=%u",
+                       off, want, (unsigned)st, (unsigned)c->async.info, c->rspMdl,
+                       (c->rspMdl != NULL) ? MmGetMdlByteCount(c->rspMdl) : 0);
             return st;
         }
         n = (ULONG)c->async.info;
@@ -1226,10 +1324,26 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
     }
     total = pdo + inBytes;
 
+    {   /* TEMPORARY: remember this command for the failure dump. */
+        NVMEOF_TCPK_DIAG* dg = &g_diagRing[g_diagAt & 7u];
+        dg->cid      = cid;
+        dg->opcode   = opcode;
+        dg->inBytes  = inBytes;
+        dg->outBytes = outBytes;
+        dg->total    = total;
+        dg->mdlBytes = (c->pduMdl != NULL) ? MmGetMdlByteCount(c->pduMdl) : 0;
+        dg->callSt   = 0;
+        dg->irpSt    = 0;
+        g_diagCur    = dg;
+        g_diagAt++;
+        g_diagSeen++;
+    }
+
     st = NvtcpkSend(c, total);
     if (!NT_SUCCESS(st)) {
         NvtcpkLogF("command 0x%02X cid=%u: send of the capsule failed 0x%08X",
                    (unsigned)opcode, (unsigned)cid, st);
+        NvtcpkDiagDump(c, "send failed");
         return st;
     }
 
@@ -1243,6 +1357,12 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
             return st;
         }
         nvmeofTcpReadHdr((const uint8_t*)c->rspBuf, &hdr);
+        if (g_rspSeen < 8) {
+            NvtcpkLogF("  resp #%u cid=%u type=0x%02X flags=0x%02X hlen=%u pdo=%u plen=%u",
+                       g_rspSeen, (unsigned)cid, (unsigned)hdr.type, (unsigned)hdr.flags,
+                       (unsigned)hdr.hlen, (unsigned)hdr.pdo, (unsigned)hdr.plen);
+        }
+        g_rspSeen++;
         hlen = hdr.hlen;
         if (hlen < NVMEOF_TCP_HDR_LEN || hlen > NVMEOF_TCPK_BUF_BYTES) {
             c->broken = TRUE;

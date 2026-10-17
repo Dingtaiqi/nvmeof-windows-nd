@@ -1,0 +1,37 @@
+0xCE DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS
+================================================================
+
+When:   2026-10-17 19:43:41 (dump 101726-24500-01.dmp)
+        An earlier one at 18:51:41 was 0x9F (101726-21734-01.dmp), also during
+        a driver reload attempt.
+
+Bugcheck arguments:
+  P1 = 0xfffff80233d2452a    (code address inside the unloaded driver)
+  P2 = 0x0000000000000010    (16 outstanding operations not cancelled)
+  P3 = 0xfffff80233d2452a
+  P4 = 0x0000000000000000
+
+What happened: the miniport nvmeofnd2 had a live NVMe/TCP connection with WSK
+IRPs outstanding when `devcon update` / `devcon remove` unloaded it.  The SCM
+and the PnP path both go through DriverUnload, which this project had already
+learned is dangerous, and the note in the earlier brief claiming a StorPort
+miniport reload "does not go through DriverUnload the way a stopped service
+does" was wrong.  The transport marks a connection poisoned on timeout and
+leaks it on purpose; that leak becomes an outstanding I/O that 0xCE refuses
+to tolerate at unload.
+
+Rule that follows, and it is absolute:
+  this driver is loaded ONCE and lives until the machine reboots.
+  Never devcon remove, never devcon update, never sc stop, never disable the
+  device while it is running.  To test a change: rebuild, then REBOOT, and let
+  Windows load the new image at boot.  If the target must be reachable at load
+  time, start it from a scheduled task at boot before the driver initialises.
+
+Consequence for testing the capsule-size bug: the diagnostic ring in
+nvmeof_tcpk.c already logs "send #N len= off= mdlBytes= bufferBytes= irql=
+callSt= irpSt= info=" on every early send and on every failed send.  The run
+that produced 0xC000020D had that line overwritten in the 8 KiB registry ring
+by the hundreds of subsequent STATUS_DEVICE_NOT_READY retries.  So the next
+attempt needs no new code: rebuild, reboot, and read the log after the FIRST
+failure only, before the miniport retries swamp it.
+

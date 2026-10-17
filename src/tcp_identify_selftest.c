@@ -148,6 +148,28 @@ static void fillIdentifyController(uint8_t* d)
     memcpy(d + 64, "1.0.0   ", 8);
 }
 
+/* Identify Namespace with the LBA Format table where NVMe 1.4 puts it: NSZE at 0,
+ * NLBAF at 25, FLBAS at 26 and LBAF0 at 128 (MS 128..129, LBADS 130, RP 131).  The
+ * offsets are written one per line because writing this table four bytes late is a
+ * mistake that a length check cannot see: the data is still 4096 bytes and every
+ * other field still decodes, only the block size silently reads back as zero. */
+#define SELFTEST_NS_BLOCKS 32768u
+
+static void fillIdentifyNamespace(uint8_t* d, uint32_t blocks)
+{
+    uint64_t nsze = (uint64_t)blocks;
+    memset(d, 0, 4096);
+    memcpy(d, &nsze, 8);                     /* NSZE  at 0  */
+    memcpy(d + 8, &nsze, 8);                 /* NCAP  at 8  */
+    memcpy(d + 16, &nsze, 8);                /* NUSE  at 16 */
+    d[25] = 0;                               /* NLBAF at 25: one format (zero based) */
+    d[26] = 0;                               /* FLBAS at 26: format 0, no metadata */
+    d[128] = 0;                              /* LBAF0 MS low  */
+    d[129] = 0;                              /* LBAF0 MS high */
+    d[130] = 9;                              /* LBAF0 LBADS: 2^9 = 512 bytes */
+    d[131] = 0;                              /* LBAF0 RP */
+}
+
 /* Handshake: read ICReq, answer ICResp. */
 static int controllerHandshake(SOCKET s)
 {
@@ -190,6 +212,10 @@ static int controllerServeOne(SOCKET s, uint8_t* ns)
 
     if (opcode == NVME_IDENTIFY && (cdw10 & 0xFF) == NVME_CNS_CONTROLLER) {
         fillIdentifyController(resp + NVMEOF_TCP_CRSP_HDR_LEN);
+        dataLen = 4096;
+        cqeBuild(cqe, 0, cid, NVME_SC_SUCCESS);
+    } else if (opcode == NVME_IDENTIFY && (cdw10 & 0xFF) == NVME_CNS_NAMESPACE) {
+        fillIdentifyNamespace(resp + NVMEOF_TCP_CRSP_HDR_LEN, SELFTEST_NS_BLOCKS);
         dataLen = 4096;
         cqeBuild(cqe, 0, cid, NVME_SC_SUCCESS);
     } else if (opcode == NVME_READ && ns != NULL) {
@@ -322,6 +348,64 @@ static void test_identify(void)
     closesocket(c); closesocket(srv); closesocket((SOCKET)ls);
 }
 
+static void test_identify_namespace(void)
+{
+    uint16_t port = 0, status = 0xFFFF;
+    int ls;
+    SOCKET c, srv;
+    uint8_t ns[4096];
+
+    printf("\n== Identify Namespace: the LBA Format table at 128, LBADS read back at 130 ==\n");
+    ls = listenOnLoopback(&port);
+    ok(ls >= 0, "controller listens");
+    if (ls < 0) { return; }
+    c = connectLoopback(port);
+    srv = accept((SOCKET)ls, NULL, NULL);
+    ok(c != INVALID_SOCKET && srv != INVALID_SOCKET, "connected");
+    setRecvTimeout(srv, 5000);
+
+    memset(ns, 0, sizeof(ns));
+    {
+        uint8_t sqe[64], cap[NVMEOF_TCP_CCMD_HDR_LEN], hdr[8], cqe[16];
+        NVMEOF_TCP_HDR h;
+        unsigned n;
+        sqeBuild(sqe, NVME_IDENTIFY, 1, 0x3333, NVME_CNS_NAMESPACE, 0, 0);
+        n = nvmeofTcpBuildCapsuleCmd(cap, sqe, 0, NVMEOF_TCP_CCMD_HDR_LEN);
+        ok(sendAll(c, cap, (int)n) == (int)n, "host sends Identify CNS=0 for namespace 1");
+        ok(controllerServeOne(srv, NULL) == 0, "controller answers it");
+        ok(recvAll(c, hdr, 8) == 8, "host reads the response header");
+        nvmeofTcpReadHdr(hdr, &h);
+        ok(h.type == NVMEOF_TCP_CAPSULERESP, "it is a CapsuleResp");
+        ok((h.flags & NVMEOF_TCP_F_SUCCESS) != 0, "SUCCESS is set");
+        ok(h.plen == 4096, "the response capsule announces 4096 bytes of data");
+        ok(recvAll(c, cqe, 16) == 16, "host reads the 16-byte completion");
+        status = cqeStatus(cqe);
+        ok(status == NVME_SC_SUCCESS, "the completion says success");
+        ok(cqeCid(cqe) == 0x3333, "the completion carries the command id it was given");
+        ok(recvAll(c, ns, 4096) == 4096, "host reads all 4096 bytes of namespace data");
+    }
+
+    /* Read the fields back out of the bytes that actually crossed the wire. */
+    {
+        uint64_t nsze = 0;
+        unsigned nlbaFormats;
+        memcpy(&nsze, ns, 8);
+        ok(nsze == (uint64_t)SELFTEST_NS_BLOCKS, "NSZE at offset 0 is the block count the controller was given");
+        /* NLBAF is zero based: 0 means one format, so the count is byte 25 + 1. */
+        nlbaFormats = (unsigned)ns[25] + 1u;
+        ok(nlbaFormats >= 1u && (unsigned)(ns[26] & 0x0F) <= (unsigned)ns[25],
+           "NLBAF at 25 says at least one LBA format exists and FLBAS selects one of them");
+        ok(ns[26] == 0, "FLBAS at 26 is 0");
+        ok(ns[130] == 9, "LBADS read back at byte offset 130 is 9, so blocks are 2^9 = 512 bytes");
+        ok((1u << ns[130]) == 512u, "the advertised block size really is 512 bytes");
+        if (ns[130] != 9) {
+            printf("       (LBAF0 bytes at 128..131 are %u %u %u %u; LBADS belongs in the third)\n",
+                   (unsigned)ns[128], (unsigned)ns[129], (unsigned)ns[130], (unsigned)ns[131]);
+        }
+    }
+    closesocket(c); closesocket(srv); closesocket((SOCKET)ls);
+}
+
 static void test_read_block(void)
 {
     uint16_t port = 0, status = 0xFFFF;
@@ -408,6 +492,7 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { printf("WSAStartup failed\n"); return 2; }
     test_identify();
+    test_identify_namespace();
     test_read_block();
     test_refusal();
     printf("\n========================================\n");

@@ -252,13 +252,21 @@ static void fillIdentifyNamespace(uint8_t* d, uint32_t blocks)
     memcpy(d, &nsze, 8);                     /* NSZE */
     memcpy(d + 8, &nsze, 8);                 /* NCAP */
     memcpy(d + 16, &nsze, 8);                /* NUSE */
+    /* Identify Namespace, NVMe 1.4 figure "Identify Namespace Data Structure":
+     *   NSZE at 0, NCAP at 8, NUSE at 16, NSFEAT at 24, NLBAF at 25, FLBAS at 26,
+     *   and the LBA Format table at 128 with 4-byte entries
+     *   (MS at +0..1, LBADS at +2, RP at +3).
+     * So LBAF0 is 128..131 and LBADS is at 130.  This function used to write the
+     * table four bytes late (LBADS at 132, with a DLFEAT byte sitting on top of
+     * LBAF0's MS field), so a host that read the entry at 128 saw LBADS = 0 and
+     * had to fall back to an assumed 512-byte block.  The offsets are written out
+     * one per line because that is exactly how this went wrong. */
+    d[25] = 0;                               /* NLBAF: one LBA format (zero based) */
     d[26] = 0;                               /* FLBAS: format 0, no metadata */
-    d[128] = 0;                              /* DLFEAT: zeros are valid, not deallocated */
-    /* LBAF0: MS=0, LBADS=9 (512 bytes), RP=0 */
-    d[130] = 0;
-    d[131] = 0;
-    d[132] = 9;
-    d[133] = 0;
+    d[128] = 0;                              /* LBAF0 MS low byte: no metadata bytes */
+    d[129] = 0;                              /* LBAF0 MS high byte */
+    d[130] = 9;                              /* LBAF0 LBADS: 2^9 = 512-byte blocks */
+    d[131] = 0;                              /* LBAF0 RP: relative performance */
 }
 
 /* Serve one capsule.  Returns 0 to keep the connection, -1 to close it. */
