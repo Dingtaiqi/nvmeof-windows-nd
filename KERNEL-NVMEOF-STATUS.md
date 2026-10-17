@@ -164,3 +164,21 @@
 - 三个 `nvmeofkloop*` 服务重启后变成 STOPPED（不再是 START_PENDING），
   可以 `sc delete` 清掉；驱动镜像仍在 `sym\k\` 作为证据。
 - 新 `nvmeofnd2.sys`（`B40537DC...`）仍未部署，按 0xCE 铁律等重启时加载。
+
+### 重启前状态（2026-10-18 01:45，操作者确认重启）
+
+- 新 `nvmeofnd2.sys` 已暂存：`C:\Windows\System32\drivers\nvmeofnd2.staged.sys`，
+  SHA256 `B40537DC8448B4192082F50E23CC368EECE76DD79D91362CA1F392FF6A5D2263`。
+- `MoveFileEx(staged, nvmeofnd2.sys, DELAY_UNTIL_REBOOT|REPLACE_EXISTING)` 返回 **True**；
+  `PendingFileRenameOperations` 末尾已出现：
+  `*1\??\C:\Windows\System32\drivers\nvmeofnd2.staged.sys` /
+  `*1!\??\C:\Windows\System32\drivers\nvmeofnd2.sys`（`!` = 目标已存在则替换）。
+- `D:\nvmeof` 仍被拦：操作者在火绒里"信任 D 盘"后，**以 SYSTEM 计划任务运行
+  `nvmeof_tcp.exe` 打开 `D:\nvmeof\bridge-ns.img` 仍然 `cannot open namespace`**。
+  所以开机路径保持 `D:\rdma\nvmeof-ns.img`。
+- 重启后按顺序验证：
+  1. `(Get-FileHash C:\Windows\System32\drivers\nvmeofnd2.sys).Hash` 应为 `B40537DC...`；
+  2. `sc query nvmeofnd2` → RUNNING；`pnputil /enum-devices /instanceid "ROOT\HDC\0002"` → Started；
+  3. `Z:` 出现，`Z:\roundtrip.bin` 的 SHA256 应为 `C0DC81BA3F03D8C865E1CF0D400EB298EF7DD3E419788D603CF45704A1455D9B`；
+  4. 若 `Z:` 没出现：先确认 4421/3260 在监听（开机任务），再
+     `pnputil /restart-device "ROOT\HDC\0002"`。
