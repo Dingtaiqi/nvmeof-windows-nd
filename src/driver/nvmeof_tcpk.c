@@ -58,6 +58,17 @@
  *
  *   6. Non-paged pool (ExAllocatePool2/ExFreePoolWithTag) only, no malloc, no
  *      CRT, no C++.  This runs at DISPATCH_LEVEL on the miniport's StartIo path.
+ *
+ *   7. 0xC000020D is STATUS_CONNECTION_RESET, not STATUS_INVALID_BUFFER_SIZE
+ *      (that one is 0xC0000206).  A capsule send that completes with it after a
+ *      long pause is the peer having closed an idle connection, and the numbers
+ *      in the buffer are innocent: this file's test target closes every
+ *      connection whose receive sits idle for 60 seconds (SO_RCVTIMEO in
+ *      src/nvmeof_tcp.c's targetConnThread) and says nothing about it.  The
+ *      repair is a reconnect, not a bigger buffer, and it is safe precisely
+ *      because that failure happens before a single byte was transmitted
+ *      (IoStatus.Information = 0), so the command was never executed and may be
+ *      sent again.  See NvtcpkReconnect below.
  */
 
 /* The public contract, the NVMe opcode values and the WSK headers come from the
@@ -321,10 +332,70 @@ typedef struct _NVMEOF_TCPK_ASYNC {
                               * pointer for WskSocket. ULONG_PTR on purpose: on
                               * x64 truncating that pointer to 32 bits is a
                               * guaranteed crash the moment it is used. */
+    LONG     seq;            /* operation number this context was last armed for */
+    LONG     doneSeq;        /* operation number of the completion that ended it */
     BOOLEAN  initialized;
     BOOLEAN  dead;           /* a timed-out operation may still complete at any
                               * time; the connection is poisoned when this is set */
 } NVMEOF_TCPK_ASYNC;
+
+/* Measurement, not theory.  Three questions that a failure report has to answer
+ * and that no amount of reading the code can:
+ *
+ *   - irpAlloc - irpFree: are this file's IRPs leaking?  Every IRP it allocates
+ *     is freed through NvtcpkIrpFree, so the difference is exactly the number
+ *     still outstanding.  A leak would fail after a fixed count; the observed
+ *     failures did not, but the counter is what says so.
+ *   - opsInFlight: can a send and a receive overlap on the one shared completion
+ *     context?  The design serialises them (one command at a time, one thread),
+ *     so this should never exceed 1.  If it ever reaches 2, the overlap is real.
+ *   - staleCompletions: did a wait end on a completion belonging to a different
+ *     operation?  seq is stamped when the context is armed and copied into
+ *     doneSeq by the completion routine, so a mismatch is the exact corruption a
+ *     shared context would produce - counted rather than dismissed.
+ *
+ * All of it is dumped with a send failure and published as a registry DWORD. */
+static LONG g_irpAlloc = 0;
+static LONG g_irpFree = 0;
+static LONG g_opSeq = 0;
+static LONG g_opsInFlight = 0;
+static LONG g_maxOpsInFlight = 0;
+static LONG g_opCompletions = 0;
+static LONG g_staleCompletions = 0;
+static LONG g_reconnects = 0;
+
+/* A status the peer's death produces, as opposed to one this file's arithmetic
+ * could produce.  Only these are worth re-establishing a connection for; anything
+ * else is a bug here and must stay visible. */
+static BOOLEAN NvtcpkIsSocketLoss(NTSTATUS st)
+{
+    return (st == STATUS_CONNECTION_RESET ||
+            st == STATUS_CONNECTION_ABORTED ||
+            st == STATUS_CONNECTION_DISCONNECTED ||
+            st == STATUS_CONNECTION_INVALID ||
+            st == STATUS_INVALID_CONNECTION);
+}
+
+/* The name of the status, for the two that this project has already misread.
+ * A number alone cost a session: 0xC000020D was taken for a buffer-size
+ * complaint for a whole day. */
+static const char* NvtcpkStatusName(NTSTATUS st)
+{
+    switch (st) {
+    case STATUS_SUCCESS:                   return "STATUS_SUCCESS";
+    case STATUS_PENDING:                   return "STATUS_PENDING";
+    case STATUS_INVALID_BUFFER_SIZE:       return "STATUS_INVALID_BUFFER_SIZE";
+    case STATUS_CONNECTION_RESET:          return "STATUS_CONNECTION_RESET";
+    case STATUS_CONNECTION_ABORTED:        return "STATUS_CONNECTION_ABORTED";
+    case STATUS_CONNECTION_DISCONNECTED:   return "STATUS_CONNECTION_DISCONNECTED";
+    case STATUS_CONNECTION_INVALID:        return "STATUS_CONNECTION_INVALID";
+    case STATUS_INVALID_CONNECTION:        return "STATUS_INVALID_CONNECTION";
+    case STATUS_IO_TIMEOUT:                return "STATUS_IO_TIMEOUT";
+    case STATUS_DEVICE_NOT_READY:          return "STATUS_DEVICE_NOT_READY";
+    case STATUS_INVALID_HANDLE:            return "STATUS_INVALID_HANDLE";
+    default:                               return "other";
+    }
+}
 
 /* Declared with the WDK's own function type so the definition below is checked
  * against IO_COMPLETION_ROUTINE instead of a comment in a header. */
@@ -334,6 +405,8 @@ static IO_COMPLETION_ROUTINE NvtcpkIrpComplete;
  * never touches the wait list, which is exactly the difference that matters. */
 static void NvtcpkStepStart(NVMEOF_TCPK_ASYNC* a)
 {
+    LONG now;
+
     if (!a->initialized) {
         KeInitializeEvent(&a->done, NotificationEvent, FALSE);
         a->initialized = TRUE;
@@ -347,6 +420,12 @@ static void NvtcpkStepStart(NVMEOF_TCPK_ASYNC* a)
     }
     a->status = STATUS_PENDING;
     a->info = 0;
+    a->seq = InterlockedIncrement(&g_opSeq);
+    a->doneSeq = 0;
+    now = InterlockedIncrement(&g_opsInFlight);
+    if (now > g_maxOpsInFlight) {
+        g_maxOpsInFlight = now;
+    }
 }
 
 /* The return value of the WSK downcall and the status the IRP completed with are
@@ -360,25 +439,38 @@ static void NvtcpkStepStart(NVMEOF_TCPK_ASYNC* a)
 static NTSTATUS NvtcpkStepFinish(NTSTATUS callStatus, NVMEOF_TCPK_ASYNC* a, ULONG waitMs, const char* what)
 {
     LARGE_INTEGER t;
+    NTSTATUS st;
 
+    st = callStatus;
     if (callStatus == STATUS_PENDING) {
         t.QuadPart = -((LONGLONG)waitMs * 10000);
         if (KeWaitForSingleObject(&a->done, Executive, KernelMode, FALSE, &t) == STATUS_TIMEOUT) {
             a->dead = TRUE;
+            InterlockedDecrement(&g_opsInFlight);
             NvtcpkLogF("!! %s: no completion after %u ms; its IRP and buffers are still owned by WSK,"
                        " so this connection is poisoned and will be leaked rather than freed",
                        what, waitMs);
             return STATUS_IO_TIMEOUT;
         }
-        return a->status;
-    }
-    if (NT_SUCCESS(callStatus)) {
+        st = a->status;
+    } else if (NT_SUCCESS(callStatus)) {
         /* Inline completion: the completion routine already stored the real
          * status.  Defensive fallback if a provider ever completes without
          * calling the routine. */
-        return (a->status != STATUS_PENDING) ? a->status : STATUS_SUCCESS;
+        st = (a->status != STATUS_PENDING) ? a->status : STATUS_SUCCESS;
     }
-    return callStatus;
+
+    /* The completion that ended the wait must be this operation's own.  If it is
+     * not, the shared context really did deliver somebody else's status and that
+     * is reported here rather than returned as this operation's result. */
+    if (a->doneSeq != 0 && a->doneSeq != a->seq) {
+        InterlockedIncrement(&g_staleCompletions);
+        NvtcpkLogF("!! %s: the completion that ended this wait belonged to operation %d,"
+                   " not to operation %d (status 0x%08X is not this call's)",
+                   what, (int)a->doneSeq, (int)a->seq, (unsigned)st);
+    }
+    InterlockedDecrement(&g_opsInFlight);
+    return st;
 }
 
 static NTSTATUS NvtcpkIrpComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
@@ -390,6 +482,10 @@ static NTSTATUS NvtcpkIrpComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID C
     if (a != NULL && Irp != NULL) {
         a->status = Irp->IoStatus.Status;
         a->info   = Irp->IoStatus.Information;
+        /* Which operation this completion belongs to, recorded by the completion
+         * itself, so NvtcpkStepFinish can tell a late completion from its own. */
+        a->doneSeq = a->seq;
+        InterlockedIncrement(&g_opCompletions);
         KeSetEvent(&a->done, IO_NO_INCREMENT, FALSE);
     }
     /* Required for a caller-allocated IRP that WSK completes: it tells the I/O
@@ -414,10 +510,13 @@ typedef struct _NVMEOF_TCPK_CONN {
     BOOLEAN                   immortal;    /* leaked on purpose, never freed   */
     BOOLEAN                   poisoned;    /* a wait timed out: hands off      */
     BOOLEAN                   broken;      /* protocol error: stream is garbage */
+    BOOLEAN                   needReconnect; /* the peer closed: re-establish  */
     LONG                      refs;        /* 1 = the list's own reference      */
     LONG                      busy;        /* 1 = a command is using the socket */
+    LONG                      reconnects;  /* times this connection was rebuilt */
     PWSK_SOCKET               socket;
     const WSK_PROVIDER_DISPATCH* providerDispatch;  /* only WskSocket needs it */
+    PVOID                     wskClient;   /* WSK_CLIENT from the provider NPI  */
     SOCKADDR_IN               remote;
     UCHAR                     cpda;        /* peer's capsule data alignment     */
     USHORT                    cidNext;
@@ -526,8 +625,22 @@ static PIRP NvtcpkIrpNew(PVOID context)
     if (irp == NULL) {
         return NULL;
     }
+    InterlockedIncrement(&g_irpAlloc);
     IoSetCompletionRoutine(irp, NvtcpkIrpComplete, context, TRUE, TRUE, TRUE);
     return irp;
+}
+
+/* Every IoFreeIrp in this file goes through here.  One wrapper, not seven hand
+ * edits, so the count cannot drift from the frees: alloc - free is the number of
+ * IRPs still outstanding, and a send failure that reports a non-zero figure has
+ * found a leak instead of a provider fault. */
+static void NvtcpkIrpFree(PIRP Irp)
+{
+    if (Irp == NULL) {
+        return;
+    }
+    InterlockedIncrement(&g_irpFree);
+    IoFreeIrp(Irp);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -558,7 +671,7 @@ static NTSTATUS NvtcpkSocketCreate(PNVMEOF_TCPK_CONN c, PWSK_CLIENT client)
         NvtcpkSetPoisoned(c);
         return st;                      /* IRP still owned by WSK: leak it */
     }
-    IoFreeIrp(irp);
+    NvtcpkIrpFree(irp);
     if (NT_SUCCESS(st)) {
         /* PFN_WSK_SOCKET returns the new socket in Irp->IoStatus.Information. */
         c->socket = (PWSK_SOCKET)c->async.info;
@@ -595,7 +708,7 @@ static NTSTATUS NvtcpkBind(PNVMEOF_TCPK_CONN c)
         NvtcpkSetPoisoned(c);
         return st;
     }
-    IoFreeIrp(irp);
+    NvtcpkIrpFree(irp);
     return st;
 }
 
@@ -614,7 +727,7 @@ static NTSTATUS NvtcpkConnect(PNVMEOF_TCPK_CONN c)
         NvtcpkSetPoisoned(c);
         return st;
     }
-    IoFreeIrp(irp);
+    NvtcpkIrpFree(irp);
     return st;
 }
 
@@ -640,7 +753,7 @@ static NTSTATUS NvtcpkSocketClose(PNVMEOF_TCPK_CONN c)
         NvtcpkSetPoisoned(c);
         return st;
     }
-    IoFreeIrp(irp);
+    NvtcpkIrpFree(irp);
     if (NT_SUCCESS(st)) {
         c->socket = NULL;
     }
@@ -648,16 +761,13 @@ static NTSTATUS NvtcpkSocketClose(PNVMEOF_TCPK_CONN c)
 }
 
 /* ------------------------------------------------------------------------- */
-/*  TEMPORARY DIAGNOSTICS - the D1.2 "first I/O" failure.                     */
+/*  Diagnostics and the IRP/operation counters                               */
 /*                                                                           */
-/*  A send that fails with 0xC000020D (STATUS_INVALID_BUFFER_SIZE) is either  */
-/*  a WSK_BUF/MDL that does not match the buffer or a refusal from the        */
-/*  provider, and the status alone cannot tell those apart.  So every send    */
-/*  records what it actually handed to WskSend (length, MDL byte count, the   */
-/*  MDL's own start address, the downcall status and the IRP status), and the */
-/*  last eight commands are kept in a small ring that is dumped on a failure. */
-/*  Nothing here changes behaviour except the guarded MDL repair below, which  */
-/*  only runs when the MDL is provably not the one this file built.           */
+/*  A send that fails is not automatically a bug here: the status says which  */
+/*  side gave up.  The numbers below are what distinguishes "this file leaked  */
+/*  or mis-sized something" from "the peer closed the connection": IRP         */
+/*  accounting, the number of operations ever in flight at once, and whether   */
+/*  any completion was delivered to a wait that did not own it.               */
 /* ------------------------------------------------------------------------- */
 
 typedef struct _NVMEOF_TCPK_DIAG {
@@ -678,15 +788,34 @@ static ULONG             g_sendSeen = 0;
 static ULONG             g_rspSeen = 0;
 static NVMEOF_TCPK_DIAG* g_diagCur = NULL;
 
+/* Milliseconds since boot.  KeQueryInterruptTime is 100 ns units and callable at
+ * any IRQL, so a log line can show the gap between two commands - which is what
+ * a peer's idle timeout turns on and what a command count cannot show. */
+static ULONG NvtcpkNowMs(void)
+{
+    return (ULONG)(KeQueryInterruptTime() / 10000u);
+}
+
 static void NvtcpkDiagDump(PNVMEOF_TCPK_CONN c, const char* why)
 {
     ULONG n = (g_diagSeen < 8) ? g_diagSeen : 8;
     ULONG i;
 
     NvtcpkLogF("--- %s after %u commands: conn %p cidNext=%u ok=%u in=%u out=%u"
-               " broken=%u poisoned=%u",
+               " broken=%u poisoned=%u needReconnect=%u reconnects=%u",
                why, g_diagSeen, c, (unsigned)c->cidNext, c->commands, c->bytesIn,
-               c->bytesOut, (unsigned)c->broken, (unsigned)c->poisoned);
+               c->bytesOut, (unsigned)c->broken, (unsigned)c->poisoned,
+               (unsigned)c->needReconnect, (unsigned)c->reconnects);
+    NvtcpkLogF("    irps: alloc=%u free=%u outstanding=%u | ops: issued=%u inFlight=%u"
+               " maxInFlight=%u completions=%u staleCompletions=%u",
+               (unsigned)g_irpAlloc, (unsigned)g_irpFree,
+               (unsigned)(g_irpAlloc - g_irpFree), (unsigned)g_opSeq,
+               (unsigned)g_opsInFlight, (unsigned)g_maxOpsInFlight,
+               (unsigned)g_opCompletions, (unsigned)g_staleCompletions);
+    NvtcpkLogF("    failing status: 0x%08X %s info=%u (0xC000020D is"
+               " STATUS_CONNECTION_RESET; STATUS_INVALID_BUFFER_SIZE is 0xC0000206)",
+               (unsigned)c->async.status, NvtcpkStatusName(c->async.status),
+               (unsigned)c->async.info);
     NvtcpkLogF("    buffers: pduBuf=%p pduMdl=%p rspBuf=%p rspMdl=%p",
                c->pduBuf, c->pduMdl, c->rspBuf, c->rspMdl);
     {
@@ -759,20 +888,32 @@ static NTSTATUS NvtcpkSend(PNVMEOF_TCPK_CONN c, ULONG len)
         g_diagCur->irpSt = c->async.status;
     }
     if (g_sendSeen < 8 || !NT_SUCCESS(st)) {
-        NvtcpkLogF("  send #%u len=%u off=%u mdlBytes=%u bufferBytes=%u irql=%u"
-                   " callSt=0x%08X irpSt=0x%08X info=%u",
+        ULONG allocNow = (ULONG)InterlockedCompareExchange(&g_irpAlloc, 0, 0);
+        ULONG freeNow  = (ULONG)InterlockedCompareExchange(&g_irpFree, 0, 0);
+        NvtcpkLogF("  send #%u len=%u off=%u mdlBytes=%u bufferBytes=%u irql=%u t=%ums"
+                   " callSt=0x%08X irpSt=0x%08X info=%u irpOut=%u",
                    g_sendSeen, len, (unsigned)buf.Offset, mdlBytes,
                    (unsigned)NVMEOF_TCPK_BUF_BYTES, (unsigned)KeGetCurrentIrql(),
-                   (unsigned)callSt, (unsigned)c->async.status, (unsigned)c->async.info);
+                   NvtcpkNowMs(), (unsigned)callSt, (unsigned)c->async.status,
+                   (unsigned)c->async.info, (unsigned)(allocNow - freeNow));
     }
     g_sendSeen++;
     if (st == STATUS_IO_TIMEOUT) {
         NvtcpkSetPoisoned(c);
         return st;                      /* IRP, MDL and buffer stay with WSK */
     }
-    IoFreeIrp(irp);
+    NvtcpkIrpFree(irp);
     if (NT_SUCCESS(st)) {
         c->bytesOut += len;
+    } else if (NvtcpkIsSocketLoss(st)) {
+        /* Nothing reached the wire: WSK reports Information = 0 when it refuses a
+         * send, so the capsule is still whole in pduBuf and the command was never
+         * executed.  That is exactly what makes reconnect-and-resend safe here;
+         * a failure after bytes went out would not be. */
+        c->needReconnect = TRUE;
+        NvtcpkLogF("  send: the socket is gone (0x%08X %s, info=%u); the capsule was not"
+                   " transmitted, so the connection is re-established and it is sent again",
+                   (unsigned)st, NvtcpkStatusName(st), (unsigned)c->async.info);
     } else {
         /* A failed send leaves the peer holding a partial PDU, so the stream is
          * out of step even though nothing here is unsafe to touch. */
@@ -823,18 +964,30 @@ static NTSTATUS NvtcpkRecv(PNVMEOF_TCPK_CONN c, ULONG off, ULONG want)
             return st;                  /* IRP, MDL and buffer stay with WSK */
         }
         if (!NT_SUCCESS(st)) {
-            IoFreeIrp(irp);
-            c->broken = TRUE;
-            NvtcpkLogF("  recv off=%u want=%u st=0x%08X info=%u rspMdl=%p mdlBytes=%u",
-                       off, want, (unsigned)st, (unsigned)c->async.info, c->rspMdl,
+            NvtcpkIrpFree(irp);
+            if (NvtcpkIsSocketLoss(st)) {
+                /* The socket itself is gone, so there is no stream left to be out
+                 * of step: the next command on a fresh connection starts clean.
+                 * The command being read, however, is lost - its bytes are not
+                 * coming back - so this call still fails. */
+                c->needReconnect = TRUE;
+            } else {
+                c->broken = TRUE;
+            }
+            NvtcpkLogF("  recv off=%u want=%u st=0x%08X %s info=%u rspMdl=%p mdlBytes=%u",
+                       off, want, (unsigned)st, NvtcpkStatusName(st),
+                       (unsigned)c->async.info, c->rspMdl,
                        (c->rspMdl != NULL) ? MmGetMdlByteCount(c->rspMdl) : 0);
             return st;
         }
         n = (ULONG)c->async.info;
-        IoFreeIrp(irp);
+        NvtcpkIrpFree(irp);
         if (n == 0) {
-            /* A zero-byte completion on a stream socket means the peer closed. */
-            c->broken = TRUE;
+            /* A zero-byte completion on a stream socket means the peer closed its
+             * side.  A fresh connection is in step again; this command is not. */
+            c->needReconnect = TRUE;
+            NvtcpkLogF("  recv: the peer closed the connection (0 bytes) after %u of %u"
+                       " wanted; the connection will be re-established", got, want);
             return STATUS_CONNECTION_DISCONNECTED;
         }
         if (n > want - got) {
@@ -983,6 +1136,84 @@ static NTSTATUS NvtcpkHandshake(PNVMEOF_TCPK_CONN c)
 }
 
 /* ------------------------------------------------------------------------- */
+/*  Reconnect: the peer closed the connection, not this file's buffers        */
+/*                                                                           */
+/*  A transport that treats "the peer went away" as a permanently broken      */
+/*  connection serves one diskpart run and then answers STATUS_DEVICE_NOT_READY */
+/*  until the machine reboots.  The socket is gone, but the caller's handle,   */
+/*  the namespace geometry and the buffers are all still valid, so the repair  */
+/*  is a new socket, a new bind/connect/handshake, and then the work goes on.  */
+/*  This is not a retry of an ambiguous operation: the only caller that ever   */
+/*  resends (NvtcpkTransaction) does so when the capsule send completed with   */
+/*  Information = 0, which means the command never reached the peer.          */
+/* ------------------------------------------------------------------------- */
+static NTSTATUS NvtcpkReconnect(PNVMEOF_TCPK_CONN c, const char* why)
+{
+    NTSTATUS st;
+
+    if (c->poisoned) {
+        /* A timed-out WSK request still owns its IRP, its buffer and its socket:
+         * that connection must never be touched again, not even to replace it. */
+        NvtcpkLogF("!! reconnect (%s): connection %p was poisoned by a timeout; not touching it",
+                   why, c);
+        return STATUS_DEVICE_NOT_READY;
+    }
+    InterlockedIncrement(&g_reconnects);
+    InterlockedIncrement(&c->reconnects);
+    NvtcpkLogF("=== reconnect (%s): rebuilding connection %p to %u.%u.%u.%u:%u, old socket=%p ===",
+               why, c,
+               (unsigned)(c->remote.sin_addr.S_un.S_addr & 0xFF),
+               (unsigned)((c->remote.sin_addr.S_un.S_addr >> 8) & 0xFF),
+               (unsigned)((c->remote.sin_addr.S_un.S_addr >> 16) & 0xFF),
+               (unsigned)((c->remote.sin_addr.S_un.S_addr >> 24) & 0xFF),
+               (unsigned)RtlUshortByteSwap(c->remote.sin_port), c->socket);
+    NvtcpkLogFlush();
+
+    /* The old socket is dead, but it is still an object WSK owns; closing it
+     * first is what keeps the socket count from growing by one per reconnect. */
+    st = NvtcpkSocketClose(c);
+    if (c->poisoned) {
+        return STATUS_DEVICE_NOT_READY;    /* the close itself timed out: hands off */
+    }
+    if (!NT_SUCCESS(st)) {
+        NvtcpkLogF("!! reconnect: WskCloseSocket on the dead socket returned 0x%08X %s;"
+                   " abandoning that socket object and building a new one",
+                   (unsigned)st, NvtcpkStatusName(st));
+        c->socket = NULL;                  /* never touch the old handle again */
+    }
+
+    st = NvtcpkSocketCreate(c, (PWSK_CLIENT)c->wskClient);
+    if (!NT_SUCCESS(st)) {
+        NvtcpkLogF("!! reconnect: WskSocket = 0x%08X %s", (unsigned)st, NvtcpkStatusName(st));
+        c->broken = TRUE;
+        return st;
+    }
+    st = NvtcpkBind(c);
+    if (!NT_SUCCESS(st)) {
+        NvtcpkLogF("reconnect: WskBind(wildcard) = 0x%08X (continuing to connect unbound)", st);
+    }
+    st = NvtcpkConnect(c);
+    if (!NT_SUCCESS(st)) {
+        NvtcpkLogF("!! reconnect: WskConnect = 0x%08X %s", (unsigned)st, NvtcpkStatusName(st));
+        c->broken = TRUE;
+        return st;
+    }
+    st = NvtcpkHandshake(c);
+    if (!NT_SUCCESS(st)) {
+        NvtcpkLogF("!! reconnect: handshake failed 0x%08X %s", (unsigned)st, NvtcpkStatusName(st));
+        c->broken = TRUE;
+        return st;
+    }
+
+    c->needReconnect = FALSE;
+    c->broken = FALSE;                     /* a fresh stream is in step again */
+    NvtcpkLogF("reconnect: connection %p is up again (%u reconnects on this connection)",
+               c, (unsigned)c->reconnects);
+    NvtcpkLogFlush();
+    return STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------------- */
 /*  Public: open                                                             */
 /* ------------------------------------------------------------------------- */
 
@@ -1029,6 +1260,9 @@ NTSTATUS NvtcpOpen(_In_ WSK_REGISTRATION* reg, _In_ WSK_PROVIDER_NPI* provider,
     c->cidNext = 1;
     c->cpda = (UCHAR)NVMEOF_TCP_PDU_ALIGN;
     c->providerDispatch = provider->Dispatch;
+    /* Kept so a reconnect can create a socket without the caller's NPI: the
+     * client half of the captured NPI lives as long as the registration. */
+    c->wskClient = provider->Client;
     c->remote.sin_family = AF_INET;
     /* `port` is host order (NVMEOF_TCP_DEFAULT_PORT is 4420, not 0x4211) and the
      * address is already network order, so only the port is swapped. */
@@ -1286,6 +1520,23 @@ NTSTATUS NvtcpClose(_In_ PVOID conn)
 /*  of step for every command that follows.                                   */
 /* ------------------------------------------------------------------------- */
 
+/* Build the whole CapsuleCmd PDU in c->pduBuf: header, SQE, padding to the
+ * peer's data offset, then the in-capsule payload.  Split out of the transaction
+ * because a reconnect has to build it twice: the ICReq of the new connection
+ * handshake is written into the same pduBuf and would otherwise overwrite the
+ * capsule that still has to be sent. */
+static void NvtcpkBuildCapsule(PNVMEOF_TCPK_CONN c, const UCHAR* sqe, ULONG pdo,
+                               PVOID inData, ULONG inBytes)
+{
+    (void)nvmeofTcpBuildCapsuleCmd((PUCHAR)c->pduBuf, sqe, inBytes, pdo);
+    if (pdo > NVMEOF_TCP_CCMD_HDR_LEN) {
+        RtlZeroMemory((PUCHAR)c->pduBuf + NVMEOF_TCP_CCMD_HDR_LEN, pdo - NVMEOF_TCP_CCMD_HDR_LEN);
+    }
+    if (inBytes != 0 && inData != NULL) {
+        RtlCopyMemory((PUCHAR)c->pduBuf + pdo, inData, inBytes);
+    }
+}
+
 static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid,
                                   UINT32 cdw10, UINT32 cdw12,
                                   PVOID inData, ULONG inBytes,
@@ -1315,13 +1566,7 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
                    (unsigned)opcode, (unsigned)pdo, (unsigned)inBytes);
         return STATUS_INVALID_BUFFER_SIZE;
     }
-    (void)nvmeofTcpBuildCapsuleCmd((PUCHAR)c->pduBuf, sqe, inBytes, pdo);
-    if (pdo > NVMEOF_TCP_CCMD_HDR_LEN) {
-        RtlZeroMemory((PUCHAR)c->pduBuf + NVMEOF_TCP_CCMD_HDR_LEN, pdo - NVMEOF_TCP_CCMD_HDR_LEN);
-    }
-    if (inBytes != 0 && inData != NULL) {
-        RtlCopyMemory((PUCHAR)c->pduBuf + pdo, inData, inBytes);
-    }
+    NvtcpkBuildCapsule(c, sqe, pdo, inData, inBytes);
     total = pdo + inBytes;
 
     {   /* TEMPORARY: remember this command for the failure dump. */
@@ -1340,9 +1585,35 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
     }
 
     st = NvtcpkSend(c, total);
+    if (!NT_SUCCESS(st) && NvtcpkIsSocketLoss(st) && !c->poisoned) {
+        /* The peer closed the connection and this capsule never left (the send
+         * completed with Information = 0), so the command has not run and may be
+         * sent again.  One reconnect, one resend: no loop, no backoff, and no
+         * second attempt if the first one fails. */
+        NvtcpkLogF("command 0x%02X cid=%u: the capsule send hit a dead connection (0x%08X %s);"
+                   " reconnecting and resending it", (unsigned)opcode, (unsigned)cid,
+                   (unsigned)st, NvtcpkStatusName(st));
+        st = NvtcpkReconnect(c, "dead connection before a capsule");
+        if (NT_SUCCESS(st)) {
+            /* The new handshake may have negotiated a different capsule data offset,
+             * so pdo and total are recomputed rather than carried over. */
+            pdo = nvmeofTcpPduTotal(NVMEOF_TCP_CCMD_HDR_LEN, 0, c->cpda);
+            total = pdo + inBytes;
+            if (pdo + inBytes > NVMEOF_TCPK_BUF_BYTES) {
+                st = STATUS_INVALID_BUFFER_SIZE;
+            } else {
+                NvtcpkBuildCapsule(c, sqe, pdo, inData, inBytes);
+                st = NvtcpkSend(c, total);
+            }
+            if (!NT_SUCCESS(st)) {
+                NvtcpkLogF("command 0x%02X cid=%u: resend after the reconnect also failed 0x%08X %s",
+                           (unsigned)opcode, (unsigned)cid, (unsigned)st, NvtcpkStatusName(st));
+            }
+        }
+    }
     if (!NT_SUCCESS(st)) {
-        NvtcpkLogF("command 0x%02X cid=%u: send of the capsule failed 0x%08X",
-                   (unsigned)opcode, (unsigned)cid, st);
+        NvtcpkLogF("command 0x%02X cid=%u: send of the capsule failed 0x%08X %s",
+                   (unsigned)opcode, (unsigned)cid, (unsigned)st, NvtcpkStatusName(st));
         NvtcpkDiagDump(c, "send failed");
         return st;
     }
@@ -1528,6 +1799,7 @@ static NTSTATUS NvtcpkCommandEx(PVOID conn, UINT8 opcode, UINT32 nsid, UINT32 cd
 {
     PNVMEOF_TCPK_CONN c;
     NTSTATUS st;
+    NTSTATUS rst;
     UCHAR localStatus = NVMEOF_TCPK_STATUS_UNKNOWN;
 
     if (statusOut == NULL) {
@@ -1575,6 +1847,21 @@ static NTSTATUS NvtcpkCommandEx(PVOID conn, UINT8 opcode, UINT32 nsid, UINT32 cd
                    (unsigned)opcode, c);
         NvtcpkDropRef(c);
         return STATUS_DEVICE_BUSY;
+    }
+
+    if (c->needReconnect) {
+        /* The socket was lost on an earlier command - the peer closed it, or a
+         * receive died with the connection.  Re-establish it before this command
+         * instead of refusing every command from here to the next reboot: the
+         * caller's handle, the geometry and the buffers are all still valid, and
+         * the fresh socket starts in step. */
+        rst = NvtcpkReconnect(c, "socket lost on an earlier command");
+        if (!NT_SUCCESS(rst)) {
+            InterlockedExchange(&c->busy, 0);
+            NvtcpkDropRef(c);
+            NvtcpkLogFlush();
+            return rst;
+        }
     }
 
     st = NvtcpkTransaction(c, opcode, nsid, cdw10, cdw12, inData, inBytes,
