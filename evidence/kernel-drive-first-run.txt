@@ -1,0 +1,83 @@
+=== nvmeofnd2_log (the miniport) ===
+=== nvmeofnd2: StorPort virtual miniport over a REMOTE NVMe/TCP namespace (target 127.0.0.1:4421, nsid 1) ===
+WskRegister = 0x00000000
+StorPortInitialize = 0x00000000 (HW_INITIALIZATION_DATA 208 bytes)
+HwFindAdapter entered (IRQL 0)
+=== HwInitialize: bring up NVMe/TCP 127.0.0.1:4421 (IRQL 0) ===
+engine 0xffffaa04a2bd1af0 allocated (non-paged, 64 slots, never freed on purpose)
+WskCaptureProviderNPI(wait 5000 ms) = 0x00000000 dispatch=0xfffff802445d8160 client=0xffffaa04a313c2b0
+NvtcpOpen(127.0.0.1:4421) = 0x00000000 conn=0xffffaa04a783ae80
+NvtcpIdentify(cns=1, nsid=0) = 0x00000000
+  controller: VID 0x1C36 SN NDTCP000000000000001 MN NVMe-oF/TCP for Windows                 
+NvtcpIdentify(cns=0, nsid=1) = 0x00000000
+  namespace 1: NSZE=32768 blocks, NLBAF=0 FLBAS=0 LBADS_byte=0 (target writes its LBAF table off by four; block size is taken as 512)
+PsCreateSystemThread(worker) = 0x00000000
+adapter ready: 32768 blocks x 512 bytes = 16 MiB from the remote namespace; bus change announced
+!! READ lba=128 blocks=1 bytes=512: transport 0xC000020D nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5944 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5944 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5944 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5944 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5944 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=128 blocks=1 bytes=512: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=128 blocks=1 bytes=512: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=128 blocks=1 bytes=512: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=128 blocks=1 bytes=512: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=128 blocks=1 bytes=512: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=11048 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=11048 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=11048 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=11048 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=11048 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=3193 blocks=61 bytes=31232: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=3193 blocks=61 bytes=31232: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=3193 blocks=61 bytes=31232: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=3193 blocks=61 bytes=31232: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=3193 blocks=61 bytes=31232: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5912 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5912 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5912 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5912 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5912 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=3256 blocks=128 bytes=65536: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=3256 blocks=128 bytes=65536: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=3256 blocks=128 bytes=65536: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=3256 blocks=128 bytes=65536: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=3256 blocks=128 bytes=65536: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=3132 blocks=61 bytes=31232: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=3132 blocks=61 bytes=31232: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=3132 blocks=61 bytes=31232: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=3132 blocks=61 bytes=31232: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=3132 blocks=61 bytes=31232: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5944 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5944 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5944 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5944 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5944 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=11024 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=11024 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=11024 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=11024 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=11024 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=416 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=416 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=416 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=416 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! READ lba=416 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5912 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5912 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5912 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! WRITE lba=5912 blocks=8 bytes=4096: transport 0xC00000A3 nvme_status=0xFF (done 0 bytes)
+!! W
+
+=== nvtcpk_log (the transport, decoded) ===
+=== NvtcpOpen: NVMe/TCP connect to 127.0.0.1:4421 ===
+WskSocket = 0x00000000 socket=0xffffaa04a3140c48
+WskConnect = 0x00000000 (0xC0000236 = connection refused, 0xC000023C = unreachable)
+handshake: ICReq sent (128 bytes, cpda=4 dgst=0 maxr2t=0)
+handshake OK: peer pfv=0 cpda=4 dgst=0 maxr2t=0
+NvtcpOpen: connection 0xffffaa04a783ae80 is open (cpda=4, one command at a time)
+Identify cns=1 nsid=0: 4096 bytes, VID 0x1C36
+Identify cns=0 nsid=1: 4096 bytes, VID 0x8000
+command 0x02 cid=228: send of the capsule failed 0xC000020D
+

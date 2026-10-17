@@ -1,0 +1,84 @@
+; SPDX-FileCopyrightText: 2026 Dingtaiqi
+; SPDX-License-Identifier: Apache-2.0
+;
+; nvmeofndi2.inf - installs the D1.2 miniport: the same StorPort virtual
+; miniport as nvmeofndi.inf, but its LUN is the REMOTE NVMe/TCP namespace at
+; 127.0.0.1:4421 instead of a RAM buffer.
+;
+; WHY A SECOND INF, A SECOND SERVICE AND A SECOND BINARY NAME
+; -----------------------------------------------------------
+; The D1.1 driver (nvmeofndi.sys, service nvmeofndi) is already loaded on this
+; machine and is still serving its RAM LUN.  A driver image that is loaded cannot
+; be replaced on disk, and stopping a driver's service on this machine has
+; wedged it once already (evidence/wsktest_incident.txt), so this revision is
+; installed as a NEW driver rather than as an update to the old one:
+;
+;   hardware id  root\nvmeofndi2   (a new root-enumerated device node)
+;   service      nvmeofnd2
+;   binary       %12%\nvmeofnd2.sys
+;   catalog      nvmeofndi2.cat
+;
+; That gives a clean load of freshly built code with nothing to unload, and it
+; leaves the working D1.1 adapter untouched as a fallback.
+;
+; Everything else mirrors nvmeofndi.inf, whose shape was proven on this machine
+; (DRIVER-D1.md sections 39-42): HDC class, root enumeration, and VirtualDevice
+; written to the device HARDWARE key (.HW section), which is what makes StorPort
+; treat the adapter as virtual and start it.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = HDC
+ClassGuid   = {4D36E96A-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderName%
+CatalogFile = nvmeofndi2.cat
+DriverVer   = 10/16/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ProviderName% = Nvmeofnd2, NTamd64
+
+[Nvmeofnd2.NTamd64]
+%DeviceDesc% = Nvmeofnd2_Inst, root\nvmeofndi2
+
+[Nvmeofnd2_Inst]
+CopyFiles = Nvmeofnd2_CopyFiles
+
+; VirtualDevice belongs in the device HARDWARE key, which is what the .HW section's
+; HKR refers to.  Written to the software key instead, the device installs and binds
+; but fails to start with problem 10 (CM_PROB_FAILED_START), because StorPort looks
+; there to decide this is a virtual adapter with no hardware behind it.
+[Nvmeofnd2_Inst.HW]
+AddReg = Nvmeofnd2_HW_AddReg
+
+[Nvmeofnd2_HW_AddReg]
+HKR,, "VirtualDevice", 0x00010001, 1
+
+[Nvmeofnd2_Inst.Services]
+AddService = nvmeofnd2, 0x00000002, Nvmeofnd2_Service
+
+[Nvmeofnd2_Service]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\nvmeofnd2.sys
+LoadOrderGroup = SCSI Miniport
+
+[Nvmeofnd2_CopyFiles]
+nvmeofnd2.sys
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+nvmeofnd2.sys = 1,,
+
+[Strings]
+ProviderName = "Dingtaiqi"
+DeviceDesc   = "NVMe-oF/TCP remote namespace (StorPort virtual miniport)"
+ServiceDesc  = "NVMe-oF TCP StorPort Miniport (remote namespace)"
+DiskName     = "NVMe-oF TCP Namespace Installation Disk"
