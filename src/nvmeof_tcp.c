@@ -335,6 +335,12 @@ static int targetServeOne(TARGET_CONN* c)
         sc = NVME_SC_INVALID_OPCODE;
     }
 
+    /* The completion must be filled for EVERY command.  Only some branches called
+     * cqeBuild, so FLUSH and any similar path shipped uninitialised stack as the
+     * 16-byte CQE while the capsule SUCCESS flag was right.  A user-mode client that
+     * trusts the flag never notices; a real host reads that field.  Found by the
+     * iSCSI bridge being driven by a genuine Windows initiator. */
+    cqeBuild(cqe, 0, cid, sc);
     respLen = nvmeofTcpBuildCapsuleResp(resp, cqe, sc == NVME_SC_SUCCESS ? 1 : 0,
                                         dataLen, NVMEOF_TCP_CRSP_HDR_LEN);
     (void)cq;
