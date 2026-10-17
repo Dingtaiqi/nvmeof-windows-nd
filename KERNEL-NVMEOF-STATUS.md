@@ -103,3 +103,64 @@
 4. 再做 RDMA 数据面实验（先试"连接完成后延迟 1–2 秒再 Send"、"先 RDMA Read 再 SEND"、
    "两个 QP 放同一个 adapter"）；
 5. 最后才是 #4 大传输（H2CData/C2HData/R2T）。
+
+---
+
+## 2026-10-18 01:21 蓝屏与恢复（实测，按发生顺序）
+
+### 蓝屏
+
+- `01:21:31` 系统蓝屏，`01:23` 重启。事件 1001：
+  **`0x00000139 (0x000000000000000a, 0, 0, 0)`**，即
+  `KERNEL_SECURITY_CHECK_FAILURE` / `FAST_FAIL_INCORRECT_STACK`。
+  转储：`C:\Windows\Minidump\101826-27953-01.dmp`（2,889,551 字节，01:23:04）。
+- 这是 `nvmeofk.c` 里记录过的同一种延迟性故障：NDK 连接/发送在 provider 里被卡住后，
+  大约几分钟内 `mlx4eth63` 会以 `0x139 P1=0xa` 收场（栈不可展开）。
+  本次三个测试连接（4420/4425/4426）分别在 01:01、01:07、01:11 卡住，
+  01:21 蓝屏，时间线吻合。
+- **不是 `nvmeofnd2` 的问题**：它是 TCP StorPort 微端口，本次实验没有加载/替换它；
+  蓝屏后部署盘上的 `nvmeofnd2.sys` 仍是旧 hash `07EF388C...`。
+
+### 重启后 `Z:` 消失，以及真正的原因
+
+- 重启后 `Z:` 不见了；`ROOT\HDC\0002`（NVMe-oF/TCP 微端口）状态 `Problem`，
+  code 10 `CM_PROB_FAILED_START`，problem status `0xC0000001`。
+- 两个开机计划任务都跑了（`LastTaskResult = 0`），但 `nvmeof_tcp.exe` 起不来，
+  日志只有 `cannot open namespace`。
+- 根因不是文件损坏，也不是路径写错：**`D:\nvmeof` 被本机安全软件（火绒）保护**。
+  实测（同一台机器、同一用户）：
+  - 签名的 PowerShell 能写入 `D:\nvmeof\probe-ps.txt`（成功）；
+  - 未签名的 `fopentest.exe` 对 `D:\nvmeof` 下的**任何**文件（包括新建的）
+    `fopen("r+b")` 都返回 `errno 13`（EACCES），`fopen("w+b")` 同样失败；
+  - 同一个 `fopentest.exe` 对 `D:\rdma` 下的文件读写正常；
+  - 以 SYSTEM 通过计划任务运行 `nvmeof_tcp.exe` 时，对 `D:\nvmeof\bridge-ns.img`
+    同样报 `cannot open namespace`。
+  结论：**`nvmeof_tcp.exe` 是未签名程序，火绒禁止它在 `D:\nvmeof` 里写文件**。
+  蓝屏前它一直能写，是因为它早已持有文件句柄；重启后重新 `fopen` 就被拒绝。
+
+### 恢复步骤（已执行，`Z:` 已回来）
+
+1. 把命名空间镜像复制到不受保护的路径，并比对哈希：
+   `D:\nvmeof\bridge-ns.img` → `D:\rdma\nvmeof-ns.img`，
+   SHA256 都是 `E7180E162618C3FB00ACC3AE0EB1DB619470F5D35125496BC00D307473975DBE`。
+2. 起 target：`nvmeof_tcp.exe -target 127.0.0.1 4421 -nsfile D:\rdma\nvmeof-ns.img -blocks 32768 -serve`
+   （pid 31260，监听 4421）。
+3. 起 bridge：`iscsi_tcp_bridge.exe -listen 127.0.0.1 3260 -target 127.0.0.1 4421 -lun 0 32768`
+   （pid 6904，监听 3260；它自己的 Identify 读到 `nsze=32768 blocks`）。
+4. `pnputil /restart-device "ROOT\HDC\0002"` → `Device restarted successfully`，
+   设备状态 `Started`，`Z:` 出现。
+5. 验证：`Z:\roundtrip.bin` 的 SHA256 仍是
+   `C0DC81BA3F03D8C865E1CF0D400EB298EF7DD3E419788D603CF45704A1455D9B`；
+   新写 64 KiB 再读回，**逐字节相同**；新建/删除文件正常。
+6. 开机脚本两份都改了（仓库 `tools/boot_4421.ps1` 与计划任务实际执行的
+   `D:\rdma\boot_4421.ps1`），`-nsfile` 指向 `D:\rdma\nvmeof-ns.img`；
+   并用 SYSTEM 计划任务实测过：target 能打开新路径并监听。
+
+### 遗留
+
+- `D:\nvmeof\bridge-ns.img` 是**旧的 16 MiB 镜像**（内容与复制时相同，之后 `Z:` 的写入
+  只落在新文件上）。如果以后修好火绒的规则（把 `nvmeof_tcp.exe` 加入信任/排除），
+  可以再搬回去；在那之前，开机路径以 `D:\rdma\nvmeof-ns.img` 为准。
+- 三个 `nvmeofkloop*` 服务重启后变成 STOPPED（不再是 START_PENDING），
+  可以 `sc delete` 清掉；驱动镜像仍在 `sym\k\` 作为证据。
+- 新 `nvmeofnd2.sys`（`B40537DC...`）仍未部署，按 0xCE 铁律等重启时加载。
