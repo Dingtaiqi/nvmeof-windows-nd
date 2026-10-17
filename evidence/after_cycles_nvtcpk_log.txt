@@ -1,0 +1,74 @@
+=== NvtcpOpen: NVMe/TCP connect to 127.0.0.1:4421 ===
+WskSocket = 0x00000000 socket=0xffff9682151b3768
+WskConnect = 0x00000000 (0xC0000236 = connection refused, 0xC000023C = unreachable)
+  send #0 len=128 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=130373ms callSt=0x00000103 irpSt=0x00000000 info=128 irpOut=1
+handshake: ICReq sent (128 bytes, cpda=4 dgst=0 maxr2t=0)
+handshake OK: peer pfv=0 cpda=4 dgst=0 maxr2t=0
+NvtcpOpen: connection 0xffff9682103813f0 is open (cpda=4, one command at a time)
+  send #1 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=130380ms callSt=0x00000103 irpSt=0x00000000 info=72 irpOut=1
+  resp #0 cid=1 type=0x05 flags=0x10 hlen=24 pdo=24 plen=4096
+Identify cns=1 nsid=0: 4096 bytes, VID 0x1C36
+  send #2 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=130380ms callSt=0x00000103 irpSt=0x00000000 info=72 irpOut=1
+  resp #1 cid=2 type=0x05 flags=0x10 hlen=24 pdo=24 plen=4096
+Identify cns=0 nsid=1: 4096 bytes, VID 0x8000
+  send #3 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=130389ms callSt=0x00000103 irpSt=0x00000000 info=72 irpOut=1
+  resp #2 cid=3 type=0x05 flags=0x10 hlen=24 pdo=24 plen=0
+  send #4 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=130390ms callSt=0x00000103 irpSt=0x00000000 info=72 irpOut=1
+  resp #3 cid=4 type=0x05 flags=0x10 hlen=24 pdo=24 plen=512
+  send #5 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=130390ms callSt=0x00000103 irpSt=0x00000000 info=72 irpOut=1
+  resp #4 cid=5 type=0x05 flags=0x10 hlen=24 pdo=24 plen=512
+  send #6 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=130391ms callSt=0x00000103 irpSt=0x00000000 info=72 irpOut=1
+  resp #5 cid=6 type=0x05 flags=0x10 hlen=24 pdo=24 plen=4096
+  send #7 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=130391ms callSt=0x00000103 irpSt=0x00000000 info=72 irpOut=1
+  resp #6 cid=7 type=0x05 flags=0x10 hlen=24 pdo=24 plen=4096
+  resp #7 cid=8 type=0x05 flags=0x10 hlen=24 pdo=24 plen=4096
+  send #218 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=222910ms callSt=0x00000103 irpSt=0xC000020D info=0 irpOut=1
+  send: the socket is gone (0xC000020D STATUS_CONNECTION_RESET, info=0); the capsule was not transmitted, so the connection is re-established and it is sent again
+command 0x02 cid=218: the capsule send hit a dead connection (0xC000020D STATUS_CONNECTION_RESET); reconnecting and resending it
+=== reconnect (dead connection before a capsule): rebuilding connection 0xffff9682103813f0 to 127.0.0.1:4421, old socket=0xffff9682151b3768 ===
+handshake: ICReq sent (128 bytes, cpda=4 dgst=0 maxr2t=0)
+handshake OK: peer pfv=0 cpda=4 dgst=0 maxr2t=0
+reconnect: connection 0xffff9682103813f0 is up again (1 reconnects on this connection)
+  send #837 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=1237082ms callSt=0x00000103 irpSt=0xC000020D info=0 irpOut=1
+  send: the socket is gone (0xC000020D STATUS_CONNECTION_RESET, info=0); the capsule was not transmitted, so the connection is re-established and it is sent again
+command 0x02 cid=835: the capsule send hit a dead connection (0xC000020D STATUS_CONNECTION_RESET); reconnecting and resending it
+=== reconnect (dead connection before a capsule): rebuilding connection 0xffff9682103813f0 to 127.0.0.1:4421, old socket=0xffff9682151b3768 ===
+handshake: ICReq sent (128 bytes, cpda=4 dgst=0 maxr2t=0)
+handshake OK: peer pfv=0 cpda=4 dgst=0 maxr2t=0
+reconnect: connection 0xffff9682103813f0 is up again (2 reconnects on this connection)
+  send #840 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=1301184ms callSt=0x00000103 irpSt=0xC000020D info=0 irpOut=1
+  send: the socket is gone (0xC000020D STATUS_CONNECTION_RESET, info=0); the capsule was not transmitted, so the connection is re-established and it is sent again
+command 0x02 cid=836: the capsule send hit a dead connection (0xC000020D STATUS_CONNECTION_RESET); reconnecting and resending it
+=== reconnect (dead connection before a capsule): rebuilding connection 0xffff9682103813f0 to 127.0.0.1:4421, old socket=0xffff9682151b3768 ===
+handshake: ICReq sent (128 bytes, cpda=4 dgst=0 maxr2t=0)
+handshake OK: peer pfv=0 cpda=4 dgst=0 maxr2t=0
+reconnect: connection 0xffff9682103813f0 is up again (3 reconnects on this connection)
+  send #2944 len=4168 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=1396472ms callSt=0x00000103 irpSt=0xC000020D info=0 irpOut=1
+  send: the socket is gone (0xC000020D STATUS_CONNECTION_RESET, info=0); the capsule was not transmitted, so the connection is re-established and it is sent again
+command 0x01 cid=2938: the capsule send hit a dead connection (0xC000020D STATUS_CONNECTION_RESET); reconnecting and resending it
+=== reconnect (dead connection before a capsule): rebuilding connection 0xffff9682103813f0 to 127.0.0.1:4421, old socket=0xffff9682151b3768 ===
+handshake: ICReq sent (128 bytes, cpda=4 dgst=0 maxr2t=0)
+handshake OK: peer pfv=0 cpda=4 dgst=0 maxr2t=0
+reconnect: connection 0xffff9682103813f0 is up again (4 reconnects on this connection)
+  send #3224 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=1523998ms callSt=0x00000103 irpSt=0xC000020D info=0 irpOut=1
+  send: the socket is gone (0xC000020D STATUS_CONNECTION_RESET, info=0); the capsule was not transmitted, so the connection is re-established and it is sent again
+command 0x02 cid=3216: the capsule send hit a dead connection (0xC000020D STATUS_CONNECTION_RESET); reconnecting and resending it
+=== reconnect (dead connection before a capsule): rebuilding connection 0xffff9682103813f0 to 127.0.0.1:4421, old socket=0xffff9682151b3768 ===
+handshake: ICReq sent (128 bytes, cpda=4 dgst=0 maxr2t=0)
+handshake OK: peer pfv=0 cpda=4 dgst=0 maxr2t=0
+reconnect: connection 0xffff9682103813f0 is up again (5 reconnects on this connection)
+  send #3227 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=1589485ms callSt=0x00000103 irpSt=0xC000020D info=0 irpOut=1
+  send: the socket is gone (0xC000020D STATUS_CONNECTION_RESET, info=0); the capsule was not transmitted, so the connection is re-established and it is sent again
+command 0x02 cid=3217: the capsule send hit a dead connection (0xC000020D STATUS_CONNECTION_RESET); reconnecting and resending it
+=== reconnect (dead connection before a capsule): rebuilding connection 0xffff9682103813f0 to 127.0.0.1:4421, old socket=0xffff9682151b3768 ===
+handshake: ICReq sent (128 bytes, cpda=4 dgst=0 maxr2t=0)
+handshake OK: peer pfv=0 cpda=4 dgst=0 maxr2t=0
+reconnect: connection 0xffff9682103813f0 is up again (6 reconnects on this connection)
+  send #3230 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 t=1654996ms callSt=0x00000103 irpSt=0xC000020D info=0 irpOut=1
+  send: the socket is gone (0xC000020D STATUS_CONNECTION_RESET, info=0); the capsule was not transmitted, so the connection is re-established and it is sent again
+command 0x02 cid=3218: the capsule send hit a dead connection (0xC000020D STATUS_CONNECTION_RESET); reconnecting and resending it
+=== reconnect (dead connection before a capsule): rebuilding connection 0xffff9682103813f0 to 127.0.0.1:4421, old socket=0xffff9682151b3768 ===
+handshake: ICReq sent (128 bytes, cpda=4 dgst=0 maxr2t=0)
+handshake OK: peer pfv=0 cpda=4 dgst=0 maxr2t=0
+reconnect: connection 0xffff9682103813f0 is up again (7 reconnects on this connection)
+

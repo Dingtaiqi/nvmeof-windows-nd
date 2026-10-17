@@ -1,0 +1,7 @@
+select disk 5
+clean
+convert gpt
+create partition primary
+format fs=ntfs quick label=NVMEOF-KERNEL
+assign letter=Z
+exit

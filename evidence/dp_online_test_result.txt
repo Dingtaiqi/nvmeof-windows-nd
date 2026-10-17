@@ -1,0 +1,4 @@
+diskpart script: select disk 5 / online disk / exit (disk 5 is already online)
+exit code: -2147211883 (0x80042595)
+The earlier failing run at 2026-10-17 23:43:49 recorded the same exit code -2147211883,
+so that diskpart stopped on 'online disk', not on an I/O that hung.

@@ -1,0 +1,14 @@
+=== provoke cycles 2026-10-18 00:04:24
+[00:04:24] cycle 1: idling 65 s (accepts=6 reconnects=4)
+[00:05:30] cycle 1: exited=True accepts 6->7 reconnects 4->5
+    00:05:30.195 OK cycle1 disk=5 off=512000 read=512 elapsed=106ms first16=00000000000000000000000000000000
+[00:05:30] cycle 2: idling 65 s (accepts=7 reconnects=5)
+[00:06:35] cycle 2: exited=True accepts 7->8 reconnects 5->6
+    00:06:35.694 OK cycle2 disk=5 off=1024000 read=512 elapsed=128ms first16=00000000000000000000000000000000
+[00:06:35] cycle 3: idling 65 s (accepts=8 reconnects=6)
+[00:07:41] cycle 3: exited=True accepts 8->9 reconnects 6->7
+    00:07:41.196 OK cycle3 disk=5 off=1536000 read=512 elapsed=129ms first16=00000000000000000000000000000000
+[00:07:41] cycle 4: idling 65 s (accepts=9 reconnects=7)
+[00:08:46] cycle 4: exited=True accepts 9->9 reconnects 7->7
+    00:08:46.827 OK cycle4 disk=5 off=2048000 read=512 elapsed=136ms first16=00000000000000000000000000000000
+=== provoke cycles done

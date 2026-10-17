@@ -1,0 +1,9 @@
+=== final state 2026-10-18 00:14:52
+driver: STATE              : 4  RUNNING
+source sha256: E3EFFFD6CBF03A3F4E1BC75FAF794307069CD5C91B0C1B414A5E63F884FD30F6
+deployed sha256: 07EF388C75E5D85043F7180EECE538914EDCD77AF94419D10965794AB3F658BA
+Z: label=NVMEOF-KERNEL fs=NTFS health=Healthy size=16642048
+Z: files: roundtrip.bin(1048576) roundtrip2.bin(524288)
+trace: opens=1 ok=1 poisoned= logdropped=
+target accepts=10 reconnects=8
+reloads performed by this session: 0 (no devcon restart, no sc stop, no reboot)
