@@ -317,7 +317,7 @@ static int targetServeOne(TARGET_CONN* c)
 
         if (nsid == 0 || nsid > 1) {
             sc = NVME_SC_INVALID_NS;
-        } else if (bytes > 4096) {
+        } else if (bytes > 4096) {   /* one PDU fits in the capsule; larger needs C2HData, not wired yet */
             /* Larger transfers need H2CData/C2HData and an R2T; that is the next piece of
              * work, and saying so is better than silently truncating. */
             sc = NVME_SC_DATA_XFER_ERR;
@@ -611,4 +611,75 @@ int main(int argc, char** argv)
     }
     printf("unknown mode %s\n", mode);
     return 2;
+}
+
+
+/* ---- out-of-capsule data: C2HData and H2CData ------------------------------------- */
+/*
+ * Send a payload as a series of data PDUs.  The receiver gets a 24-byte header and then the
+ * data, with LAST set on the final PDU - that is how it knows the transfer is complete
+ * without counting bytes itself.  Each PDU is padded up to the capsule alignment, and both
+ * sides have to agree about the padding or every following PDU in the stream is misaligned.
+ *
+ * This is the part of NVMe/TCP that has no RDMA equivalent at all.  There is no RDMA Write
+ * and no remote memory to write into; the sender paces the transfer in chunks and the
+ * receiver follows headers.
+ */
+static int sendDataPdus(SOCKET s, uint8_t type, uint16_t cccid, uint16_t ttag,
+                        const uint8_t* data, unsigned len, unsigned maxPerPdu, unsigned align)
+{
+    unsigned off = 0;
+    if (maxPerPdu == 0) { maxPerPdu = 65536; }
+    while (off < len) {
+        unsigned chunk = len - off;
+        unsigned total;
+        int last;
+        uint8_t hdr[NVMEOF_TCP_DATA_HDR_LEN];
+        uint8_t* buf;
+        NVMEOF_TCP_DATA d;
+        if (chunk > maxPerPdu) { chunk = maxPerPdu; }
+        last = (off + chunk >= len);
+        d.cccid = cccid; d.ttag = ttag; d.datao = off; d.datal = chunk;
+        nvmeofTcpBuildData(hdr, type, last ? NVMEOF_TCP_F_LAST : 0, &d);
+        total = nvmeofTcpPduTotal(NVMEOF_TCP_DATA_HDR_LEN, chunk, align);
+        buf = (uint8_t*)calloc(1, total);
+        if (buf == NULL) { return -1; }
+        memcpy(buf, hdr, NVMEOF_TCP_DATA_HDR_LEN);
+        memcpy(buf + NVMEOF_TCP_DATA_HDR_LEN, data + off, chunk);
+        if (sendAll(s, buf, (int)total) != (int)total) { free(buf); return -2; }
+        free(buf);
+        off += chunk;
+    }
+    return 0;
+}
+
+/* Receive data PDUs until LAST arrives.  Returns the number of bytes accumulated, or -1. */
+static int recvDataPdus(SOCKET s, uint8_t* out, unsigned cap, unsigned align, unsigned* gotOut)
+{
+    unsigned got = 0;
+    for (;;) {
+        uint8_t hdr[NVMEOF_TCP_DATA_HDR_LEN];
+        NVMEOF_TCP_HDR h;
+        NVMEOF_TCP_DATA d;
+        unsigned pad;
+        if (recvAll(s, hdr, NVMEOF_TCP_DATA_HDR_LEN) != (int)NVMEOF_TCP_DATA_HDR_LEN) { return -1; }
+        nvmeofTcpReadHdr(hdr, &h);
+        if (h.type != NVMEOF_TCP_C2HDATA && h.type != NVMEOF_TCP_H2CDATA) { return -2; }
+        nvmeofTcpReadData(hdr, &d);
+        if (d.datal > cap - got) { return -3; }
+        if (d.datal > 0) {
+            if (recvAll(s, out + got, (int)d.datal) != (int)d.datal) { return -4; }
+        }
+        pad = nvmeofTcpPduTotal(NVMEOF_TCP_DATA_HDR_LEN, d.datal, align)
+            - NVMEOF_TCP_DATA_HDR_LEN - d.datal;
+        if (pad > 0) {
+            uint8_t skip[8];
+            if (pad > sizeof(skip)) { return -5; }
+            if (recvAll(s, skip, (int)pad) != (int)pad) { return -6; }
+        }
+        got += d.datal;
+        if ((h.flags & NVMEOF_TCP_F_LAST) != 0) { break; }
+    }
+    *gotOut = got;
+    return (int)got;
 }
