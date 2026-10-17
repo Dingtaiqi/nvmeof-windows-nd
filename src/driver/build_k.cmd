@@ -9,6 +9,7 @@ if errorlevel 1 (echo VCVARS FAILED & exit /b 1)
 set WDKINC=C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0
 set WDKLIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0
 set SRC=D:\rdma\nvmeof\src\driver
+if "%1"=="" (set NAME=nvmeofk_lb) else (set NAME=%1)
 set OUT=%SRC%\sym\k
 if not exist "%OUT%" mkdir "%OUT%"
 
@@ -20,9 +21,10 @@ cl %CFLAGS% %INCS% /Fo"%OUT%\nvmeofk.obj" "%SRC%\nvmeofk.c"
 if errorlevel 1 (echo CL FAILED nvmeofk.c & exit /b 2)
 
 echo === linking ===
-link /nologo /DRIVER:WDM /SUBSYSTEM:NATIVE,1.10 /MACHINE:X64 /GUARD:CF /OPT:REF /OPT:ICF /DEBUG /ENTRY:GsDriverEntry /LIBPATH:"%WDKLIB%\km\x64" /OUT:"%OUT%\nvmeofk_lb.sys" "%OUT%\nvmeofk.obj" ntoskrnl.lib hal.lib wdm.lib netio.lib BufferOverflowK.lib
+link /nologo /DRIVER:WDM /SUBSYSTEM:NATIVE,1.10 /MACHINE:X64 /GUARD:CF /OPT:REF /OPT:ICF /DEBUG /ENTRY:GsDriverEntry /LIBPATH:"%WDKLIB%\km\x64" /OUT:"%OUT%\%NAME%.sys" "%OUT%\nvmeofk.obj" ntoskrnl.lib hal.lib wdm.lib netio.lib BufferOverflowK.lib
 if errorlevel 1 (echo LINK FAILED & exit /b 4)
 
 echo === result ===
-dir "%OUT%\nvmeofk_lb.sys"
+dir "%OUT%\%NAME%.sys"
 exit /b 0
+

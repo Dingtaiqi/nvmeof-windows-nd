@@ -1,0 +1,40 @@
+=== nvmeofk D3: NDK listener and same-card loopback ===
+listener ifIndex=30 port=4426; initiator ifIndex=17; connect=YES
+WskControlClient('NDKD') = 0x00000000 (open=0xfffff8011b7701d0 close=0xfffff8011b770180)
+L WskOpenNdkAdapter(ifIndex=30, v2.0) = 0x00000000 adapter=0xffff9682121fb200
+L NdkCreatePd        = 0x00000000 pd=0xffff968211e55470
+L NdkCreateCq        = 0x00000000 cq=0xffff9681ff3dee30
+L NdkCreateQp        = 0x00000000 qp=0xffff96821297a8e0
+L NdkCreateListener  = 0x00000000 listener=0xffff9681f93dbe30
+L NdkCreateMr        = 0x00000000 mr=0xffff9681e0447790
+L NdkRegisterMr(flags 0x9) = 0x00000000
+L region 0xffff9682041f9000: lkey=0x20010B00 rkey=0x20010B00
+L NdkListen(192.168.100.2:4426) = 0x00000000
+L NdkGetLocalAddress = 0x00000000 len=16 family=2 port=4426 addr=192.168.100.2
+initiator ifIndex from registry: 17
+C WskOpenNdkAdapter(ifIndex=17, v2.0) = 0x00000000 adapter=0xffff96820efe4200
+NdkCreatePd        = 0x00000000 pd=0xffff9681fb9904a0
+NdkCreateCq        = 0x00000000 cq=0xffff9682127bf210
+NdkCreateQp        = 0x00000000 qp=0xffff96821297b8e0
+NdkCreateConnector = 0x00000000 connector=0xffff9681d0e7ecd0
+NdkCreateMr        = 0x00000000 mr=0xffff9681de3dbd80
+NdkRegisterMr flags = 0x3 (remote read: the target may read this region)
+NdkRegisterMr(4096) = 0x00000000
+region 0xffff968205bf6000 registered: rkey=0x20010D00 lkey=0x20010D00 (remote read+write allowed)
+connecting to 192.168.100.2:4426 (local 192.168.100.3)
+NdkConnect submit  = 0x00000103 (pending: the CM is working on it)
+L connect event    = 0x00000000 events=1 incoming=0xffff96821295dd10
+L NdkGetConnectionData = 0x00000000 inbound=1 outbound=1 len=0
+L NdkAccept submit = 0x00000103 (qp 0xffff96821297a8e0)
+NdkConnect         = 0x00000000 (0xC0000236 = connection refused)
+NdkGetConnectionData = 0x00000000 peer inbound=1 outbound=1 dataLen=0 recfmt=0 crqsize=0
+about to call NdkCompleteConnect (connect done, accept submitted)
+NdkCompleteConnect returned 0x00000103 (pending: waiting for the completion)
+NdkCompleteConnect completion phase = 0x00000000
+NdkCompleteConnect = 0x00000000
+L NdkAccept        = 0x00000000 (the same card accepted its own connection)
+X1 posting the 16-byte response receive on the initiator qp
+X1 postResponseRecv = 0x00000000
+X2 arming the in-kernel target receive
+X2 responderPrepare = 0x00000000
+X3 sending the 64-byte capsule

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: Apache-2.0
 #
 # run_kernel_listener.ps1 - load a fresh copy of nvmeofk_lb.sys and read its log.
@@ -16,11 +16,12 @@
 param(
     [ValidateSet(0, 1)][int]$Connect = 0,
     [string]$Tag = 'listen-only',
-    [string]$Instance = (Get-Date -Format 'HHmmss')
+    [string]$Instance = (Get-Date -Format 'HHmmss'),
+    [int]$Port = 4420
 )
 
 $ErrorActionPreference = 'Continue'
-$base   = 'D:\rdma\nvmeof\src\driver\sym\k\nvmeofk_lb.sys'
+$base   = 'D:\rdma\nvmeof\src\driver\sym\k\nvmeofk_d4.sys'
 $driver = 'D:\rdma\nvmeof\src\driver\sym\k\nvmeofk_lb_' + $Instance + '.sys'
 $svc    = 'nvmeofkloop' + $Instance
 $out    = 'D:\rdma\klisten_' + $Tag + '.txt'
@@ -78,7 +79,7 @@ $knobs = @{
     nvmeofk_lifindex = 30
     nvmeofk_local    = (AddrToNetOrder '192.168.100.3')
     nvmeofk_target   = (AddrToNetOrder '192.168.100.2')
-    nvmeofk_lport    = 4420
+    nvmeofk_lport    = $Port
 }
 foreach ($k in $knobs.Keys) {
     & reg.exe add 'HKLM\Software\NVMeoFProbe' /v $k /t REG_DWORD /d $knobs[$k] /f 2>&1 | Out-Null
@@ -124,3 +125,6 @@ $st = & sc.exe stop $svc 2>&1
 Say ('sc stop : ' + (($st | Where-Object { $_ -match 'STATE|FAILED' }) -join ' | '))
 Say ('sc delete: ' + ((& sc.exe delete $svc 2>&1) -join ' '))
 Say '=== RUN DONE ==='
+
+
+

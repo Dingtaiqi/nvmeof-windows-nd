@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿// SPDX-FileCopyrightText: 2026 Dingtaiqi
 // SPDX-License-Identifier: Apache-2.0
 //
 // ===========================================================================
@@ -63,7 +63,7 @@
 
 #define NVMEOFK_DEFAULT_PORT      4420
 #define NVMEOFK_DEFAULT_TARGET    0x00000002u   // 192.168.100.2, network order applied below
-#define NVMEOFK_DEFAULT_IFINDEX   37u           // 以太网 24, the RoCE endpoint (from D0's measurements)
+#define NVMEOFK_DEFAULT_IFINDEX   37u           // 浠ュお缃?24, the RoCE endpoint (from D0's measurements)
 
 static const char kSubsysNqn[] = "nqn.2024-01.local.rdma:windows-nd";
 static const char kHostNqn[]   = "nqn.2014-08.org.nvmexpress:uuid:ndvmeof-kernel-0001";
@@ -253,7 +253,7 @@ static UINT32         g_rkey;
 
 // ---- the LISTENER half (D3): does NDK let one HCA talk to itself? ----------
 // The card has two ports which are physically cross-connected (40 Gbps, both
-// "Connected"): 192.168.100.2 = 以太网 4 (ifIndex 30), 192.168.100.3 = 以太网 5
+// "Connected"): 192.168.100.2 = 浠ュお缃?4 (ifIndex 30), 192.168.100.3 = 浠ュお缃?5
 // (ifIndex 17).  A listener on the .2 adapter and a connector on the .3 adapter
 // therefore test the CM loopback question for real - and unlike the user-mode
 // attempt (f5_interop could not even open its adapter: no ndv2.dll, 0xC0000141),
@@ -388,7 +388,11 @@ static NTSTATUS reap(ULONG wantCtx, ULONG ms, ULONG* bytesOut)
     for (;;) {
         LONG have = InterlockedExchange(&g_cqCount, 0);
         if (have > 0) {
+            logf("R NdkGetCqResults(have=%d) ...", have);
+            writeLog();
             ULONG got = g_cq->Dispatch->NdkGetCqResults(g_cq, g_cqResults, (ULONG)(have > 16 ? 16 : have));
+            logf("R NdkGetCqResults returned %u", got);
+            writeLog();
             for (ULONG i = 0; i < got && i < (ULONG)(sizeof(g_cqResults)/sizeof(g_cqResults[0])); i++) {   // never trust the count past our own array
                 NDK_RESULT* r = &g_cqResults[i];
                 if ((ULONG)(ULONG_PTR)r->RequestContext == wantCtx) {
@@ -673,8 +677,12 @@ static NTSTATUS lreap(ULONG wantCtx, ULONG ms, ULONG* bytesOut)
     for (;;) {
         LONG have = InterlockedExchange(&g_lcqCount, 0);
         if (have > 0) {
+            logf("LR NdkGetCqResults(have=%d) ...", have);
+            writeLog();
             ULONG got = g_lcq->Dispatch->NdkGetCqResults(g_lcq, g_lcqResults,
                                                          (ULONG)(have > 16 ? 16 : have));
+            logf("LR NdkGetCqResults returned %u", got);
+            writeLog();
             for (ULONG i = 0; i < got && i < (ULONG)(sizeof(g_lcqResults) / sizeof(g_lcqResults[0])); i++) {
                 NDK_RESULT* r = &g_lcqResults[i];
                 if ((ULONG)(ULONG_PTR)r->RequestContext == wantCtx) {
@@ -868,12 +876,16 @@ static NTSTATUS responderServe(ULONG timeoutMs)
     ULONG got = 0;
     NTSTATUS st;
 
+    logf("L responder: waiting for the capsule");
+    writeLog();
     st = lreap(CTX_LRECV, timeoutMs, &got);
     logf("L recv completion    = 0x%08X bytes=%u", st, got);
+    writeLog();
     if (!NT_SUCCESS(st)) { return st; }
 
     logf("L capsule: opc=0x%02X flags=0x%02X cid=%u fctype=0x%02X",
          cap[0], cap[1], *(USHORT*)(cap + 2), cap[4]);
+    writeLog();
 
     // Keyed SGL at capsule[24..39]: 8-byte address, 24-bit length, 4-byte rkey,
     // and 0x40 in the last byte.  Pull the Connect data out of the initiator's
@@ -884,6 +896,7 @@ static NTSTATUS responderServe(ULONG timeoutMs)
         ULONG len = (ULONG)cap[32] | ((ULONG)cap[33] << 8) | ((ULONG)cap[34] << 16);
         UINT32 rkey = *(UINT32*)(cap + 35);
         logf("L SGL: addr=%p len=%u rkey=0x%08X type=0x%02X", (PVOID)(ULONG_PTR)addr, len, rkey, cap[39]);
+        writeLog();
 
         if (len > 0 && len <= NVMEOF_CONNECT_DATA_SIZE) {
             NDK_SGE sge;
@@ -895,10 +908,12 @@ static NTSTATUS responderServe(ULONG timeoutMs)
                                           (UINT64)addr, rkey, 0);
             logf("L NdkRead(remote %p, %u bytes, rkey 0x%08X) = 0x%08X",
                  (PVOID)(ULONG_PTR)addr, len, rkey, st);
+            writeLog();
             if (NT_SUCCESS(st)) {
                 got = 0;
                 st = lreap(CTX_LREAD, timeoutMs, &got);
                 logf("L RDMA read completion = 0x%08X bytes=%u", st, got);
+                writeLog();
             }
             if (!NT_SUCCESS(st)) {
                 logf("!! the target could not read the initiator's Connect data (0xC0000005 = remote access denied)");
@@ -910,6 +925,7 @@ static NTSTATUS responderServe(ULONG timeoutMs)
                      (UCHAR)cd[0], (UCHAR)cd[1], (UCHAR)cd[2], (UCHAR)cd[3],
                      *(USHORT*)(cd + 16), cd + 256, cd + 512);
                 logf("L subnqn matches this project's subsystem: %s", strEq(cd + 256, kSubsysNqn) ? "YES" : "NO");
+                writeLog();
             }
         }
     }
@@ -950,7 +966,9 @@ static NTSTATUS connectToTarget(void)
     UCHAR pd[32];
     SOCKADDR_IN local, remote;
     ULONG peerLimitOut = 0, peerLimitIn = 0;
-    UCHAR peerData[64];
+    // 1024, not 64: the provider answered 0xC0000023 (STATUS_BUFFER_TOO_SMALL) and
+    // wanted 148 bytes for this peer's connection data.
+    UCHAR peerData[1024];
     ULONG peerDataLen = sizeof(peerData);
 
     RtlZeroMemory(&local, sizeof(local));
@@ -1074,9 +1092,17 @@ static NTSTATUS connectToTarget(void)
     }
 
     StepStart(&g_connectCtx);
+    // Markers around a call that has been observed to stop returning.  The registry
+    // holds the log incrementally, so whichever marker is last names the exact call.
+    logf("about to call NdkCompleteConnect (connect done, accept submitted)");
+    writeLog();
     st = g_connector->Dispatch->NdkCompleteConnect(g_connector, NULL, NULL, requestComplete, &g_connectCtx);
+    logf("NdkCompleteConnect returned 0x%08X (%s)", st,
+         (st == STATUS_PENDING) ? "pending: waiting for the completion" : "synchronously");
+    writeLog();
     st = StepFinish(st, &g_connectCtx, 20000);
-    writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
+    logf("NdkCompleteConnect completion phase = 0x%08X", st);
+    writeLog();
     logf("NdkCompleteConnect = 0x%08X", st);
     if (!NT_SUCCESS(st)) {
         closeConnectorNow();
@@ -1087,6 +1113,7 @@ static NTSTATUS connectToTarget(void)
         st = StepFinish(STATUS_PENDING, &g_acceptCtx, 20000);
         logf("L NdkAccept        = 0x%08X%s", st,
              NT_SUCCESS(st) ? " (the same card accepted its own connection)" : "");
+        writeLog();
         traceValue(L"nvmeofk_accept", (ULONG)st);
         if (!NT_SUCCESS(st)) {
             return st;
@@ -1161,28 +1188,49 @@ static NTSTATUS submitCapsule(const UCHAR* capsule, UCHAR* responseOut, ULONG ti
     RtlZeroMemory((UCHAR*)g_region + NVMEOFK_RESP_OFF, NVMEOFK_RESPONSE_BYTES);
 
     // 1. post the receive for the 16-byte response
+    logf("X1 posting the 16-byte response receive on the initiator qp");
+    writeLog();
     st = postResponseRecv();
+    logf("X1 postResponseRecv = 0x%08X", st);
+    writeLog();
     if (!NT_SUCCESS(st)) { logf("NdkReceive failed 0x%08X", st); return st; }
 
     // 2. loopback: arm the in-kernel responder BEFORE the capsule leaves, otherwise
     //    the request could arrive at a QP with no receive posted.
     if (g_loopback) {
+        logf("X2 arming the in-kernel target receive");
+        writeLog();
         st = responderPrepare();
+        logf("X2 responderPrepare = 0x%08X", st);
+        writeLog();
         if (!NT_SUCCESS(st)) { logf("L NdkReceive(post) failed 0x%08X", st); return st; }
     }
 
     // 3. send the 64-byte capsule
+    logf("X3 sending the 64-byte capsule");
+    writeLog();
     st = sendCapsule(capsule, timeoutMs);
+    logf("X3 sendCapsule = 0x%08X", st);
+    writeLog();
     if (!NT_SUCCESS(st)) { return st; }
 
     // 4. loopback: be the target too - receive the capsule, RDMA-read the Connect
     //    data, answer with a 16-byte response.
     if (g_loopback) {
+        logf("X4 serving the capsule as the target");
+        writeLog();
         st = responderServe(timeoutMs);
+        logf("X4 responderServe = 0x%08X", st);
+        writeLog();
         if (!NT_SUCCESS(st)) { logf("responder failed 0x%08X", st); return st; }
     }
 
-    return waitResponse(responseOut, timeoutMs);
+    logf("X5 waiting for the 16-byte response");
+    writeLog();
+    st = waitResponse(responseOut, timeoutMs);
+    logf("X5 waitResponse = 0x%08X", st);
+    writeLog();
+    return st;
 }
 
 static USHORT responseStatus(const UCHAR* resp)
