@@ -251,6 +251,51 @@ static PVOID          g_region;
 static UINT32         g_lkey;
 static UINT32         g_rkey;
 
+// ---- the LISTENER half (D3): does NDK let one HCA talk to itself? ----------
+// The card has two ports which are physically cross-connected (40 Gbps, both
+// "Connected"): 192.168.100.2 = 以太网 4 (ifIndex 30), 192.168.100.3 = 以太网 5
+// (ifIndex 17).  A listener on the .2 adapter and a connector on the .3 adapter
+// therefore test the CM loopback question for real - and unlike the user-mode
+// attempt (f5_interop could not even open its adapter: no ndv2.dll, 0xC0000141),
+// this listener actually exists, so 0xC0000236 would now be a real answer.
+static NDK_ADAPTER*   g_ladapter;
+static NDK_PD*        g_lpd;
+static NDK_CQ*        g_lcq;
+static NDK_QP*        g_lqp;
+static NDK_MR*        g_lmr;
+static NDK_LISTENER*  g_listener;
+static MDL*           g_lmdl;
+static PVOID          g_lregion;
+static UINT32         g_llkey;
+static UINT32         g_lrkey;
+
+static KEVENT g_lcqEvent;
+static KSPIN_LOCK g_lcqLock;
+static NDK_RESULT g_lcqResults[16];
+static volatile LONG g_lcqCount;
+static volatile LONG g_lcqDropped;
+
+static KEVENT g_acceptEvent;
+static volatile LONG g_acceptEvents;
+static NDK_CONNECTOR* g_incoming;    // handed to the connect-event callback
+static NDK_CONNECTOR* g_accepted;    // the same object, after NdkAccept was issued
+
+static NVMEOFK_ASYNC g_lpdCtx;
+static NVMEOFK_ASYNC g_lcqCtx;
+static NVMEOFK_ASYNC g_lqpCtx;
+static NVMEOFK_ASYNC g_lmrCtx;
+static NVMEOFK_ASYNC g_listenCtx;
+static NVMEOFK_ASYNC g_acceptCtx;
+static NVMEOFK_ASYNC g_lsendCtx;
+static NVMEOFK_ASYNC g_lrecvCtx;
+static NVMEOFK_ASYNC g_lreadCtx;
+
+static ULONG   g_lport      = 4420;
+static ULONG   g_listenIf   = 0;
+static BOOLEAN g_loopback   = FALSE;
+static BOOLEAN g_lconnect   = FALSE;
+static BOOLEAN g_loopTornDown = FALSE;
+
 static KEVENT g_cqEvent;
 static KSPIN_LOCK g_cqLock;
 static NDK_RESULT g_cqResults[16];
@@ -368,13 +413,44 @@ static NTSTATUS reap(ULONG wantCtx, ULONG ms, ULONG* bytesOut)
 // ---------------------------------------------------------------------------
 //  Bring-up
 // ---------------------------------------------------------------------------
-static NTSTATUS openAdapter(void)
+// Every knob is a REG_DWORD under HKLM\Software\NVMeoFProbe, so a test can be
+// reconfigured without a rebuild (and the previous build's registry code is
+// replaced by this one helper).
+static ULONG regDword(PCWSTR name, ULONG defaultValue)
+{
+    UNICODE_STRING kn, vn;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE key = NULL;
+    UCHAR buf[24];
+    ULONG len = sizeof(buf);
+    ULONG value = defaultValue;
+
+    RtlInitUnicodeString(&kn, L"\\Registry\\Machine\\Software\\NVMeoFProbe");
+    InitializeObjectAttributes(&oa, &kn, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &oa))) {
+        RtlInitUnicodeString(&vn, name);
+        if (NT_SUCCESS(ZwQueryValueKey(key, &vn, KeyValuePartialInformation, buf, sizeof(buf), &len))) {
+            KEY_VALUE_PARTIAL_INFORMATION* p = (KEY_VALUE_PARTIAL_INFORMATION*)buf;
+            if (p->Type == REG_DWORD && p->DataLength == sizeof(ULONG)) {
+                value = *(ULONG*)p->Data;
+            }
+        }
+        ZwClose(key);
+    }
+    return value;
+}
+
+static BOOLEAN g_wskReady = FALSE;
+
+// WSK registration is process-wide, so it happens once even when two adapters
+// (one per port) are opened.
+static NTSTATUS wskInit(void)
 {
     NTSTATUS st;
-    ULONG ifIndex = 0;
-    NDK_VERSION ver;
-    NDK_ADAPTER_INFO info;
 
+    if (g_wskReady) {
+        return STATUS_SUCCESS;
+    }
     g_wskDispatch.Version = MAKE_WSK_VERSION(1, 0);
     g_wskDispatch.Reserved = 0;
     g_wskDispatch.WskClientEvent = NULL;
@@ -401,53 +477,49 @@ static NTSTATUS openAdapter(void)
     st = g_wskProvider.Dispatch->WskControlClient(g_wskProvider.Client,
                                                   WSKNDK_GET_WSK_PROVIDER_NDK_DISPATCH,
                                                   0, NULL, sizeof(g_ndk), &g_ndk, NULL, NULL);
-    logf("WskControlClient('NDKD') = 0x%08X", st);
+    logf("WskControlClient('NDKD') = 0x%08X (open=%p close=%p)", st,
+         g_ndk.WskOpenNdkAdapter, g_ndk.WskCloseNdkAdapter);
     if (!NT_SUCCESS(st) || g_ndk.WskOpenNdkAdapter == NULL) {
         return NT_SUCCESS(st) ? STATUS_INVALID_DEVICE_STATE : st;
     }
+    g_wskReady = TRUE;
+    return STATUS_SUCCESS;
+}
 
-    // Interface index: from the registry when present, otherwise the RoCE endpoint
-    // this machine actually runs (192.168.100.2 = 以太网 24).
-    {
-        UNICODE_STRING vn, kn;
-        OBJECT_ATTRIBUTES oa;
-        HANDLE key = NULL;
-        UCHAR buf[24];
-        ULONG len = sizeof(buf);
+// Open ONE NDK adapter for ONE port.  ifIndex 30 = the .2 port, 17 = the .3 port.
+static NTSTATUS openAdapterOn(ULONG ifIndex, NDK_ADAPTER** out, const char* tag)
+{
+    NDK_VERSION ver;
+    NTSTATUS st;
 
-        ifIndex = NVMEOFK_DEFAULT_IFINDEX;
-        RtlInitUnicodeString(&kn, L"\\Registry\\Machine\\Software\\NVMeoFProbe");
-        InitializeObjectAttributes(&oa, &kn, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-        if (NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &oa))) {
-            RtlInitUnicodeString(&vn, L"nvmeofk_ifindex");
-            if (NT_SUCCESS(ZwQueryValueKey(key, &vn, KeyValuePartialInformation, buf, sizeof(buf), &len))) {
-                KEY_VALUE_PARTIAL_INFORMATION* p = (KEY_VALUE_PARTIAL_INFORMATION*)buf;
-                if (p->Type == REG_DWORD && p->DataLength == sizeof(ULONG)) {
-                    ifIndex = *(ULONG*)p->Data;
-                    logf("ifIndex from registry: %u", ifIndex);
-                }
-            }
-            ZwClose(key);
-        }
-    }
-
+    *out = NULL;
     RtlZeroMemory(&ver, sizeof(ver));
     ver.Major = 2;
     ver.Minor = 0;
-    logf("NDK version 0x%08X  ifIndex %u", ver, ifIndex);
 
-    st = g_ndk.WskOpenNdkAdapter(g_wskProvider.Client, ver, (NET_IFINDEX)ifIndex, &g_adapter);
-    if (!NT_SUCCESS(st) || g_adapter == NULL) {
-        logf("WskOpenNdkAdapter(ifIndex=%u, ver=0x%08X) failed 0x%08X adapter=%p",
-             ifIndex, ver, st, g_adapter);
+    st = g_ndk.WskOpenNdkAdapter(g_wskProvider.Client, ver, (NET_IFINDEX)ifIndex, out);
+    logf("%s WskOpenNdkAdapter(ifIndex=%u, v%u.%u) = 0x%08X adapter=%p",
+         tag, ifIndex, ver.Major, ver.Minor, st, *out);
+    if (!NT_SUCCESS(st) || *out == NULL) {
+        logf("!! %s adapter on ifIndex %u is not usable (0xC0010011 = the RDMA stack does not have that address)", tag, ifIndex);
         return NT_SUCCESS(st) ? STATUS_UNSUCCESSFUL : st;
     }
-    RtlZeroMemory(&info, sizeof(info));
-    // (adapter info is not consulted: the registry supplies what we need)
-    logf("NdkOpenAdapter ok: ifIndex=%u infoStatus=0x%08X adapter=%p", ifIndex, st, g_adapter);
-    traceValue(L"nvmeofk_ifindex", ifIndex);
-    traceValue(L"nvmeofk_ndkver", (ULONG)ver.Major);
+    traceValue((tag[0] == 'L') ? L"nvmeofk_lifindex" : L"nvmeofk_ifindex", ifIndex);
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS openAdapter(void)
+{
+    NTSTATUS st;
+    ULONG ifIndex;
+
+    st = wskInit();
+    if (!NT_SUCCESS(st)) {
+        return st;
+    }
+    ifIndex = regDword(L"nvmeofk_ifindex", NVMEOFK_DEFAULT_IFINDEX);
+    logf("initiator ifIndex from registry: %u", ifIndex);
+    return openAdapterOn(ifIndex, &g_adapter, "C");
 }
 static NTSTATUS createObjects(void)
 {
@@ -531,16 +603,20 @@ static NTSTATUS registerRegion(void)
     // 0xC0000005 and transfers 0 bytes.  The target must be able to READ the
     // Connect data and the Identify buffer we hand it through a keyed SGL.
     StepStart(&g_async);
-    // A SINGLE flag - these are ENUMERATED VALUES, not bit flags.  Note that
-    // NDK_MR_FLAG_ALLOW_REMOTE_WRITE is 0x5 rather than 0x4, so OR-ing them
-    // together (which this line did for several rounds: 0x1|0x2|0x5|0x8 = 0xF)
-    // hands the provider a value it never defined.  D0 - the kernel driver in
-    // this project that actually completed an RDMA read on this hardware -
-    // passed exactly one flag, and this is that flag: we are the destination of
-    // an RDMA read, so the HCA writes into our region.
-    st = g_mr->Dispatch->NdkRegisterMr(g_mr, g_mdl, NVMEOFK_REGION_BYTES,
-            NDK_MR_FLAG_ALLOW_LOCAL_WRITE,
-            requestComplete, &g_async);
+    // ndkpi.h: 0x1 ALLOW_LOCAL_WRITE, 0x2 ALLOW_REMOTE_READ, 0x5 ALLOW_REMOTE_WRITE
+    // (0x5 = 0x4|0x1, so this IS a bit mask).  In loopback mode our own in-kernel
+    // target RDMA-Reads the 1024-byte Connect data out of this region, which only
+    // works if remote read is granted - and the local write is what lets the NIC
+    // drop the 16-byte response into the region at RESP_OFF.
+    {
+        ULONG mrFlags = NDK_MR_FLAG_ALLOW_LOCAL_WRITE;
+        if (g_loopback) {
+            mrFlags |= NDK_MR_FLAG_ALLOW_REMOTE_READ;
+        }
+        st = g_mr->Dispatch->NdkRegisterMr(g_mr, g_mdl, NVMEOFK_REGION_BYTES,
+                mrFlags, requestComplete, &g_async);
+        logf("NdkRegisterMr flags = 0x%X%s", mrFlags, (mrFlags & NDK_MR_FLAG_ALLOW_REMOTE_READ) ? " (remote read: the target may read this region)" : "");
+    }
     st = StepFinish(st, &g_async, 10000);
     writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     logf("NdkRegisterMr(%u) = 0x%08X", NVMEOFK_REGION_BYTES, st);
@@ -567,6 +643,304 @@ static void fillPrivateData(UCHAR* pd, USHORT qid, USHORT depth, USHORT cntlid)
     *(USHORT*)(pd + 8) = cntlid;
 }
 
+// ===========================================================================
+//  D3: the LISTENER half.
+//
+//  The CX3's two ports are physically cross-connected.  If NDK lets us put a
+//  listener on 192.168.100.2 (ifIndex 30) and connect to it from 192.168.100.3
+//  (ifIndex 17) on the SAME card, then a single machine can carry the whole
+//  NVMe-oF/RDMA path with no second host - which is exactly what this machine
+//  needs, because the EndeavourOS laptop (192.168.100.5) is not here and
+//  user-mode NetworkDirect does not exist on this install (no ndv2.dll).
+//
+//  The previous "loopback is refused" note was measured against a listener
+//  that never existed (f5_interop dies at NdOpenAdapter with 0xC0000141), so
+//  0xC0000236 was just "nobody is listening".  This listener really listens.
+// ===========================================================================
+static void lcqNotification(PVOID context, NTSTATUS status)
+{
+    UNREFERENCED_PARAMETER(context);
+    UNREFERENCED_PARAMETER(status);
+    InterlockedIncrement(&g_lcqCount);
+    KeSetEvent(&g_lcqEvent, IO_NO_INCREMENT, FALSE);
+}
+
+static NTSTATUS lreap(ULONG wantCtx, ULONG ms, ULONG* bytesOut)
+{
+    LARGE_INTEGER t;
+    ULONG spin = 0;
+
+    for (;;) {
+        LONG have = InterlockedExchange(&g_lcqCount, 0);
+        if (have > 0) {
+            ULONG got = g_lcq->Dispatch->NdkGetCqResults(g_lcq, g_lcqResults,
+                                                         (ULONG)(have > 16 ? 16 : have));
+            for (ULONG i = 0; i < got && i < (ULONG)(sizeof(g_lcqResults) / sizeof(g_lcqResults[0])); i++) {
+                NDK_RESULT* r = &g_lcqResults[i];
+                if ((ULONG)(ULONG_PTR)r->RequestContext == wantCtx) {
+                    if (bytesOut != NULL) {
+                        *bytesOut = r->BytesTransferred;
+                    }
+                    traceValue(L"nvmeofk_llastcq", r->Status);
+                    return r->Status;
+                }
+                InterlockedIncrement(&g_lcqDropped);
+            }
+        }
+        spin++;
+        if (spin > (ms * 4)) {
+            return STATUS_IO_TIMEOUT;
+        }
+        t.QuadPart = -10000;
+        KeWaitForSingleObject(&g_lcqEvent, Executive, KernelMode, FALSE, &t);
+    }
+}
+
+// Called by the provider at DISPATCH_LEVEL when a connection request arrives.
+// Only two things are legal here: record the object and signal the event.
+static VOID connectEvent(PVOID context, NDK_CONNECTOR* conn)
+{
+    UNREFERENCED_PARAMETER(context);
+    g_incoming = conn;
+    InterlockedIncrement(&g_acceptEvents);
+    KeSetEvent(&g_acceptEvent, IO_NO_INCREMENT, FALSE);
+}
+
+static NTSTATUS lregisterRegion(void)
+{
+    NTSTATUS st;
+
+    g_lregion = ExAllocatePoolWithTag(NonPagedPoolNx, NVMEOFK_REGION_BYTES, NVMEOFK_TAG);
+    if (g_lregion == NULL) { return STATUS_INSUFFICIENT_RESOURCES; }
+    RtlZeroMemory(g_lregion, NVMEOFK_REGION_BYTES);
+
+    g_lmdl = IoAllocateMdl(g_lregion, NVMEOFK_REGION_BYTES, FALSE, FALSE, NULL);
+    if (g_lmdl == NULL) { return STATUS_INSUFFICIENT_RESOURCES; }
+    __try {
+        MmProbeAndLockPages(g_lmdl, KernelMode, IoReadAccess);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        logf("!! L MmProbeAndLockPages raised 0x%08X", GetExceptionCode());
+        IoFreeMdl(g_lmdl);
+        g_lmdl = NULL;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    StepStart(&g_lmrCtx);
+    st = g_lpd->Dispatch->NdkCreateMr(g_lpd, FALSE, complete, &g_lmrCtx, &g_lmr);
+    st = StepFinish(st, &g_lmrCtx, 10000);
+    writeLog();
+    if (NT_SUCCESS(st) && g_lmr == NULL) { g_lmr = (NDK_MR*)g_lmrCtx.object; }
+    logf("L NdkCreateMr        = 0x%08X mr=%p", st, g_lmr);
+    if (!NT_SUCCESS(st) || g_lmr == NULL) { return STATUS_UNSUCCESSFUL; }
+
+    // LOCAL_WRITE (the NIC writes the received capsule into it) + RDMA_READ_SINK
+    // (it is also the local sink of the RDMA Read that pulls the Connect data out
+    // of the initiator's region).
+    StepStart(&g_lmrCtx);
+    st = g_lmr->Dispatch->NdkRegisterMr(g_lmr, g_lmdl, NVMEOFK_REGION_BYTES,
+            NDK_MR_FLAG_ALLOW_LOCAL_WRITE | NDK_MR_FLAG_RDMA_READ_SINK,
+            requestComplete, &g_lmrCtx);
+    st = StepFinish(st, &g_lmrCtx, 10000);
+    writeLog();
+    logf("L NdkRegisterMr(flags 0x%X) = 0x%08X", NDK_MR_FLAG_ALLOW_LOCAL_WRITE | NDK_MR_FLAG_RDMA_READ_SINK, st);
+    if (!NT_SUCCESS(st)) { return st; }
+
+    g_llkey = g_lmr->Dispatch->NdkGetLocalTokenFromMr(g_lmr);
+    g_lrkey = g_lmr->Dispatch->NdkGetRemoteTokenFromMr(g_lmr);
+    logf("L region %p: lkey=0x%08X rkey=0x%08X", g_lregion, g_llkey, g_lrkey);
+    traceValue(L"nvmeofk_lrkey", g_lrkey);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS createListenerSide(void)
+{
+    NTSTATUS st;
+    SOCKADDR_IN la;
+    UCHAR abuf[64];
+    ULONG alen = sizeof(abuf);
+
+    KeInitializeEvent(&g_lcqEvent, NotificationEvent, FALSE);
+    KeInitializeSpinLock(&g_lcqLock);
+    KeInitializeEvent(&g_acceptEvent, NotificationEvent, FALSE);
+
+    st = openAdapterOn(g_listenIf, &g_ladapter, "L");
+    if (!NT_SUCCESS(st)) { return st; }
+
+    StepStart(&g_lpdCtx);
+    st = g_ladapter->Dispatch->NdkCreatePd(g_ladapter, complete, &g_lpdCtx, &g_lpd);
+    st = StepFinish(st, &g_lpdCtx, 10000);
+    writeLog();
+    if (NT_SUCCESS(st) && g_lpd == NULL) { g_lpd = (NDK_PD*)g_lpdCtx.object; }
+    logf("L NdkCreatePd        = 0x%08X pd=%p", st, g_lpd);
+    if (!NT_SUCCESS(st) || g_lpd == NULL) { return STATUS_UNSUCCESSFUL; }
+
+    StepStart(&g_lcqCtx);
+    st = g_ladapter->Dispatch->NdkCreateCq(g_ladapter, 64, lcqNotification, NULL, NULL,
+                                           complete, &g_lcqCtx, &g_lcq);
+    st = StepFinish(st, &g_lcqCtx, 10000);
+    writeLog();
+    if (NT_SUCCESS(st) && g_lcq == NULL) { g_lcq = (NDK_CQ*)g_lcqCtx.object; }
+    logf("L NdkCreateCq        = 0x%08X cq=%p", st, g_lcq);
+    if (!NT_SUCCESS(st) || g_lcq == NULL) { return STATUS_UNSUCCESSFUL; }
+
+    // The QP that the accepted connection will run on.  Created before the
+    // request arrives, because NdkAccept takes it as a parameter.
+    StepStart(&g_lqpCtx);
+    st = g_lpd->Dispatch->NdkCreateQp(g_lpd, g_lcq, g_lcq, NULL, 16, 16, 4, 4, 0,
+                                      complete, &g_lqpCtx, &g_lqp);
+    st = StepFinish(st, &g_lqpCtx, 10000);
+    writeLog();
+    if (NT_SUCCESS(st) && g_lqp == NULL) { g_lqp = (NDK_QP*)g_lqpCtx.object; }
+    logf("L NdkCreateQp        = 0x%08X qp=%p", st, g_lqp);
+    if (!NT_SUCCESS(st) || g_lqp == NULL) { return STATUS_UNSUCCESSFUL; }
+
+    StepStart(&g_listenCtx);
+    st = g_ladapter->Dispatch->NdkCreateListener(g_ladapter, connectEvent, NULL,
+                                                 complete, &g_listenCtx, &g_listener);
+    st = StepFinish(st, &g_listenCtx, 10000);
+    writeLog();
+    if (NT_SUCCESS(st) && g_listener == NULL) { g_listener = (NDK_LISTENER*)g_listenCtx.object; }
+    logf("L NdkCreateListener  = 0x%08X listener=%p", st, g_listener);
+    if (!NT_SUCCESS(st) || g_listener == NULL) { return STATUS_UNSUCCESSFUL; }
+
+    st = lregisterRegion();
+    writeLog();
+    if (!NT_SUCCESS(st)) { return st; }
+
+    // Bind the address that belongs to the LISTENER port (nvmeofk_target = .2).
+    RtlZeroMemory(&la, sizeof(la));
+    la.sin_family = AF_INET;
+    la.sin_port = RtlUshortByteSwap((USHORT)g_lport);
+    la.sin_addr.S_un.S_addr = regDword(L"nvmeofk_target", NVMEOFK_DEFAULT_TARGET);
+
+    StepStart(&g_listenCtx);
+    st = g_listener->Dispatch->NdkListen(g_listener, (CONST PSOCKADDR)&la, sizeof(la),
+                                         requestComplete, &g_listenCtx);
+    st = StepFinish(st, &g_listenCtx, 20000);
+    logf("L NdkListen(%u.%u.%u.%u:%u) = 0x%08X",
+         ((PUCHAR)&la.sin_addr)[0], ((PUCHAR)&la.sin_addr)[1],
+         ((PUCHAR)&la.sin_addr)[2], ((PUCHAR)&la.sin_addr)[3], g_lport, st);
+    traceValue(L"nvmeofk_listen", (ULONG)st);
+    writeLog();
+    if (!NT_SUCCESS(st)) { return st; }
+
+    RtlZeroMemory(abuf, sizeof(abuf));
+    st = g_listener->Dispatch->NdkGetLocalAddress(g_listener, (PSOCKADDR)abuf, &alen);
+    {
+        SOCKADDR_IN* a = (SOCKADDR_IN*)abuf;
+        logf("L NdkGetLocalAddress = 0x%08X len=%u family=%u port=%u addr=%u.%u.%u.%u",
+             st, alen,
+             (alen >= 2) ? (ULONG)a->sin_family : 0UL,
+             (alen >= 4) ? (ULONG)RtlUshortByteSwap(a->sin_port) : 0UL,
+             (alen >= 8) ? ((PUCHAR)&a->sin_addr)[0] : 0,
+             (alen >= 8) ? ((PUCHAR)&a->sin_addr)[1] : 0,
+             (alen >= 8) ? ((PUCHAR)&a->sin_addr)[2] : 0,
+             (alen >= 8) ? ((PUCHAR)&a->sin_addr)[3] : 0);
+    }
+    return st;
+}
+
+// ---- the in-kernel nvmet stand-in: one capsule in, one response out --------
+#define CTX_LRECV 0x2001
+#define CTX_LSEND 0x2002
+#define CTX_LREAD 0x2003
+
+static BOOLEAN strEq(const char* a, const char* b)
+{
+    while (*a != 0 && *a == *b) { a++; b++; }
+    return (*a == 0 && *b == 0) ? TRUE : FALSE;
+}
+
+static NTSTATUS responderPrepare(void)
+{
+    NDK_SGE sge;
+
+    sge.VirtualAddress = (UCHAR*)g_lregion + NVMEOFK_CAP_OFF;
+    sge.Length = NVMEOFK_CAPSULE_BYTES;
+    sge.MemoryRegionToken = g_llkey;
+    return g_lqp->Dispatch->NdkReceive(g_lqp, (PVOID)(ULONG_PTR)CTX_LRECV, &sge, 1);
+}
+
+static NTSTATUS responderServe(ULONG timeoutMs)
+{
+    UCHAR* cap = (UCHAR*)g_lregion + NVMEOFK_CAP_OFF;
+    UCHAR* resp = (UCHAR*)g_lregion + NVMEOFK_RESP_OFF;
+    ULONG got = 0;
+    NTSTATUS st;
+
+    st = lreap(CTX_LRECV, timeoutMs, &got);
+    logf("L recv completion    = 0x%08X bytes=%u", st, got);
+    if (!NT_SUCCESS(st)) { return st; }
+
+    logf("L capsule: opc=0x%02X flags=0x%02X cid=%u fctype=0x%02X",
+         cap[0], cap[1], *(USHORT*)(cap + 2), cap[4]);
+
+    // Keyed SGL at capsule[24..39]: 8-byte address, 24-bit length, 4-byte rkey,
+    // and 0x40 in the last byte.  Pull the Connect data out of the initiator's
+    // memory with a real RDMA Read - that is the byte-level proof this is not
+    // just two SENDs over a socket.
+    {
+        ULONGLONG addr = *(ULONGLONG*)(cap + 24);
+        ULONG len = (ULONG)cap[32] | ((ULONG)cap[33] << 8) | ((ULONG)cap[34] << 16);
+        UINT32 rkey = *(UINT32*)(cap + 35);
+        logf("L SGL: addr=%p len=%u rkey=0x%08X type=0x%02X", (PVOID)(ULONG_PTR)addr, len, rkey, cap[39]);
+
+        if (len > 0 && len <= NVMEOF_CONNECT_DATA_SIZE) {
+            NDK_SGE sge;
+            sge.VirtualAddress = (UCHAR*)g_lregion + NVMEOFK_CONNECT_OFF;
+            sge.Length = len;
+            sge.MemoryRegionToken = g_llkey;
+
+            st = g_lqp->Dispatch->NdkRead(g_lqp, (PVOID)(ULONG_PTR)CTX_LREAD, &sge, 1,
+                                          (UINT64)addr, rkey, 0);
+            logf("L NdkRead(remote %p, %u bytes, rkey 0x%08X) = 0x%08X",
+                 (PVOID)(ULONG_PTR)addr, len, rkey, st);
+            if (NT_SUCCESS(st)) {
+                got = 0;
+                st = lreap(CTX_LREAD, timeoutMs, &got);
+                logf("L RDMA read completion = 0x%08X bytes=%u", st, got);
+            }
+            if (!NT_SUCCESS(st)) {
+                logf("!! the target could not read the initiator's Connect data (0xC0000005 = remote access denied)");
+                return st;
+            }
+            {
+                char* cd = (char*)g_lregion + NVMEOFK_CONNECT_OFF;
+                logf("L connect data: hostid=%02X%02X%02X%02X cntlid=0x%04X subnqn='%s' hostnqn='%s'",
+                     (UCHAR)cd[0], (UCHAR)cd[1], (UCHAR)cd[2], (UCHAR)cd[3],
+                     *(USHORT*)(cd + 16), cd + 256, cd + 512);
+                logf("L subnqn matches this project's subsystem: %s", strEq(cd + 256, kSubsysNqn) ? "YES" : "NO");
+            }
+        }
+    }
+
+    // 16-byte RDMA response: result in dwords 0..3, status word at byte 14.
+    RtlZeroMemory(resp, NVMEOFK_RESPONSE_BYTES);
+    if (cap[4] == NVMEOF_FCTYPE_CONNECT) {
+        *(ULONG*)resp = 1;                                  // cntlid
+        logf("L response: Fabrics Connect -> cntlid=1, status=0x0000");
+    } else if (cap[4] == NVMEOF_FCTYPE_PROP_GET) {
+        *(ULONG*)resp = 0x0000FFFF;                         // a plausible CAP (MQES = 65535)
+        logf("L response: Property Get -> CAP=0x0000FFFF, status=0x0000");
+    } else {
+        logf("L response: fctype 0x%02X is not one this stand-in knows, answering status=0 anyway", cap[4]);
+    }
+
+    {
+        NDK_SGE sge;
+        sge.VirtualAddress = resp;
+        sge.Length = NVMEOFK_RESPONSE_BYTES;
+        sge.MemoryRegionToken = g_llkey;
+        st = g_lqp->Dispatch->NdkSend(g_lqp, (PVOID)(ULONG_PTR)CTX_LSEND, &sge, 1, 0);
+        logf("L NdkSend(response)  = 0x%08X", st);
+        if (!NT_SUCCESS(st)) { return st; }
+        got = 0;
+        st = lreap(CTX_LSEND, timeoutMs, &got);
+        logf("L send completion    = 0x%08X bytes=%u", st, got);
+    }
+    return st;
+}
+
 // forward declaration: the call site sits above the definition
 static void closeConnectorNow(void);
 
@@ -585,41 +959,15 @@ static NTSTATUS connectToTarget(void)
 
     RtlZeroMemory(&remote, sizeof(remote));
     remote.sin_family = AF_INET;
-    remote.sin_port = RtlUshortByteSwap(NVMEOFK_DEFAULT_PORT);
-    remote.sin_addr.S_un.S_addr = NVMEOFK_DEFAULT_TARGET;
+    remote.sin_port = RtlUshortByteSwap((USHORT)g_lport);
     // nvmeofk_target / nvmeofk_local are REG_DWORDs holding addresses in NETWORK byte
     // order, so the peer can be changed without rebuilding the driver.
-    {
-        UNICODE_STRING kn, vn;
-        OBJECT_ATTRIBUTES oa;
-        HANDLE key = NULL;
-        UCHAR buf[24];
-        ULONG len = sizeof(buf);
+    remote.sin_addr.S_un.S_addr = regDword(L"nvmeofk_target", NVMEOFK_DEFAULT_TARGET);
+    local.sin_addr.S_un.S_addr  = regDword(L"nvmeofk_local", 0);
 
-        RtlInitUnicodeString(&kn, L"\\Registry\\Machine\\Software\\NVMeoFProbe");
-        InitializeObjectAttributes(&oa, &kn, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-        if (NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &oa))) {
-            RtlInitUnicodeString(&vn, L"nvmeofk_target");
-            if (NT_SUCCESS(ZwQueryValueKey(key, &vn, KeyValuePartialInformation, buf, sizeof(buf), &len))) {
-                KEY_VALUE_PARTIAL_INFORMATION* p = (KEY_VALUE_PARTIAL_INFORMATION*)buf;
-                if (p->Type == REG_DWORD && p->DataLength == sizeof(ULONG)) {
-                    remote.sin_addr.S_un.S_addr = *(ULONG*)p->Data;
-                }
-            }
-            len = sizeof(buf);
-            RtlInitUnicodeString(&vn, L"nvmeofk_local");
-            if (NT_SUCCESS(ZwQueryValueKey(key, &vn, KeyValuePartialInformation, buf, sizeof(buf), &len))) {
-                KEY_VALUE_PARTIAL_INFORMATION* p = (KEY_VALUE_PARTIAL_INFORMATION*)buf;
-                if (p->Type == REG_DWORD && p->DataLength == sizeof(ULONG)) {
-                    local.sin_addr.S_un.S_addr = *(ULONG*)p->Data;
-                }
-            }
-            ZwClose(key);
-        }
-    }
     logf("connecting to %u.%u.%u.%u:%u (local %u.%u.%u.%u)",
          ((PUCHAR)&remote.sin_addr)[0], ((PUCHAR)&remote.sin_addr)[1],
-         ((PUCHAR)&remote.sin_addr)[2], ((PUCHAR)&remote.sin_addr)[3], NVMEOFK_DEFAULT_PORT,
+         ((PUCHAR)&remote.sin_addr)[2], ((PUCHAR)&remote.sin_addr)[3], g_lport,
          ((PUCHAR)&local.sin_addr)[0], ((PUCHAR)&local.sin_addr)[1],
          ((PUCHAR)&local.sin_addr)[2], ((PUCHAR)&local.sin_addr)[3]);
 
@@ -635,11 +983,69 @@ static NTSTATUS connectToTarget(void)
                                            1, 1,
                                            pd, sizeof(pd),
                                            requestComplete, &g_connectCtx);
+    writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
+    logf("NdkConnect submit  = 0x%08X%s", st,
+         (st == STATUS_PENDING) ? " (pending: the CM is working on it)" : "");
+    if (st != STATUS_PENDING && !NT_SUCCESS(st)) {
+        logf("!! NdkConnect was refused straight away: 0x%08X (0xC0000236 = connection refused, i.e. no listener)", st);
+        traceValue(L"nvmeofk_connect", (ULONG)st);
+        closeConnectorNow();
+        return st;
+    }
+
+    // ---- loopback only: answer our own connection request ------------------
+    if (g_loopback) {
+        LARGE_INTEGER t;
+        NTSTATUS sw;
+
+        t.QuadPart = -200000000LL;      // 20 s
+        sw = KeWaitForSingleObject(&g_acceptEvent, Executive, KernelMode, FALSE, &t);
+        logf("L connect event    = 0x%08X events=%u incoming=%p", sw, g_acceptEvents, g_incoming);
+        if (sw == STATUS_TIMEOUT || g_incoming == NULL) {
+            logf("!! no connection request reached the listener within 20 s");
+            closeConnectorNow();
+            return STATUS_IO_TIMEOUT;
+        }
+        g_accepted = g_incoming;
+
+        // What the initiator put in the RDMA-CM REQ - read on the incoming connector
+        // before accepting, i.e. this is the private data from the other port of the
+        // same card.
+        {
+            ULONG inLimit = 0, outLimit = 0, plen = sizeof(peerData);
+            NTSTATUS sp = g_accepted->Dispatch->NdkGetConnectionData(g_accepted, &inLimit, &outLimit,
+                                                                     peerData, &plen);
+            logf("L NdkGetConnectionData = 0x%08X inbound=%u outbound=%u len=%u", sp, inLimit, outLimit, plen);
+            if (NT_SUCCESS(sp) && plen >= 32) {
+                logf("L peer private data: recfmt=%u qid=%u hrqsize=%u hsqsize=%u cntlid=%u",
+                     *(USHORT*)(peerData + 0), *(USHORT*)(peerData + 2), *(USHORT*)(peerData + 4),
+                     *(USHORT*)(peerData + 6), *(USHORT*)(peerData + 8));
+            }
+        }
+
+        {
+            UCHAR lpd[32];
+            fillPrivateData(lpd, 0, NVMEOFK_SQ_DEPTH, 0);
+            // A marker the initiator must find in NdkGetConnectionData, byte for byte.
+            RtlCopyMemory(lpd + 16, "NVMET-LISTENER01", 16);
+            StepStart(&g_acceptCtx);
+            st = g_accepted->Dispatch->NdkAccept(g_accepted, g_lqp, 1, 1, lpd, sizeof(lpd),
+                                                 NULL, NULL, requestComplete, &g_acceptCtx);
+            logf("L NdkAccept submit = 0x%08X (qp %p)", st, g_lqp);
+            writeLog();
+            if (st != STATUS_PENDING && !NT_SUCCESS(st)) {
+                logf("!! NdkAccept failed 0x%08X", st);
+                closeConnectorNow();
+                return st;
+            }
+        }
+    }
+
     st = StepFinish(st, &g_connectCtx, 20000);
     writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     logf("NdkConnect         = 0x%08X (0xC0000236 = connection refused)", st);
+    traceValue(L"nvmeofk_connect", (ULONG)st);
     if (!NT_SUCCESS(st)) {
-        traceValue(L"nvmeofk_connect", (ULONG)st);
         closeConnectorNow();   // do not leave a failed connection dangling
         return st;
     }
@@ -657,14 +1063,36 @@ static NTSTATUS connectToTarget(void)
          st, peerLimitIn, peerLimitOut, peerDataLen,
          (peerDataLen >= 2) ? *(USHORT*)peerData : 0,
          (peerDataLen >= 4) ? *(USHORT*)(peerData + 2) : 0);
+    if (NT_SUCCESS(st) && peerDataLen >= 32) {
+        logf("peer private data: recfmt=%u qid=%u hrqsize=%u hsqsize=%u cntlid=%u",
+             *(USHORT*)(peerData + 0), *(USHORT*)(peerData + 2), *(USHORT*)(peerData + 4),
+             *(USHORT*)(peerData + 6), *(USHORT*)(peerData + 8));
+        if (g_loopback) {
+            logf("peer private data marker: %s", RtlEqualMemory(peerData + 16, "NVMET-LISTENER01", 16)
+                 ? "MATCHES 'NVMET-LISTENER01' byte for byte" : "does NOT match the listener's marker");
+        }
+    }
 
     StepStart(&g_connectCtx);
     st = g_connector->Dispatch->NdkCompleteConnect(g_connector, NULL, NULL, requestComplete, &g_connectCtx);
     st = StepFinish(st, &g_connectCtx, 20000);
     writeLog();   // incremental: if the next step corrupts something, the evidence is already on disk
     logf("NdkCompleteConnect = 0x%08X", st);
-    traceValue(L"nvmeofk_connect", (ULONG)st);
-    return st;
+    if (!NT_SUCCESS(st)) {
+        closeConnectorNow();
+        return st;
+    }
+
+    if (g_loopback) {
+        st = StepFinish(STATUS_PENDING, &g_acceptCtx, 20000);
+        logf("L NdkAccept        = 0x%08X%s", st,
+             NT_SUCCESS(st) ? " (the same card accepted its own connection)" : "");
+        traceValue(L"nvmeofk_accept", (ULONG)st);
+        if (!NT_SUCCESS(st)) {
+            return st;
+        }
+    }
+    return STATUS_SUCCESS;
 }
 #define CTX_SEND 0x1001
 #define CTX_RECV 0x1002
@@ -689,39 +1117,72 @@ static void sglNull(UCHAR* sgl)
     sgl[15] = NVMEOF_SGL_KEYED_TS;
 }
 
-static NTSTATUS submitCapsule(const UCHAR* capsule, UCHAR* responseOut, ULONG timeoutMs)
+static NTSTATUS postResponseRecv(void)
+{
+    NDK_SGE sge;
+
+    sge.VirtualAddress = (UCHAR*)g_region + NVMEOFK_RESP_OFF;
+    sge.Length = NVMEOFK_RESPONSE_BYTES;
+    sge.MemoryRegionToken = g_lkey;
+    return g_qp->Dispatch->NdkReceive(g_qp, (PVOID)(ULONG_PTR)(PVOID)(ULONG_PTR)CTX_RECV, &sge, 1);
+}
+
+static NTSTATUS sendCapsule(const UCHAR* capsule, ULONG timeoutMs)
 {
     NTSTATUS st;
     NDK_SGE sge;
-    UCHAR* region = (UCHAR*)g_region;
 
-    RtlCopyMemory(region + NVMEOFK_CAP_OFF, capsule, NVMEOFK_CAPSULE_BYTES);
-    RtlZeroMemory(region + NVMEOFK_RESP_OFF, NVMEOFK_RESPONSE_BYTES);
-
-    // 1. post the receive for the 16-byte response
-    sge.VirtualAddress = region + NVMEOFK_RESP_OFF;
-    sge.Length = NVMEOFK_RESPONSE_BYTES;
-    sge.MemoryRegionToken = g_lkey;
-    st = g_qp->Dispatch->NdkReceive(g_qp, (PVOID)(ULONG_PTR)(PVOID)(ULONG_PTR)CTX_RECV, &sge, 1);
-    if (!NT_SUCCESS(st)) { logf("NdkReceive failed 0x%08X", st); return st; }
-
-    // 2. send the 64-byte capsule
-    sge.VirtualAddress = region + NVMEOFK_CAP_OFF;
+    RtlCopyMemory((UCHAR*)g_region + NVMEOFK_CAP_OFF, capsule, NVMEOFK_CAPSULE_BYTES);
+    sge.VirtualAddress = (UCHAR*)g_region + NVMEOFK_CAP_OFF;
     sge.Length = NVMEOFK_CAPSULE_BYTES;
     sge.MemoryRegionToken = g_lkey;
     st = g_qp->Dispatch->NdkSend(g_qp, (PVOID)(ULONG_PTR)CTX_SEND, &sge, 1, 0);
     if (!NT_SUCCESS(st)) { logf("NdkSend failed 0x%08X", st); return st; }
 
     st = reap(CTX_SEND, timeoutMs, NULL);
-    if (!NT_SUCCESS(st)) { logf("send completion 0x%08X", st); return st; }
+    if (!NT_SUCCESS(st)) { logf("send completion 0x%08X", st); }
+    return st;
+}
 
-    st = reap(CTX_RECV, timeoutMs, NULL);
+static NTSTATUS waitResponse(UCHAR* responseOut, ULONG timeoutMs)
+{
+    NTSTATUS st = reap(CTX_RECV, timeoutMs, NULL);
     if (!NT_SUCCESS(st)) { logf("response completion 0x%08X", st); return st; }
-
     if (responseOut != NULL) {
-        RtlCopyMemory(responseOut, region + NVMEOFK_RESP_OFF, NVMEOFK_RESPONSE_BYTES);
+        RtlCopyMemory(responseOut, (UCHAR*)g_region + NVMEOFK_RESP_OFF, NVMEOFK_RESPONSE_BYTES);
     }
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS submitCapsule(const UCHAR* capsule, UCHAR* responseOut, ULONG timeoutMs)
+{
+    NTSTATUS st;
+
+    RtlZeroMemory((UCHAR*)g_region + NVMEOFK_RESP_OFF, NVMEOFK_RESPONSE_BYTES);
+
+    // 1. post the receive for the 16-byte response
+    st = postResponseRecv();
+    if (!NT_SUCCESS(st)) { logf("NdkReceive failed 0x%08X", st); return st; }
+
+    // 2. loopback: arm the in-kernel responder BEFORE the capsule leaves, otherwise
+    //    the request could arrive at a QP with no receive posted.
+    if (g_loopback) {
+        st = responderPrepare();
+        if (!NT_SUCCESS(st)) { logf("L NdkReceive(post) failed 0x%08X", st); return st; }
+    }
+
+    // 3. send the 64-byte capsule
+    st = sendCapsule(capsule, timeoutMs);
+    if (!NT_SUCCESS(st)) { return st; }
+
+    // 4. loopback: be the target too - receive the capsule, RDMA-read the Connect
+    //    data, answer with a 16-byte response.
+    if (g_loopback) {
+        st = responderServe(timeoutMs);
+        if (!NT_SUCCESS(st)) { logf("responder failed 0x%08X", st); return st; }
+    }
+
+    return waitResponse(responseOut, timeoutMs);
 }
 
 static USHORT responseStatus(const UCHAR* resp)
@@ -827,7 +1288,7 @@ static NTSTATUS nvmeofRun(void)
 // ONE CONTEXT PER CLOSE.  The teardown used to call StepStart(&g_shared) five times
 // in a row - KeInitializeEvent on the same dispatcher object five times - which is
 // exactly the wait-list corruption the minidump showed.
-static NVMEOFK_ASYNC g_closeCtx[6];
+static NVMEOFK_ASYNC g_closeCtx[12];
 
 static void closeDone(PVOID context, NTSTATUS status)
 {
@@ -931,6 +1392,120 @@ static void NvmeofkTeardown(void)
     writeLog();
 }
 
+// ---------------------------------------------------------------------------
+//  D3 teardown: BOTH ends live in this driver, so both are closed here - and
+//  unlike the old path, the adapters go back too.  Leaking one adapter per
+//  load is how the provider got poisoned after about ten runs (KERNEL-NVMEOF-
+//  STATUS.md), and a test that needs a reboot after every attempt costs hours.
+// ---------------------------------------------------------------------------
+static void LoopTeardown(void)
+{
+    if (g_loopTornDown) {
+        return;
+    }
+    g_loopTornDown = TRUE;
+
+    if (g_accepted != NULL) {
+        StepStart(&g_closeCtx[0]);
+        (void)g_accepted->Dispatch->NdkCloseConnector(g_accepted, closeDone1, &g_closeCtx[0]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[0], 10000);
+        logf("teardown: accepted connector closed");
+        g_accepted = NULL;
+        g_incoming = NULL;
+    }
+    if (g_connector != NULL) {
+        StepStart(&g_closeCtx[1]);
+        (void)g_connector->Dispatch->NdkCloseConnector(g_connector, closeDone1, &g_closeCtx[1]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[1], 10000);
+        logf("teardown: initiator connector closed");
+        g_connector = NULL;
+    }
+    if (g_listener != NULL) {
+        StepStart(&g_closeCtx[2]);
+        (void)g_listener->Dispatch->NdkCloseListener(g_listener, closeDone1, &g_closeCtx[2]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[2], 10000);
+        logf("teardown: listener closed");
+        g_listener = NULL;
+    }
+    if (g_lqp != NULL) {
+        StepStart(&g_closeCtx[3]);
+        (void)g_lqp->Dispatch->NdkCloseQp(g_lqp, closeDone1, &g_closeCtx[3]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[3], 10000);
+        logf("teardown: listener qp closed");
+        g_lqp = NULL;
+    }
+    if (g_qp != NULL) {
+        StepStart(&g_closeCtx[4]);
+        (void)g_qp->Dispatch->NdkCloseQp(g_qp, closeDone1, &g_closeCtx[4]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[4], 10000);
+        logf("teardown: initiator qp closed");
+        g_qp = NULL;
+    }
+    if (g_lcq != NULL) {
+        StepStart(&g_closeCtx[5]);
+        (void)g_lcq->Dispatch->NdkCloseCq(g_lcq, closeDone1, &g_closeCtx[5]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[5], 10000);
+        logf("teardown: listener cq closed");
+        g_lcq = NULL;
+    }
+    if (g_cq != NULL) {
+        StepStart(&g_closeCtx[6]);
+        (void)g_cq->Dispatch->NdkCloseCq(g_cq, closeDone1, &g_closeCtx[6]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[6], 10000);
+        logf("teardown: initiator cq closed");
+        g_cq = NULL;
+    }
+    if (g_lmr != NULL) {
+        StepStart(&g_closeCtx[7]);
+        (void)g_lmr->Dispatch->NdkCloseMr(g_lmr, closeDone1, &g_closeCtx[7]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[7], 10000);
+        logf("teardown: listener mr closed");
+        g_lmr = NULL;
+    }
+    if (g_mr != NULL) {
+        StepStart(&g_closeCtx[8]);
+        (void)g_mr->Dispatch->NdkCloseMr(g_mr, closeDone1, &g_closeCtx[8]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[8], 10000);
+        logf("teardown: initiator mr closed");
+        g_mr = NULL;
+    }
+    if (g_lpd != NULL) {
+        StepStart(&g_closeCtx[9]);
+        (void)g_lpd->Dispatch->NdkClosePd(g_lpd, closeDone1, &g_closeCtx[9]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[9], 10000);
+        logf("teardown: listener pd closed");
+        g_lpd = NULL;
+    }
+    if (g_pd != NULL) {
+        StepStart(&g_closeCtx[10]);
+        (void)g_pd->Dispatch->NdkClosePd(g_pd, closeDone1, &g_closeCtx[10]);
+        (void)StepFinish(STATUS_PENDING, &g_closeCtx[10], 10000);
+        logf("teardown: initiator pd closed");
+        g_pd = NULL;
+    }
+
+    // Only now can the buffers go: every MR that described them is closed.
+    if (g_lmdl != NULL) { MmUnlockPages(g_lmdl); IoFreeMdl(g_lmdl); g_lmdl = NULL; }
+    if (g_lregion != NULL) { ExFreePoolWithTag(g_lregion, NVMEOFK_TAG); g_lregion = NULL; }
+    if (g_mdl != NULL) { MmUnlockPages(g_mdl); IoFreeMdl(g_mdl); g_mdl = NULL; }
+    if (g_region != NULL) { ExFreePoolWithTag(g_region, NVMEOFK_TAG); g_region = NULL; }
+
+    if (g_ladapter != NULL) {
+        g_ndk.WskCloseNdkAdapter(g_wskProvider.Client, g_ladapter);
+        logf("teardown: listener adapter closed (ifIndex %u)", g_listenIf);
+        g_ladapter = NULL;
+    }
+    if (g_adapter != NULL) {
+        g_ndk.WskCloseNdkAdapter(g_wskProvider.Client, g_adapter);
+        logf("teardown: initiator adapter closed");
+        g_adapter = NULL;
+    }
+
+    writeLog();
+    logf("teardown complete: listener, accepted connection and initiator all closed; adapters returned");
+    writeLog();
+}
+
 // History, kept short because it cost fourteen bugchecks to learn:
 //
 //   The version of this file before the rewrite above did NOT close anything, on the
@@ -997,6 +1572,74 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registryPath)
     UNREFERENCED_PARAMETER(registryPath);
     driver->DriverUnload = nvmeofkUnload;
 
+    g_listenIf = regDword(L"nvmeofk_lifindex", 0);
+    g_lport    = regDword(L"nvmeofk_lport", NVMEOFK_DEFAULT_PORT);
+    g_lconnect = (regDword(L"nvmeofk_lconnect", 0) != 0);
+    g_loopback = g_lconnect;
+
+    // ---- D3: listener on one port of the card, initiator on the other ------
+    if (regDword(L"nvmeofk_dolisten", 0) != 0) {
+        logf("=== nvmeofk D3: NDK listener and same-card loopback ===");
+        logf("listener ifIndex=%u port=%u; initiator ifIndex=%u; connect=%s",
+             g_listenIf, g_lport,
+             regDword(L"nvmeofk_ifindex", 0),
+             g_lconnect ? "YES" : "no (listener only)");
+
+        st = wskInit();
+        if (!NT_SUCCESS(st)) {
+            logf("wskInit failed 0x%08X", st);
+            writeLog();
+            return STATUS_SUCCESS;
+        }
+        st = createListenerSide();
+        if (!NT_SUCCESS(st)) {
+            logf("createListenerSide failed 0x%08X", st);
+            LoopTeardown();
+            writeLog();
+            return STATUS_SUCCESS;
+        }
+        if (!g_lconnect) {
+            logf("listener-only run: nvmeofk_lconnect is 0, so nothing is connected to it");
+            LoopTeardown();
+            writeLog();
+            return STATUS_SUCCESS;
+        }
+
+        st = openAdapter();
+        if (!NT_SUCCESS(st)) {
+            logf("initiator adapter failed 0x%08X", st);
+            LoopTeardown();
+            writeLog();
+            return STATUS_SUCCESS;
+        }
+        st = createObjects();
+        if (!NT_SUCCESS(st)) {
+            logf("createObjects failed 0x%08X", st);
+            LoopTeardown();
+            writeLog();
+            return STATUS_SUCCESS;
+        }
+        st = registerRegion();
+        if (!NT_SUCCESS(st)) {
+            logf("registerRegion failed 0x%08X", st);
+            LoopTeardown();
+            writeLog();
+            return STATUS_SUCCESS;
+        }
+        st = connectToTarget();
+        if (!NT_SUCCESS(st)) {
+            logf("connectToTarget failed 0x%08X", st);
+            LoopTeardown();
+            writeLog();
+            return STATUS_SUCCESS;
+        }
+        st = nvmeofRun();
+        logf("nvmeofRun = 0x%08X%s", st, NT_SUCCESS(st) ? "  (NVME-OF OVER SAME-CARD RDMA: OK)" : "");
+        LoopTeardown();
+        writeLog();
+        return STATUS_SUCCESS;
+    }
+
     logf("=== nvmeofk D2.1: NVMe-oF from kernel mode ===");
     st = openAdapter();
     if (!NT_SUCCESS(st)) {
@@ -1026,10 +1669,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registryPath)
     st = nvmeofRun();
     logf("nvmeofRun = 0x%08X%s", st, NT_SUCCESS(st) ? "  (NVME-OF FROM KERNEL: OK)" : "");
     NvmeofkTeardown();
-    writeLog();
-    return STATUS_SUCCESS;
-    st = nvmeofRun();
-    logf("nvmeofRun = 0x%08X%s", st, NT_SUCCESS(st) ? "  (NVME-OF FROM KERNEL: OK)" : "");
     writeLog();
     return STATUS_SUCCESS;
 }

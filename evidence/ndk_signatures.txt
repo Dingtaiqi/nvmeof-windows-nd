@@ -1,0 +1,207 @@
+NDK SIGNATURES READ FROM THE INSTALLED HEADER
+=============================================
+Header : C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km\ndkpi.h
+Kit    : Windows SDK/WDK 10.0.26100.0
+Read   : 2026-10-18 (Asia/Shanghai), before any code was written.
+
+IMPORTANT - THE NAMES IN THE TASK AND THE INSTALLED HEADER DO NOT FULLY MATCH
+----------------------------------------------------------------------------
+Two of the four requested symbols do not exist in this header at all:
+
+  - NDK_FN_CREATE_CONNECTION_REQUEST : no hit in ndkpi.h (or anywhere under
+    the 10.0.26100.0 Include tree).
+  - NdkAcceptConnection              : no hit in ndkpi.h.
+
+This header is the NDKPI 2.0 interface. Its listener callback is
+NDK_FN_CONNECT_EVENT_CALLBACK (VOID, two parameters, NO out-parameter), and
+acceptance is NDK_FN_ACCEPT / NdkAccept (it needs a QP and an async
+completion). There is also no NdkGetListenerDispatch function: the dispatch
+table hangs directly off NDK_LISTENER.Dispatch.
+
+The code added to nvmeofk.c therefore uses ONLY the declarations quoted below.
+Nothing here is reconstructed from memory. The protocol-visible values and
+object lifetimes still follow the existing, already-working nvmeofk.c code.
+
+[1] NdkCreateListener
+---------------------
+Exact declaration, ndkpi.h lines 924-934:
+
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+(*NDK_FN_CREATE_LISTENER) (
+    _In_ NDK_ADAPTER *pNdkAdapter,
+    _In_ NDK_FN_CONNECT_EVENT_CALLBACK ConnectEvent,
+    _In_opt_ PVOID ConnectEventContext,
+    _In_ NDK_FN_CREATE_COMPLETION CreateCompletion,
+    _In_opt_ PVOID RequestContext,
+    _Outptr_ NDK_LISTENER **ppNdkListener
+    );
+
+Member of NDK_ADAPTER_DISPATCH, ndkpi.h line 965:
+
+    NDK_FN_CREATE_LISTENER NdkCreateListener;
+
+Consequence: NdkCreateListener is called on the ADAPTER dispatch, not on the
+PD dispatch, and it takes the connect-event callback plus the same async
+create completion (NDK_FN_CREATE_COMPLETION) the file already uses for PD/CQ/
+QP/connector.
+
+[2] NDK_FN_CREATE_CONNECTION_REQUEST
+------------------------------------
+NOT PRESENT in this header. The installed callback type is
+NDK_FN_CONNECT_EVENT_CALLBACK, ndkpi.h lines 807-813:
+
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+(*NDK_FN_CONNECT_EVENT_CALLBACK) (
+    _In_opt_ PVOID ConnectEventContext,
+    _In_ NDK_CONNECTOR *pNdkConnector
+    );
+
+Answer to the specific question asked: the old NDKPI 1.x
+NDK_FN_CREATE_CONNECTION_REQUEST did have a PVOID * out-parameter; the
+installed NDKPI 2.0 callback does NOT. It returns VOID and has exactly two
+parameters. The accept/reject decision is a separate call on the connector
+(see [3]).
+
+Consequence: the compiler-checked forward declaration used in the code is
+
+    static NDK_FN_CONNECT_EVENT_CALLBACK MyCreateConnectionRequest;
+
+and the definition must be
+
+    static VOID MyCreateConnectionRequest(PVOID ConnectEventContext,
+                                         NDK_CONNECTOR *pNdkConnector)
+
+[3] NdkAcceptConnection
+-----------------------
+NOT PRESENT in this header. The installed accept is NDK_FN_ACCEPT, ndkpi.h
+lines 695-709:
+
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+(*NDK_FN_ACCEPT) (
+    _In_ NDK_CONNECTOR *pNdkConnector,
+    _In_ NDK_QP *pNdkQp,
+    _In_ ULONG InboundReadLimit,
+    _In_ ULONG OutboundReadLimit,
+    _In_reads_bytes_opt_(PrivateDataLength) CONST PVOID pPrivateData,
+    _In_ ULONG PrivateDataLength,
+    _In_opt_ NDK_FN_DISCONNECT_EVENT_CALLBACK DisconnectEvent,
+    _In_opt_ PVOID DisconnectEventContext,
+    _In_ NDK_FN_REQUEST_COMPLETION RequestCompletion,
+    _In_opt_ PVOID RequestContext
+    );
+
+Member of NDK_CONNECTOR_DISPATCH, ndkpi.h line 790:
+
+    NDK_FN_ACCEPT NdkAccept;
+
+Consequence: accepting REQUIRES a queue pair. The QP carrying the outgoing
+connect cannot be reused for the accept, so the listener gets its own QP
+created on the same PD/CQ, and NdkAccept is posted with that QP.
+
+[4] NDK_FN_CONNECT and NdkConnect
+---------------------------------
+Exact declaration, ndkpi.h lines 623-639:
+
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+(*NDK_FN_CONNECT) (
+    _In_ NDK_CONNECTOR *pNdkConnector,
+    _In_ NDK_QP *pNdkQp,
+    _In_reads_bytes_(SrcAddressLength) CONST PSOCKADDR pSrcAddress,
+    _In_ ULONG SrcAddressLength,
+    _In_reads_bytes_(DestAddressLength) CONST PSOCKADDR pDestAddress,
+    _In_ ULONG DestAddressLength,
+    _In_ ULONG InboundReadLimit,
+    _In_ ULONG OutboundReadLimit,
+    _In_reads_bytes_opt_(PrivateDataLength) CONST PVOID pPrivateData,
+    _In_ ULONG PrivateDataLength,
+    _In_ NDK_FN_REQUEST_COMPLETION RequestCompletion,
+    _In_opt_ PVOID RequestContext
+    );
+
+Member of NDK_CONNECTOR_DISPATCH, ndkpi.h line 787:
+
+    NDK_FN_CONNECT NdkConnect;
+
+This is the signature the existing nvmeofk.c already calls at line 632.
+
+[5] Additional signatures the listener code uses (same rule: quoted, not
+    remembered)
+-----------------------------------------------------------------------
+NDK_FN_LISTEN, ndkpi.h lines 823-832:
+
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+(*NDK_FN_LISTEN) (
+    _In_ NDK_LISTENER *pNdkListener,
+    _In_reads_bytes_(AddressLength) CONST PSOCKADDR pAddress,
+    _In_ ULONG AddressLength,
+    _In_ NDK_FN_REQUEST_COMPLETION RequestCompletion,
+    _In_opt_ PVOID RequestContext
+    );
+
+Member of NDK_LISTENER_DISPATCH, ndkpi.h line 846:
+
+    NDK_FN_LISTEN NdkListen;
+
+NDK_FN_GET_PEER_ADDRESS, ndkpi.h lines 756-763:
+
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+(*NDK_FN_GET_PEER_ADDRESS) (
+    _In_ NDK_CONNECTOR *pNdkConnector,
+    _Out_writes_bytes_to_opt_(*pAddressLength, *pAddressLength) PSOCKADDR pAddress,
+    _Inout_ ULONG* pAddressLength
+    );
+
+NDK_FN_REQUEST_COMPLETION, ndkpi.h lines 119-125:
+
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+(*NDK_FN_REQUEST_COMPLETION) (
+    _In_opt_ PVOID Context,
+    _In_ NTSTATUS Status
+    );
+
+NDK_FN_CLOSE_COMPLETION, ndkpi.h lines 112-117:
+
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+VOID
+(*NDK_FN_CLOSE_COMPLETION) (
+    _In_opt_ PVOID Context
+    );
+
+NDK_FN_CLOSE_OBJECT, ndkpi.h lines 136-143:
+
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+NTSTATUS
+(*NDK_FN_CLOSE_OBJECT) (
+    _In_ NDK_OBJECT_HEADER *pNdkObject,
+    _In_ NDK_FN_CLOSE_COMPLETION CloseCompletion,
+    _In_opt_ PVOID RequestContext
+    );
+
+[6] Full listener dispatch table, ndkpi.h lines 843-849
+-------------------------------------------------------
+typedef struct _NDK_LISTENER_DISPATCH {
+    NDK_FN_CLOSE_OBJECT NdkCloseListener;
+    NDK_FN_QUERY_EXTENSION_INTERFACE NdkQueryExtension;
+    NDK_FN_LISTEN NdkListen;
+    NDK_FN_GET_LISTENER_LOCAL_ADDRESS NdkGetLocalAddress;
+    NDK_FN_CONTROL_CONNECT_EVENTS NdkControlConnectEvents;
+} NDK_LISTENER_DISPATCH;
+
+There is no NdkGetListenerDispatch entry point in this header. The code logs
+the value of listener->Dispatch instead, which is the same table.

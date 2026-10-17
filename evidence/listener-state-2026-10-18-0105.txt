@@ -1,0 +1,163 @@
+NVMEOFK LISTENER - STATE AND EVIDENCE, 2026-10-18 01:05 (Asia/Shanghai)
+=======================================================================
+Author: delegated subagent (listener task).
+Status: STOPPED WITHOUT MODIFYING src/driver/nvmeofk.c - another writer
+owns it and a load is wedged. This file is new; no existing file was
+rewritten.
+
+WHY THIS FILE EXISTS
+--------------------
+The task said to implement the listener in nvmeofk.c. While I was reading
+the header, nvmeofk.c changed under me:
+
+  00:56  read: 45,202 bytes, "nvmeofk D2.1", no listener
+  00:59  on disk: 71,328 bytes, "nvmeofk D3: NDK listener and same-card
+         loopback", two NDK stacks (listener + initiator) and an in-kernel
+         responder
+
+A DSH tool process (powershell PID 34368/29016) was running
+D:\rdma\nvmeof\tools\run_kernel_listener.ps1 -Connect 1 -Tag loopback at
+the same time. Writing the file would have raced that run, so I did not.
+This is the honest result: the requested feature had already been
+implemented by another writer, and I verified its measured results.
+
+MACHINE FACTS AT 01:03
+----------------------
+Boot time (LastBootUpTime): 2026-10-17 23:40:06
+Newest minidump: C:\Windows\Minidump\101726-24500-01.dmp
+                 (2026-10-17 19:43:41, bugcheck 0xCE, BEFORE this boot)
+Bugcheck events after this boot: none
+Live adapters: 30 = 192.168.100.2 (Ethernet 4), 17 = 192.168.100.3
+               (Ethernet 5); both RDMA enabled, 40 Gbps.
+Loaded nvmeofk modules:
+  nvmeofkloop        Running       (listen-only run, 01:00:36, clean)
+  nvmeofkloop010118  START_PENDING (loopback run, 01:01:19, wedged)
+
+STEP 1 - SIGNATURES (before any code, as required)
+--------------------------------------------------
+File: D:\rdma\ndk_signatures.txt
+Source: C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km\ndkpi.h
+This is the only ndkpi.h in the kit tree, and it is the NDKPI 2.0 interface.
+
+  NdkCreateListener
+    ndkpi.h 924-934, member of NDK_ADAPTER_DISPATCH at line 965.
+    Called on the ADAPTER dispatch; takes NDK_FN_CONNECT_EVENT_CALLBACK,
+    context, NDK_FN_CREATE_COMPLETION, request context, out listener.
+
+  NDK_FN_CREATE_CONNECTION_REQUEST
+    DOES NOT EXIST in this header (no hit under the 10.0.26100.0 Include
+    tree). The installed callback is NDK_FN_CONNECT_EVENT_CALLBACK,
+    ndkpi.h 807-813:
+        VOID (*)(PVOID ConnectEventContext, NDK_CONNECTOR *pNdkConnector)
+    It has NO PVOID *CONNECTOR_CONTEXT out-parameter. The old NDKPI 1.x
+    callback had one; this header does not declare it, so it must not be
+    invented. Accept/reject is a separate call on the connector.
+
+  NdkAcceptConnection
+    DOES NOT EXIST in this header. The installed call is NdkAccept
+    (NDK_FN_ACCEPT, ndkpi.h 695-709; dispatch member at line 790):
+        NTSTATUS (*)(NDK_CONNECTOR *, NDK_QP *, ULONG InboundReadLimit,
+                     ULONG OutboundReadLimit, CONST PVOID pPrivateData,
+                     ULONG PrivateDataLength,
+                     NDK_FN_DISCONNECT_EVENT_CALLBACK, PVOID,
+                     NDK_FN_REQUEST_COMPLETION, PVOID RequestContext)
+    It REQUIRES a QP and an async completion. The listener therefore needs
+    its own QP; the initiator QP cannot be reused.
+
+  NDK_FN_CONNECT / NdkConnect
+    ndkpi.h 623-639, member of NDK_CONNECTOR_DISPATCH at line 787. Matches
+    the existing nvmeofk.c call: (connector, qp, src, srcLen, dst, dstLen,
+    inbound, outbound, privateData, privateLen, completion, context).
+
+Full quotes with line numbers are in D:\rdma\ndk_signatures.txt.
+There is also no NdkGetListenerDispatch function in this header; the
+dispatch table is read directly from listener->Dispatch.
+
+STEP 3 - LISTENER CREATION, MEASURED CLEAN (listen-only run 01:00:36)
+--------------------------------------------------------------------
+Evidence: D:\rdma\klisten_listen-only.txt (ASCII, written by the runner).
+Driver: sym\k\nvmeofk_lb.sys, SHA256 D22ED27BCC6E14922FAA8A89A4D86906
+        A695D0012CFDF389345DAE2B026D9DF0, signed.
+Config: nvmeofk_dolisten=1, nvmeofk_lconnect=0,
+        nvmeofk_lifindex=30 (.2), nvmeofk_lport=4420.
+Result: sc start STATE 4 RUNNING in 1 s.
+
+  L NdkCreatePd        = 0x00000000
+  L NdkCreateCq        = 0x00000000
+  L NdkCreateQp        = 0x00000000
+  L NdkCreateListener  = 0x00000000   <-- STEP 3 SUCCESS
+  L NdkCreateMr        = 0x00000000
+  L NdkRegisterMr      = 0x00000000
+  L NdkListen(192.168.100.2:4420) = 0x00000000
+  L NdkGetLocalAddress = 0x00000000 len=16 family=2 port=4420 addr=.2
+  teardown: listener, listener qp, cq, mr, pd, adapter all closed
+  teardown complete: listener, accepted connection and initiator all
+  closed; adapters returned
+  nvmeofk_ok = 0x00000001
+
+So the listener object, its dispatch and NdkListen all work on this
+ConnectX-3 Pro under NDKPI 2.0, and tear down without a leak.
+
+STEP 4 - SAME-CARD LOOPBACK, MEASURED FROM THE EARLIER D3 RUN
+--------------------------------------------------------------
+Provenance: HKLM\Software\NVMeoFProbe\nvmeofk_log as read at 00:56, before
+the 01:01 load. It is the D3 code path (identical log strings and line
+numbers to the current source): listener ifIndex=30 (.2), initiator
+ifIndex=17 (.3), connect=YES.
+
+  C WskOpenNdkAdapter(ifIndex=17, v2.0) = 0x00000000
+  NdkCreatePd/Cq/Qp/Connector/Mr         = 0x00000000
+  NdkConnect submit = 0x00000103 (pending)
+  L connect event   = 0x00000000 events=1 incoming=0xffff968211e76210
+      <-- THE LISTENER CALLBACK FIRED
+  L NdkGetConnectionData = 0x00000000 inbound=1 outbound=1 len=56
+  L peer private data: recfmt=0 qid=0 hrqsize=32 hsqsize=31 cntlid=0
+  L NdkAccept submit = 0x00000103 (qp 0xffff9681fdfe88e0)
+  NdkConnect        = 0x00000000
+      <-- SAME-CARD .3 -> .2 LOOPBACK SUCCEEDED; NO 0xC0000236 REFUSAL
+
+Then the initiator read the peer data back with a 64-byte stack buffer:
+
+  NdkGetConnectionData = 0xC0000023  dataLen=148
+
+0xC0000023 is STATUS_BUFFER_TOO_SMALL: the provider wants 148 bytes, the
+source declares UCHAR peerData[64] (nvmeofk.c line 953). The log stops at
+that call. This is the project's known IN/OUT-length stack-damage class,
+not an NDK connection failure.
+
+CURRENT BLOCKER AT 01:03
+------------------------
+The 01:01:18 loopback load never reached its first writeLog: the registry
+still holds the older log above, and nvmeofkloop010118 has been
+START_PENDING since 01:01:19. The runner is blocked in sc start.
+The service is NOT_STOPPABLE (live NDK connection).
+DO NOT call sc stop / devcon remove / devcon update. A reboot is the only
+safe way out. I did not reboot: the DSH harness on this machine has no
+autostart (no scheduled task, no service, no Run entry), so a reboot ends
+this session before the post-reboot log can be read.
+
+RECOMMENDED, AFTER REBOOT
+-------------------------
+1. nvmeofk.c line 953: UCHAR peerData[64] -> UCHAR peerData[256]
+   (peerDataLen = sizeof(peerData) is already correct).
+2. Add the compiler-checked forward declaration requested by the task:
+       static NDK_FN_CONNECT_EVENT_CALLBACK connectEvent;
+   The current definition at line 701 is plain "static VOID"; its parameter
+   list happens to match NDK_FN_CONNECT_EVENT_CALLBACK, but nothing checks
+   it against the header.
+3. Rebuild nvmeofk_lb.sys, sign, and run EXACTLY ONE loopback load
+   (-Connect 1). Expected: NdkCreateListener=0, callback fires,
+   NdkConnect=0, NdkGetConnectionData succeeds with the 32-byte listener
+   private data ("NVMET-LISTENER01" marker at offset 16), accept completes,
+   and the driver returns with a clean teardown.
+4. Do not attempt to unload either nvmeofk module; reboot after the run.
+
+BOTTOM LINE
+-----------
+- NdkCreateListener status: 0x00000000.
+- Listener callback: FIRED (events=1).
+- NdkConnect on .3 -> .2: 0x00000000. The two ports of this single HCA DO
+  loop back under NDK when the listener is on its own adapter/port. A
+  refusal is NOT what this hardware returns.
+- Remaining defect is a 64-byte buffer for a 148-byte provider answer, plus
+  the current wedged load. Both are fixable; neither is an NDK limitation.
