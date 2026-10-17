@@ -1,0 +1,8 @@
+select disk 4
+online disk
+clean
+convert gpt
+create partition primary
+format fs=ntfs quick label=NVMEOF-KERNEL
+assign letter=Z
+exit
