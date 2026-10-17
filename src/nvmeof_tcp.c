@@ -1,4 +1,4 @@
-/* SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿/* SPDX-FileCopyrightText: 2026 Dingtaiqi
  * SPDX-License-Identifier: Apache-2.0
  *
  * nvmeof_tcp.c - NVMe/TCP, both ends, user mode.
@@ -245,29 +245,9 @@ static void fillIdentifyController(uint8_t* d, uint32_t blocks)
     nvmeofTcpPut32(d, 512, blocks);                /* TNVMCAP low  (namespace size hint) */
 }
 
-static void fillIdentifyNamespace(uint8_t* d, uint32_t blocks)
-{
-    uint64_t nsze = (uint64_t)blocks;
-    memset(d, 0, 4096);
-    memcpy(d, &nsze, 8);                     /* NSZE */
-    memcpy(d + 8, &nsze, 8);                 /* NCAP */
-    memcpy(d + 16, &nsze, 8);                /* NUSE */
-    /* Identify Namespace, NVMe 1.4 figure "Identify Namespace Data Structure":
-     *   NSZE at 0, NCAP at 8, NUSE at 16, NSFEAT at 24, NLBAF at 25, FLBAS at 26,
-     *   and the LBA Format table at 128 with 4-byte entries
-     *   (MS at +0..1, LBADS at +2, RP at +3).
-     * So LBAF0 is 128..131 and LBADS is at 130.  This function used to write the
-     * table four bytes late (LBADS at 132, with a DLFEAT byte sitting on top of
-     * LBAF0's MS field), so a host that read the entry at 128 saw LBADS = 0 and
-     * had to fall back to an assumed 512-byte block.  The offsets are written out
-     * one per line because that is exactly how this went wrong. */
-    d[25] = 0;                               /* NLBAF: one LBA format (zero based) */
-    d[26] = 0;                               /* FLBAS: format 0, no metadata */
-    d[128] = 0;                              /* LBAF0 MS low byte: no metadata bytes */
-    d[129] = 0;                              /* LBAF0 MS high byte */
-    d[130] = 9;                              /* LBAF0 LBADS: 2^9 = 512-byte blocks */
-    d[131] = 0;                              /* LBAF0 RP: relative performance */
-}
+/* Identify Namespace (CNS = 0) now lives in nvmeof_tcp.h, so the self-test in
+ * tcp_identify_selftest.c runs the same function this target runs.  The LBA Format
+ * table is at 128 and LBADS at 130; see the comment there. */
 
 /* Serve one capsule.  Returns 0 to keep the connection, -1 to close it. */
 static int targetServeOne(TARGET_CONN* c)
@@ -314,7 +294,7 @@ static int targetServeOne(TARGET_CONN* c)
             dataLen = 4096;
         } else if (cns == NVME_CNS_NAMESPACE) {
             if (nsid == 0 || nsid > 1) { sc = NVME_SC_INVALID_NS; }
-            else { fillIdentifyNamespace(resp + NVMEOF_TCP_CRSP_HDR_LEN, c->ns->blocks); dataLen = 4096; }
+            else { nvmeofTcpFillIdentifyNamespace(resp + NVMEOF_TCP_CRSP_HDR_LEN, c->ns->blocks); dataLen = 4096; }
         } else {
             sc = NVME_SC_INVALID_FIELD;
         }

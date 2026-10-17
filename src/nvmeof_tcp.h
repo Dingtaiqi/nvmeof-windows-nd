@@ -244,6 +244,32 @@ static unsigned nvmeofTcpBuildCapsuleResp(uint8_t* buf, const uint8_t* cqe16, in
 }
 
 /* ------------------------------------------------------------------------------------- */
+/* Identify Namespace (CNS = 0)                                                           */
+/*                                                                                       */
+/* This lives in the header, not in nvmeof_tcp.c, so the self-test runs the exact function */
+/* the target runs instead of a copy that can drift from it.  NVMe 1.4 puts NSZE at 0,     */
+/* NCAP at 8, NUSE at 16, NSFEAT at 24, NLBAF at 25, FLBAS at 26, and the LBA Format table */
+/* at 128 with 4-byte entries: MS at +0..1, LBADS at +2, RP at +3.  So LBAF0 is 128..131   */
+/* and LBADS is byte 130.  The first version of the target wrote the table four bytes late */
+/* (LBADS at 132, with DLFEAT on top of LBAF0's MS), and the kernel miniport had to work   */
+/* around it; the offsets are one per line because that is exactly how it went wrong.      */
+/* ------------------------------------------------------------------------------------- */
+static void nvmeofTcpFillIdentifyNamespace(uint8_t* d, uint32_t blocks)
+{
+    uint64_t nsze = (uint64_t)blocks;
+    memset(d, 0, 4096);
+    memcpy(d, &nsze, 8);                     /* NSZE  at 0  */
+    memcpy(d + 8, &nsze, 8);                 /* NCAP  at 8  */
+    memcpy(d + 16, &nsze, 8);                /* NUSE  at 16 */
+    d[25] = 0;                               /* NLBAF at 25: one format (zero based) */
+    d[26] = 0;                               /* FLBAS at 26: format 0, no metadata */
+    d[128] = 0;                              /* LBAF0 MS low byte: no metadata bytes */
+    d[129] = 0;                              /* LBAF0 MS high byte */
+    d[130] = 9;                              /* LBAF0 LBADS: 2^9 = 512-byte blocks */
+    d[131] = 0;                              /* LBAF0 RP: relative performance */
+}
+
+/* ------------------------------------------------------------------------------------- */
 /* H2CData / C2HData / R2T                                                                */
 /*                                                                                        */
 /*   +0 type, +1 flags, +2 hlen = 24, +3 pdo = 0, +4 plen = data length                   */

@@ -170,11 +170,26 @@ static char   g_log[8192];
 static size_t g_logLen = 0;
 static ULONG  g_logDropped = 0;
 
+/*  Never refuse the NEW bytes.  The old behaviour was: once the 8 KiB filled up, every
+ *  later line was counted as dropped and thrown away - so a long session lost exactly
+ *  the late failures the log exists for.  When there is no room, discard the OLDEST
+ *  half (a 4 KiB move, once per ~4 KiB of text) and keep appending; g_logDropped counts
+ *  how many times the window rolled, so a reader knows the beginning is gone. */
 static void NvtcpkLogRaw(const char* s, size_t n)
 {
-    if (g_logLen + n + 3 >= sizeof(g_log)) {
-        g_logDropped++;
+    if (n + 3 >= sizeof(g_log)) {
+        g_logDropped++;                     /* a single line larger than the whole buffer */
         return;
+    }
+    if (g_logLen + n + 3 >= sizeof(g_log)) {
+        size_t keep = sizeof(g_log) / 2;
+        if (g_logLen > keep) {
+            RtlMoveMemory(g_log, g_log + (g_logLen - keep), keep);
+            g_logLen = keep;
+        } else {
+            g_logLen = 0;
+        }
+        g_logDropped++;
     }
     RtlCopyMemory(g_log + g_logLen, s, n);
     g_logLen += n;
@@ -286,6 +301,10 @@ static void NvtcpkLogFlush(void)
         return;
     }
     RtlInitUnicodeString(&valueName, L"nvtcpk_log");
+    /* The value is a REG_SZ, so it must be NUL terminated.  After a rollover the byte
+     * past g_logLen is old text, not zero, so write the terminator explicitly instead
+     * of hoping for one.  NvtcpkLogRaw always leaves three bytes of headroom. */
+    g_log[g_logLen] = 0;
     ZwSetValueKey(key, &valueName, 0, REG_SZ, g_log, (ULONG)g_logLen + 1);
 
     RtlInitUnicodeString(&valueName, L"nvtcpk_ok");
@@ -1833,11 +1852,24 @@ static NTSTATUS NvtcpkCommandEx(PVOID conn, UINT8 opcode, UINT32 nsid, UINT32 cd
         NvtcpkLogF("command 0x%02X: %p is not an open connection", (unsigned)opcode, conn);
         return STATUS_INVALID_HANDLE;
     }
-    if (c->poisoned || c->broken) {
-        NvtcpkLogF("command 0x%02X: connection %p is unusable (%s); refusing",
-                   (unsigned)opcode, c, c->poisoned ? "a wait timed out" : "protocol error");
+    if (c->poisoned) {
+        NvtcpkLogF("command 0x%02X: connection %p was poisoned by a timeout; refusing",
+                   (unsigned)opcode, c);
         NvtcpkDropRef(c);
         return STATUS_DEVICE_NOT_READY;
+    }
+    if (c->broken) {
+        /* A protocol error left the byte stream out of step.  A TCP stream cannot be
+         * resynchronised, so the only repair is a NEW socket - and the old code did
+         * not do that: it refused every command until the machine rebooted, which is
+         * the one-way latch this replaces.  Setting needReconnect routes this command
+         * through NvtcpkReconnect, which closes the out-of-step socket, builds a new
+         * one, redoes the handshake and clears broken.  If the rebuild fails, broken
+         * stays set and the next command tries again. */
+        NvtcpkLogF("command 0x%02X: connection %p is out of step after a protocol error;"
+                   " rebuilding the connection instead of refusing until reboot",
+                   (unsigned)opcode, c);
+        c->needReconnect = TRUE;
     }
     if (InterlockedCompareExchange(&c->busy, 1, 0) != 0) {
         /* One command at a time per connection is the whole concurrency model:

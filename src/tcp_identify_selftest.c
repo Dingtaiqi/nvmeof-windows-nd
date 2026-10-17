@@ -1,4 +1,4 @@
-/* SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿/* SPDX-FileCopyrightText: 2026 Dingtaiqi
  * SPDX-License-Identifier: Apache-2.0
  *
  * tcp_identify_selftest.c - a real NVMe command carried over NVMe/TCP on loopback.
@@ -148,27 +148,12 @@ static void fillIdentifyController(uint8_t* d)
     memcpy(d + 64, "1.0.0   ", 8);
 }
 
-/* Identify Namespace with the LBA Format table where NVMe 1.4 puts it: NSZE at 0,
- * NLBAF at 25, FLBAS at 26 and LBAF0 at 128 (MS 128..129, LBADS 130, RP 131).  The
- * offsets are written one per line because writing this table four bytes late is a
- * mistake that a length check cannot see: the data is still 4096 bytes and every
- * other field still decodes, only the block size silently reads back as zero. */
+/* Identify Namespace comes from nvmeof_tcp.h (nvmeofTcpFillIdentifyNamespace), i.e.
+ * the exact function the real target calls.  It used to be a local copy here, which
+ * meant this test could pass while the target was still writing the LBA Format table
+ * four bytes late.  The assertion below reads the bytes that crossed the wire, so a
+ * regression in the shared function fails this test. */
 #define SELFTEST_NS_BLOCKS 32768u
-
-static void fillIdentifyNamespace(uint8_t* d, uint32_t blocks)
-{
-    uint64_t nsze = (uint64_t)blocks;
-    memset(d, 0, 4096);
-    memcpy(d, &nsze, 8);                     /* NSZE  at 0  */
-    memcpy(d + 8, &nsze, 8);                 /* NCAP  at 8  */
-    memcpy(d + 16, &nsze, 8);                /* NUSE  at 16 */
-    d[25] = 0;                               /* NLBAF at 25: one format (zero based) */
-    d[26] = 0;                               /* FLBAS at 26: format 0, no metadata */
-    d[128] = 0;                              /* LBAF0 MS low  */
-    d[129] = 0;                              /* LBAF0 MS high */
-    d[130] = 9;                              /* LBAF0 LBADS: 2^9 = 512 bytes */
-    d[131] = 0;                              /* LBAF0 RP */
-}
 
 /* Handshake: read ICReq, answer ICResp. */
 static int controllerHandshake(SOCKET s)
@@ -215,7 +200,7 @@ static int controllerServeOne(SOCKET s, uint8_t* ns)
         dataLen = 4096;
         cqeBuild(cqe, 0, cid, NVME_SC_SUCCESS);
     } else if (opcode == NVME_IDENTIFY && (cdw10 & 0xFF) == NVME_CNS_NAMESPACE) {
-        fillIdentifyNamespace(resp + NVMEOF_TCP_CRSP_HDR_LEN, SELFTEST_NS_BLOCKS);
+        nvmeofTcpFillIdentifyNamespace(resp + NVMEOF_TCP_CRSP_HDR_LEN, SELFTEST_NS_BLOCKS);
         dataLen = 4096;
         cqeBuild(cqe, 0, cid, NVME_SC_SUCCESS);
     } else if (opcode == NVME_READ && ns != NULL) {
