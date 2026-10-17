@@ -1,0 +1,94 @@
+=== wsktest INCIDENT RECORD ===
+Written after load #1 succeeded and a subsequent `sc stop nvmeofwsk` wedged the
+machine (new process startup stopped completing).  This file is insurance: the
+registry values it quotes may be lost if the hive cannot flush before a reset.
+
+FILES
+  D:\rdma\wsktest_preload.txt        baseline taken before load #1
+  D:\rdma\wsktest_breadcrumb.txt     external breadcrumbs of create/start
+  D:\rdma\wsktest_run1.log           load #1 log, copied out of the registry
+  D:\rdma\wsktest_harness_run1.out   harness stdout
+  D:\rdma\wsktest_load.ps1           the unattended loader (create + start only)
+  D:\rdma\nvmeof\src\driver\nvmeof_wsktest.c      the test driver source
+  D:\rdma\nvmeof\src\driver\sym\nvmeof_wsktest.sys  the signed image (42376 bytes)
+  D:\rdma\nvmeof\src\driver\sym\wsk_test\wsktest.map  link map (entry point proof)
+
+RESULT OF LOAD #1: PASS
+  sc create SUCCESS; sc start exit=0; service RUNNING; wsktest_done=1; 4043 ms.
+  The WSK IRP completion pattern ran end to end: WskSocket, WskBind, WskConnect
+  (refused), completion routine, STATUS_MORE_PROCESSING_REQUIRED, IoFreeIrp,
+  WskCloseSocket, free.  WskDeregister returned.  No bugcheck, no new minidump.
+
+  WskRegister              0x00000000
+  WskCaptureProviderNPI    0x00000000  dispatch=0xfffff8005ce18160
+  NvtcpOpen #1             0xC0000236  (STATUS_CONNECTION_REFUSED, expected)
+  NvtcpOpen #2             0xC0000236  (identical: no state leaked between calls)
+  NvtcpClose(NULL)         0xC000000D  (STATUS_INVALID_PARAMETER, no crash)
+  WskReleaseProviderNPI    returned
+  WskDeregister            returned
+
+  wsktest_log, exactly as read from HKLM\Software\NVMeoFProbe (REG_SZ):
+---8<---
+=== wsktest: WSK IRP completion pattern, one load, loopback 127.0.0.1:9 ===
+[     0 ms] entry point (WsktestDriverEntry) entered; all log times are ms from here
+expected: both NvtcpOpen calls FAIL (nothing listens on port 9) and that failure runs socket/bind/connect/completion/close/free
+[     1 ms] step 1: WskRegister(client NPI version 1.0) = 0x00000000
+[     1 ms] step 2: WskCaptureProviderNPI(wait 5000 ms) = 0x00000000  dispatch=0xfffff8005ce18160  client=0xffff92837da57290
+[     1 ms] step 3: NvtcpOpen(127.0.0.1:9) #1, failure is the expected result
+[  2033 ms] step 3: NvtcpOpen #1 = 0xC0000236  conn=0x0000000000000000  (failure, as expected)
+[  2033 ms] step 4: NvtcpOpen(127.0.0.1:9) #2, same expectations
+[  4042 ms] step 4: NvtcpOpen #2 = 0xC0000236  conn=0x0000000000000000  (failure, as expected)
+[  4042 ms] step 4: open #1 = 0xC0000236, open #2 = 0xC0000236 -> IDENTICAL, no state leaked between the two attempts
+[  4043 ms] step 5: NvtcpClose(NULL) = 0xC000000D  (returned, no crash: pass)
+[  4043 ms] step 6: calling WskReleaseProviderNPI
+[  4043 ms] step 6: WskReleaseProviderNPI returned
+[  4043 ms] step 7: calling WskDeregister (blocks forever if anything is still outstanding)
+[  4043 ms] step 7: WskDeregister returned
+[  4043 ms] steps: register=0x00000000 capture=0x00000000 open1=0xC0000236 open2=0xC0000236 closeNull=0xC000000D
+[  4043 ms] wsktest_done = 1 (total 4043 ms, budget 60000 ms)
+---8<---
+
+  nvtcpk_log (the transport's own log, ANSI bytes recovered):
+---8<---
+=== NvtcpOpen: NVMe/TCP connect to 127.0.0.1:9 ===
+WskSocket = 0x00000000 socket=0xffff92837da56ac8
+WskConnect = 0xC0000236 (0xC0000236 = connection refused, 0xC000023C = unreachable)
+NvtcpOpen failed 0xC0000236; socket closed and everything released
+=== NvtcpOpen: NVMe/TCP connect to 127.0.0.1:9 ===
+WskSocket = 0x00000000 socket=0xffff92837da61488
+WskConnect = 0xC0000236 (0xC0000236 = connection refused, 0xC000023C = unreachable)
+NvtcpOpen failed 0xC0000236; socket closed and everything released
+---8<---
+
+WHAT WENT WRONG
+  sc stop nvmeofwsk -> first attempt exit 1052 (ERROR_INVALID_SERVICE_CONTROL,
+  "The requested control is not valid for this service"); the service had
+  reported (STOPPABLE) right after start and (NOT_STOPPABLE) at that point.
+  A later stop attempt was accepted and never returned; after that `sc query`
+  blocks and a fresh powershell.exe running only Write-Output "alive" does not
+  complete.  The machine is partially wedged (no bugcheck, no dump, no reboot).
+
+  The only driver code on that path is DriverUnload, which performs two registry
+  writes (wsktest_log, wsktest_unload).  Registry I/O from DriverUnload is the
+  prime suspect.  nvmeof_tcpk.c's NvtcpkUnload and nvmeofk.c's unload routine
+  also do registry I/O (NvtcpkLogFlush), so this is a real defect to chase.
+
+  Evidence that it is process creation, not just the tool: a fresh
+  powershell.exe whose FIRST statement was
+      Set-Content D:\rdma\wsktest_heartbeat.txt ...
+  never created that file within 30 s, and a glob (which spawns a helper) timed
+  out too, while in-process file reads/writes still worked.  So new processes
+  cannot complete startup; nothing was bugchecked (this session survived, so the
+  machine never rebooted) and no new dump appeared.
+
+  Load #2 was NOT attempted: the brief requires a clean unload first, and the
+  machine stopped being able to run diagnostics.  Two loads are budgeted; one
+  was used.
+
+AFTER THE REBOOT
+  1) sc.exe delete nvmeofwsk      (start= demand, so it will not auto-load)
+  2) Confirm wsktest_done=1 and wsktest_stage=7 are still in
+     HKLM\Software\NVMeoFProbe, and that wsktest_unload is absent (the unload
+     never completed).
+  3) Do not load this image again until the unload path is understood: on this
+     machine, stopping it wedges the box.

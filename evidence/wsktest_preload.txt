@@ -1,0 +1,9 @@
+=== wsktest PRE-LOAD baseline (written before the first load) ===
+now                : 2026-10-17 17:23:52
+LastBootUpTime     : 10/17/2026 13:13:33
+newest minidump    : 101526-21296-01.dmp  len=3161766  mtime=2026-10-15 18:05:26
+driver             : D:\rdma\nvmeof\src\driver\sym\nvmeof_wsktest.sys  len=42376  mtime=2026-10-17 17:23:30
+signature          : Valid
+testsigning        : Yes (bcdedit)
+budget             : DriverEntry failing if over 60000 ms; loader polled 90 s
+expected           : NvtcpOpen fails twice (nothing listens on 127.0.0.1:9), NvtcpClose(NULL) safe, WskDeregister returns

@@ -1,0 +1,6 @@
+2026-10-17 17:25:29.724  [run1]  HARNESS START pid=40468 tag=run1
+2026-10-17 17:25:29.830  [run1]  before sc create
+2026-10-17 17:25:29.859  [run1]  after sc create exit=0 output=[SC] CreateService SUCCESS |
+2026-10-17 17:25:29.861  [run1]  before sc start
+2026-10-17 17:25:33.963  [run1]  after sc start exit=0 output=| SERVICE_NAME: nvmeofwsk  |         TYPE               : 1  KERNEL_DRIVER   |         STATE              : 4  RUNNING  |                                 (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN) |         WIN32_EXIT_CODE    : 0  (0x0) |         SERVICE_EXIT_CODE  : 0  (0x0) |         CHECKPOINT         : 0x0 |         WAIT_HINT          : 0x0 |         PID                : 0 |         FLAGS              :  |
+2026-10-17 17:25:33.964  [run1]  HARNESS END sc start rc=0

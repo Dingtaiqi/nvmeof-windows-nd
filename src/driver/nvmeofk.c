@@ -981,10 +981,13 @@ static BOOLEAN connectWanted(void)
 static VOID nvmeofkUnload(PDRIVER_OBJECT driver)
 {
     UNREFERENCED_PARAMETER(driver);
-    NvmeofkTeardown();
-    // The probes in this project deliberately do not tear the NDK objects down on
-    // unload: an outstanding operation against a freed object is a bugcheck, and
-    // the process ends with the driver anyway.
+
+    // Deliberately nothing that touches the registry.  On 2026-10-17 a DriverUnload that
+    // wrote to the hive wedged this machine: the SCM waited for the unload and the write
+    // never returned, no bugcheck and no dump, and only a reboot recovered it.  NvmeofkTeardown
+    // calls writeLog, which is a ZwSetValueKey, so it must not run from here.  The driver is
+    // being unloaded; the NDK objects it leaked are the process's problem anyway, and the
+    // log that matters was written during the run.
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registryPath)

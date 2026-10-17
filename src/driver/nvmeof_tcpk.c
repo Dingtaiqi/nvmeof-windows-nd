@@ -1570,10 +1570,14 @@ static VOID NvtcpkUnload(PDRIVER_OBJECT DriverObject)
     UNREFERENCED_PARAMETER(DriverObject);
 
     NvtcpkLogF("=== nvmeof_tcpk unload: releasing every connection this file still owns ===");
-    NvtcpkLogFlush();
+    /* No registry I/O on unload: it wedged this machine once already.  The ring is
+     * dropped with the driver; anything worth keeping was written during the run. */
+    /* NvtcpkLogFlush(); */
     NvtcpkCloseAll();
     NvtcpkLogF("unload complete");
-    NvtcpkLogFlush();
+    /* No registry I/O on unload: it wedged this machine once already.  The ring is
+     * dropped with the driver; anything worth keeping was written during the run. */
+    /* NvtcpkLogFlush(); */
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
