@@ -1,0 +1,69 @@
+# The transport refuses at an unpredictable point - 6 commands once, 643 another time
+
+Two runs, same driver, same target, same code. The failing call is identical in shape.
+
+RUN A (16 MiB namespace, D:\nvmeof\bridge-ns.img, -blocks 32768):
+  --- send failed after 643 commands: ok=643 in=1622728 out=1013080 broken=1 poisoned=0
+  cid=644 op=0x02 in=0 out=512 total=72 mdl=4424 callSt=0x00000103 irpSt=0xC000020D info=0
+  The seven commands before it were 4168-byte writes that all succeeded:
+    cid=637..643 op=0x01 in=4096 out=0 total=4168 mdl=4424 callSt=0x00000103 irpSt=0x00000000
+
+RUN B (4 MiB namespace, D:\nvmeof\r4m.img, -blocks 8192), after a clean devcon restart:
+  command 0x02 cid=6: send of the capsule failed 0xC000020D
+  --- send failed after 6 commands: ok=5 in=9464 out=488 broken=1 poisoned=0
+  resp #3 cid=4 plen=512 and resp #4 cid=5 plen=512 had just succeeded -
+  so 512-byte reads were working immediately before the failure.
+
+Why this matters more than any earlier reading:
+
+  A resource leak fails after a fixed count.  It did not: 6, then 643.
+  A size bug fails on a fixed size.  It did not: 72-byte sends succeeded both times,
+    including the first ones, and the failing call reports mdlBytes=4424 bufferBytes=4424
+    offset=0 length=72 - all correct, all measured.
+  A byte limit fails on a fixed byte count.  It did not: 9464 bytes, then 1622728.
+
+So it is neither exhaustion nor arithmetic.  It is a race or a state machine, and the
+one shared thing on that path is the per-connection completion context used by
+NvtcpkStepStart / NvtcpkStepFinish: if a send and a receive can overlap on it, a late
+completion writes status or info for the wrong operation, or an event is re-initialised
+while another thread waits on it.  Re-initialising a KEVENT somebody is waiting on
+corrupts the dispatcher wait list - this project lost days to that elsewhere already,
+so it is the first thing to rule out.
+
+info=0 on the failing send means nothing was transmitted; WSK returned the error before
+putting anything on the wire.  STATUS_INVALID_BUFFER_SIZE is therefore the provider
+reporting its own confused state, not a complaint about the buffer.
+
+## Raw transport log from run B
+
+=== NvtcpOpen: NVMe/TCP connect to 127.0.0.1:4421 ===
+WskSocket = 0x00000000 socket=0xffff8c8f9c1d51c8
+WskConnect = 0x00000000 (0xC0000236 = connection refused, 0xC000023C = unreachable)
+  send #0 len=128 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 callSt=0x00000103 irpSt=0x00000000 info=128
+handshake: ICReq sent (128 bytes, cpda=4 dgst=0 maxr2t=0)
+handshake OK: peer pfv=0 cpda=4 dgst=0 maxr2t=0
+NvtcpOpen: connection 0xffff8c8fa2715500 is open (cpda=4, one command at a time)
+  send #1 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 callSt=0x00000103 irpSt=0x00000000 info=72
+  resp #0 cid=1 type=0x05 flags=0x10 hlen=24 pdo=24 plen=4096
+Identify cns=1 nsid=0: 4096 bytes, VID 0x1C36
+  send #2 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 callSt=0x00000103 irpSt=0x00000000 info=72
+  resp #1 cid=2 type=0x05 flags=0x10 hlen=24 pdo=24 plen=4096
+Identify cns=0 nsid=1: 4096 bytes, VID 0x2000
+  send #3 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 callSt=0x00000103 irpSt=0x00000000 info=72
+  resp #2 cid=3 type=0x05 flags=0x10 hlen=24 pdo=24 plen=0
+  send #4 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 callSt=0x00000103 irpSt=0x00000000 info=72
+  resp #3 cid=4 type=0x05 flags=0x10 hlen=24 pdo=24 plen=512
+  send #5 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 callSt=0x00000103 irpSt=0x00000000 info=72
+  resp #4 cid=5 type=0x05 flags=0x10 hlen=24 pdo=24 plen=512
+  send #6 len=72 off=0 mdlBytes=4424 bufferBytes=4424 irql=0 callSt=0x00000103 irpSt=0xC000020D info=0
+command 0x02 cid=6: send of the capsule failed 0xC000020D
+--- send failed after 6 commands: conn 0xffff8c8fa2715500 cidNext=7 ok=5 in=9464 out=488 broken=1 poisoned=0
+    buffers: pduBuf=0xffff8c8f7bf86000 pduMdl=0xffff8c8f79cbfd90 rspBuf=0xffff8c8f9c2b5000 rspMdl=0xffff8c8f79cc5620
+    capsule still in pduBuf: type=0x04 flags=0x00 hlen=72 pdo=72 plen=0
+    cid=1 op=0x06 in=0 out=4096 total=72 mdl=4424 callSt=0x00000103 irpSt=0x00000000
+    cid=2 op=0x06 in=0 out=4096 total=72 mdl=4424 callSt=0x00000103 irpSt=0x00000000
+    cid=3 op=0x00 in=0 out=0 total=72 mdl=4424 callSt=0x00000103 irpSt=0x00000000
+    cid=4 op=0x02 in=0 out=512 total=72 mdl=4424 callSt=0x00000103 irpSt=0x00000000
+    cid=5 op=0x02 in=0 out=512 total=72 mdl=4424 callSt=0x00000103 irpSt=0x00000000
+    cid=6 op=0x02 in=0 out=512 total=72 mdl=4424 callSt=0x00000103 irpSt=0xC000020D
+
