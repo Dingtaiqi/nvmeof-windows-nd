@@ -16,12 +16,14 @@
 #   between a demonstration and a claim.  What is live is the transport - the write and the
 #   verification both go through the target.
 #
-#   nvmeof_tcp_mount.ps1 [-Blocks 4096] [-Letter X] [-Unmount]
+#   nvmeof_tcp_mount.ps1 [-Blocks 8192] [-Letter X] [-Unmount]
 #
-# 4096 blocks = 2 MiB, which is the smallest size that formats cleanly as NTFS.
+# 8192 blocks = 4 MiB.  The earlier default of 4096 blocks (2 MiB) is NOT formattable: GPT
+# leaves a 1.875 MiB partition and Windows answers Format-Volume with "Size Not Supported",
+# so 4 MiB is used instead.
 
 param(
-    [int]    $Blocks  = 4096,
+    [int]    $Blocks  = 8192,
     [string] $Letter  = 'X',
     [switch] $Unmount,
     [string] $WorkDir = 'D:\nvmeof\tcpvol'
@@ -155,11 +157,23 @@ Initialize-Disk -Number $disk.Number -PartitionStyle GPT -ErrorAction SilentlyCo
 Start-Sleep -Seconds 2
 $p = New-Partition -DiskNumber $disk.Number -UseMaximumSize -DriveLetter $Letter -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
-Format-Volume -DriveLetter $Letter -FileSystem NTFS -NewFileSystemLabel 'NVMEOF-TCP' -Confirm:$false -Force -ErrorAction SilentlyContinue | Out-Null
+$fmtErr = $null
+try {
+    Format-Volume -DriveLetter $Letter -FileSystem NTFS -NewFileSystemLabel 'NVMEOF-TCP' -Confirm:$false -Force -ErrorAction Stop | Out-Null
+} catch { $fmtErr = ($_.Exception.Message -split "`r?`n")[0] }
 Start-Sleep -Seconds 3
 
 $vol = Get-Volume -DriveLetter $Letter -ErrorAction SilentlyContinue
 if (-not $vol) { Bad ('volume ' + $Letter + ': did not appear'); exit 1 }
+if (-not $vol.FileSystem) {
+    # A drive letter with no filesystem is not a volume, and the previous version wrote its
+    # files into one anyway, so the failure surfaced as "Cannot find drive X" from Out-File.
+    # Windows refuses to put NTFS on a partition this small and answers "Size Not Supported".
+    if ($fmtErr) { Bad ('the NTFS format failed: ' + $fmtErr) } else { Bad 'the volume has no filesystem' }
+    $psz = (Get-Partition -DriveLetter $Letter -ErrorAction SilentlyContinue).Size
+    if ($psz) { Bad ('the partition is only ' + [math]::Round($psz / 1MB, 2) + ' MiB; use -Blocks 8192 (4 MiB) for a formattable volume') }
+    exit 1
+}
 Ok ($Letter + ': ' + $vol.FileSystemLabel + '  ' + $vol.FileSystem + '  ' + [math]::Round($vol.Size / 1MB, 2) + ' MiB  ' + $vol.HealthStatus)
 
 # ------------------------------------------------------------------ 4. put real files in it
