@@ -1,13 +1,21 @@
 # SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: Apache-2.0
 #
-# enable_bigio.ps1 - switch the NVMe/TCP miniport to one command per 64 KiB and
-# verify that Z: survives the device restart.  Rolls back to 4 KiB by itself if it
-# does not.
+# enable_bigio.ps1 - choose how many bytes one NVMe READ/WRITE moves.
 #
-# The chunk size is read in HwInitialize (engine attach), so a device restart is
-# what applies it - no driver reload and no reboot.  The default in the driver is
-# 4 KiB, so everything before this script behaves exactly as it did.
+#   4   = the old in-capsule behaviour (default, always safe)
+#   64  = one 64 KiB command, whose payload moves as H2CData/C2HData PDUs
+#
+# THE DEVICE IS NOT RESTARTED HERE, ON PURPOSE.  On 2026-10-18 12:03:49,
+# `pnputil /restart-device ROOT\HDC\0002` on this machine bugchecked with
+# 0xCE (P2 = 0x10, DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS)
+# because the miniport still had its NVMe/TCP connection and a pending WSK
+# request.  That is the same "never unload a driver with an active connection"
+# rule the project learned the hard way; a device restart is an unload.
+#
+# The value is read in HwInitialize (engine attach), so it takes effect on the
+# NEXT BOOT.  Set it, reboot, and then run z_bigio_test.exe.  To go back to the
+# safe value, run this with -Rollback and reboot again.
 param(
     [int]$ChunkKb = 64,
     [switch]$Rollback
@@ -15,43 +23,15 @@ param(
 
 $ErrorActionPreference = 'Continue'
 if ($Rollback) { $ChunkKb = 4 }
+if ($ChunkKb -lt 4)   { $ChunkKb = 4 }
+if ($ChunkKb -gt 128) { $ChunkKb = 128 }
 
-function Set-Chunk([int]$kb) {
-    & reg.exe add 'HKLM\Software\NVMeoFProbe' /v nvmeofnd_chunkkb /t REG_DWORD /d $kb /f 2>&1 | Out-Null
-    Write-Output ('  nvmeofnd_chunkkb = ' + $kb)
-}
-function Restart-Miniport() {
-    $o = & pnputil /restart-device 'ROOT\HDC\0002' 2>&1 | Out-String
-    Write-Output ('  ' + (($o -split "`r?`n" | Where-Object { $_ -match 'success|failed|error' }) -join ' ').Trim())
-}
-function Wait-Z([int]$seconds) {
-    for ($i = 0; $i -lt $seconds; $i++) {
-        if (Test-Path 'Z:\') { return $true }
-        Start-Sleep -Seconds 1
-    }
-    return (Test-Path 'Z:\')
-}
-
-Write-Output ('=== miniport command size -> ' + $ChunkKb + ' KiB ===')
-Set-Chunk $ChunkKb
-Restart-Miniport
-$ok = Wait-Z 20
-Write-Output ('  Z: present = ' + $ok)
-if ($ok) {
-    $h = (Get-FileHash 'Z:\roundtrip.bin' -Algorithm SHA256).Hash
-    Write-Output ('  roundtrip.bin = ' + $h)
-    if ($h -ne 'C0DC81BA3F03D8C865E1CF0D400EB298EF7DD3E419788D603CF45704A1455D9B') {
-        Write-Output '  [FAIL] the volume content changed; rolling back to 4 KiB'
-        $ok = $false
-    }
-}
-if (-not $ok -and $ChunkKb -ne 4) {
-    Write-Output '  rolling back to 4 KiB'
-    Set-Chunk 4
-    Restart-Miniport
-    Write-Output ('  Z: present after rollback = ' + (Wait-Z 20))
-}
-if ($ok) {
+& reg.exe add 'HKLM\Software\NVMeoFProbe' /v nvmeofnd_chunkkb /t REG_DWORD /d $ChunkKb /f 2>&1 | Out-Null
+$now = (Get-ItemProperty 'HKLM:\Software\NVMeoFProbe' -Name nvmeofnd_chunkkb -EA SilentlyContinue).nvmeofnd_chunkkb
+Write-Output ('nvmeofnd_chunkkb = ' + $now + ' KiB (applies at the next boot)')
+if ($ChunkKb -ne 4) {
     Write-Output ''
-    Write-Output 'next: run D:\rdma\nvmeof\src\z_bigio_test.exe (uncached 2 MiB write/read on Z:)'
+    Write-Output 'REBOOT REQUIRED.  Do not restart the device: that is the 0xCE above.'
+    Write-Output 'If Z: does not come back after that boot: boot Safe Mode (the miniport does'
+    Write-Output 'not load there), run this script with -Rollback, and reboot normally.'
 }
