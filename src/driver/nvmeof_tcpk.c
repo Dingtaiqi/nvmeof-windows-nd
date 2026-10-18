@@ -106,10 +106,13 @@
 
 #define NVMEOF_TCPK_MAGIC          0x4E54434Bu   /* 'NTCK', sanity marker on a conn */
 
-/* In-capsule data only, so this is both the send and the receive ceiling.  The
- * value itself (NVMEOF_TCPK_MAX_DATA) is in the header, because a caller has to
- * know it; a larger transfer needs H2CData/C2HData plus an R2T exchange, which is
- * the next piece of work, and NvtcpCommand rejects it rather than truncating. */
+/* Capsule data is still capped at NVMEOF_TCPK_MAX_DATA (4096), but a command may
+ * move more than that as data PDUs: a Read's payload arrives as C2HData (handled
+ * in the receive loop) and a Write's payload is pushed as H2CData by
+ * NvtcpkSendDataPdus.  The R2T exchange stays unimplemented because this transport
+ * advertises maxr2t = 0, so a conforming peer never sends one.  This is only the
+ * sanity ceiling for a single command. */
+#define NVMEOF_TCPK_IO_MAX         (1024u * 1024u)
 
 /* One buffer serves every PDU in both directions.  The slack covers the capsule
  * header (72) plus whatever padding the peer's cpda demands for the data offset
@@ -1556,6 +1559,49 @@ static void NvtcpkBuildCapsule(PNVMEOF_TCPK_CONN c, const UCHAR* sqe, ULONG pdo,
     }
 }
 
+/* Push a Write's payload as H2CData PDUs.  The capsule that precedes them carries
+ * plen = 0, and the target reassembles by datao and completes only after it has
+ * every byte.  One PDU per 4096 bytes fits the existing send buffer, so nothing
+ * new is allocated and the per-PDU padding comes from the negotiated cpda. */
+static NTSTATUS NvtcpkSendDataPdus(PNVMEOF_TCPK_CONN c, USHORT cid, PVOID data, ULONG bytes)
+{
+    ULONG off = 0;
+    PUCHAR buf = (PUCHAR)c->pduBuf;
+
+    while (off < bytes) {
+        NVMEOF_TCP_DATA d;
+        ULONG chunk = bytes - off;
+        ULONG used, total;
+        NTSTATUS st;
+
+        if (chunk > NVMEOF_TCPK_MAX_DATA) { chunk = NVMEOF_TCPK_MAX_DATA; }
+        RtlZeroMemory(&d, sizeof(d));
+        d.cccid = cid;
+        d.ttag = 0;
+        d.datao = off;
+        d.datal = chunk;
+        nvmeofTcpBuildData(buf, NVMEOF_TCP_H2CDATA,
+                           (off + chunk == bytes) ? NVMEOF_TCP_F_LAST : 0, &d);
+        RtlCopyMemory(buf + NVMEOF_TCP_DATA_HDR_LEN, (PUCHAR)data + off, chunk);
+        used  = NVMEOF_TCP_DATA_HDR_LEN + chunk;
+        total = nvmeofTcpPduTotal(used, 0, c->cpda);
+        if (total > NVMEOF_TCPK_BUF_BYTES) {
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+        if (total > used) {
+            RtlZeroMemory(buf + used, total - used);
+        }
+        st = NvtcpkSend(c, total);
+        if (!NT_SUCCESS(st)) {
+            NvtcpkLogF("command cid=%u: H2CData at offset %u/%u failed 0x%08X %s",
+                       (unsigned)cid, off, bytes, (unsigned)st, NvtcpkStatusName(st));
+            return st;
+        }
+        off += chunk;
+    }
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid,
                                   UINT32 cdw10, UINT32 cdw12,
                                   PVOID inData, ULONG inBytes,
@@ -1566,12 +1612,19 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
     NVMEOF_TCP_HDR hdr;
     UCHAR sqe[NVMEOF_TCP_SQE_LEN];
     ULONG pdo, total, plen = 0, pdus;
+    ULONG capsuleBytes;
     USHORT cid;
     BOOLEAN gotResponse = FALSE;
+    BOOLEAN bigWrite;
 
     if (dataLenOut != NULL) {
         *dataLenOut = 0;
     }
+
+    /* Anything over one capsule payload travels as data PDUs: 0 here means the
+     * capsule announces no in-line data and an H2CData train follows it. */
+    bigWrite = (inBytes > NVMEOF_TCPK_MAX_DATA) ? TRUE : FALSE;
+    capsuleBytes = bigWrite ? 0 : inBytes;
 
     cid = c->cidNext++;
     NvtcpkBuildSqe(sqe, opcode, cid, nsid, cdw10, cdw12);
@@ -1580,13 +1633,13 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
      * cpda every implementation in practice negotiates (4) this is 72 and the
      * PDU is byte-identical to the user-mode initiator's. */
     pdo = nvmeofTcpPduTotal(NVMEOF_TCP_CCMD_HDR_LEN, 0, c->cpda);
-    if (pdo + inBytes > NVMEOF_TCPK_BUF_BYTES) {
+    if (pdo + capsuleBytes > NVMEOF_TCPK_BUF_BYTES) {
         NvtcpkLogF("command 0x%02X: capsule %u + %u bytes does not fit the PDU buffer",
-                   (unsigned)opcode, (unsigned)pdo, (unsigned)inBytes);
+                   (unsigned)opcode, (unsigned)pdo, (unsigned)capsuleBytes);
         return STATUS_INVALID_BUFFER_SIZE;
     }
-    NvtcpkBuildCapsule(c, sqe, pdo, inData, inBytes);
-    total = pdo + inBytes;
+    NvtcpkBuildCapsule(c, sqe, pdo, inData, capsuleBytes);
+    total = pdo + capsuleBytes;
 
     {   /* TEMPORARY: remember this command for the failure dump. */
         NVMEOF_TCPK_DIAG* dg = &g_diagRing[g_diagAt & 7u];
@@ -1617,17 +1670,26 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
             /* The new handshake may have negotiated a different capsule data offset,
              * so pdo and total are recomputed rather than carried over. */
             pdo = nvmeofTcpPduTotal(NVMEOF_TCP_CCMD_HDR_LEN, 0, c->cpda);
-            total = pdo + inBytes;
-            if (pdo + inBytes > NVMEOF_TCPK_BUF_BYTES) {
+            total = pdo + capsuleBytes;
+            if (pdo + capsuleBytes > NVMEOF_TCPK_BUF_BYTES) {
                 st = STATUS_INVALID_BUFFER_SIZE;
             } else {
-                NvtcpkBuildCapsule(c, sqe, pdo, inData, inBytes);
+                NvtcpkBuildCapsule(c, sqe, pdo, inData, capsuleBytes);
                 st = NvtcpkSend(c, total);
             }
             if (!NT_SUCCESS(st)) {
                 NvtcpkLogF("command 0x%02X cid=%u: resend after the reconnect also failed 0x%08X %s",
                            (unsigned)opcode, (unsigned)cid, (unsigned)st, NvtcpkStatusName(st));
             }
+        }
+    }
+    if (NT_SUCCESS(st) && bigWrite) {
+        st = NvtcpkSendDataPdus(c, cid, inData, inBytes);
+        if (!NT_SUCCESS(st)) {
+            /* The capsule is already on the wire and the target is waiting for the
+             * rest of the payload, so this stream can never be back in step.  A
+             * reconnect (which replaces the socket) is the only repair. */
+            c->broken = TRUE;
         }
     }
     if (!NT_SUCCESS(st)) {
@@ -1829,11 +1891,11 @@ static NTSTATUS NvtcpkCommandEx(PVOID conn, UINT8 opcode, UINT32 nsid, UINT32 cd
         *dataLenOut = 0;
     }
 
-    /* 4096 is the in-capsule ceiling; anything larger needs H2CData/C2HData with
-     * an R2T exchange, and saying so is better than truncating. */
-    if (inBytes > NVMEOF_TCPK_MAX_DATA || outBytes > NVMEOF_TCPK_MAX_DATA) {
-        NvtcpkLogF("command 0x%02X: %u in / %u out exceeds the %u-byte in-capsule limit",
-                   (unsigned)opcode, inBytes, outBytes, (unsigned)NVMEOF_TCPK_MAX_DATA);
+    /* Up to one capsule payload rides in the capsule; more moves as C2HData/H2CData
+     * PDUs.  R2T pacing is not implemented (the ICReq advertises maxr2t = 0). */
+    if (inBytes > NVMEOF_TCPK_IO_MAX || outBytes > NVMEOF_TCPK_IO_MAX) {
+        NvtcpkLogF("command 0x%02X: %u in / %u out exceeds the %u-byte per-command limit",
+                   (unsigned)opcode, inBytes, outBytes, (unsigned)NVMEOF_TCPK_IO_MAX);
         return STATUS_INVALID_BUFFER_SIZE;
     }
     if ((inBytes != 0 && inData == NULL) || (outBytes != 0 && outData == NULL)) {

@@ -355,6 +355,7 @@ typedef struct _NVMEOFND_ENGINE {
     PVOID           IdBuf;        // 4096-byte non-paged Identify buffer
     ULONG           Blocks;       // NSZE from Identify CNS=0
     ULONG           BlockBytes;
+    ULONG           ChunkBytes;   // bytes per NVMe READ/WRITE (nvmeofnd_chunkkb, default 4 KiB)
     ULONG           CmdOk;        // NVMe commands answered with status 0
     ULONG           CmdNvmeErr;   // NVMe commands answered with a non-zero status
     ULONG           CmdTransportErr;
@@ -485,8 +486,8 @@ static NTSTATUS NvmeofndTransportRw(PNVMEOFND_ENGINE Eng, BOOLEAN IsRead, ULONG 
         UINT8  status = 0xFF;
         NTSTATUS st;
 
-        if (chunk > NVMEOFND_CHUNK_BYTES) {
-            chunk = NVMEOFND_CHUNK_BYTES;
+        if (chunk > Eng->ChunkBytes) {
+            chunk = Eng->ChunkBytes;
         }
         if ((chunk % NVMEOFND_BLOCK_BYTES) != 0) {
             // A partial block cannot be expressed as an NLB; this would be a bug
@@ -705,6 +706,45 @@ static NTSTATUS NvmeofndStartWorker(PNVMEOFND_ENGINE Eng)
     return STATUS_SUCCESS;
 }
 
+// How many bytes one NVMe READ/WRITE moves.  4 KiB is the old in-capsule
+// behaviour and stays the default, so a boot with the new driver is identical to
+// the one before it.  nvmeofnd_chunkkb = 64 makes one command cover a 64 KiB
+// transfer, whose payload the transport then moves as H2CData/C2HData PDUs.
+// Read at engine attach, which HwInitialize calls: a device restart picks up a
+// new value without unloading the driver.
+#define NVMEOFND_CHUNK_MIN      4096u
+#define NVMEOFND_CHUNK_MAX      (128u * 1024u)
+
+static ULONG NvmeofndReadChunkBytes(VOID)
+{
+    UNICODE_STRING keyName, valueName;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE key = NULL;
+    UCHAR buf[24];
+    ULONG len = sizeof(buf);
+    ULONG kb = 4;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return NVMEOFND_CHUNK_MIN;
+    }
+    RtlInitUnicodeString(&keyName, L"\\Registry\\Machine\\Software\\NVMeoFProbe");
+    InitializeObjectAttributes(&oa, &keyName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &oa))) {
+        RtlInitUnicodeString(&valueName, L"nvmeofnd_chunkkb");
+        if (NT_SUCCESS(ZwQueryValueKey(key, &valueName, KeyValuePartialInformation, buf,
+                                       sizeof(buf), &len))) {
+            KEY_VALUE_PARTIAL_INFORMATION* p = (KEY_VALUE_PARTIAL_INFORMATION*)buf;
+            if (p->Type == REG_DWORD && p->DataLength == sizeof(ULONG)) {
+                kb = *(ULONG*)p->Data;
+            }
+        }
+        ZwClose(key);
+    }
+    if (kb < 4)   { kb = 4; }
+    if (kb > 128) { kb = 128; }
+    return kb * 1024u;
+}
+
 // Idempotent: HwInitialize calls it once, and a device restart finds the engine
 // already built and simply reuses it.
 static NTSTATUS NvmeofndEngineAttach(PNVMEOFND_EXTENSION Ext)
@@ -747,6 +787,11 @@ static NTSTATUS NvmeofndEngineAttach(PNVMEOFND_EXTENSION Ext)
     if (!NT_SUCCESS(st)) {
         return st;
     }
+
+    // Re-read on every attach: a device restart is how a new chunk size is applied.
+    g_engine->ChunkBytes = NvmeofndReadChunkBytes();
+    NvmeofndLogF("command size: %u bytes per NVMe READ/WRITE (nvmeofnd_chunkkb=%u)",
+                 g_engine->ChunkBytes, g_engine->ChunkBytes / 1024u);
 
     Ext->Eng        = g_engine;
     Ext->Blocks     = g_engine->Blocks;
