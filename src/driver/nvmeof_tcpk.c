@@ -1,4 +1,4 @@
-﻿/* SPDX-FileCopyrightText: 2026 Dingtaiqi
+/* SPDX-FileCopyrightText: 2026 Dingtaiqi
  * SPDX-License-Identifier: Apache-2.0
  *
  * nvmeof_tcpk.c - the NVMe/TCP transport client, in kernel mode, over WSK.
@@ -185,6 +185,18 @@ static char   g_log[8192];
 static size_t g_logLen = 0;
 static ULONG  g_logDropped = 0;
 
+/* Several worker threads log at once once nvmeofnd_queues > 1; without this the
+ * byte-at-a-time appends interleave and every line is garbage. */
+static KSPIN_LOCK g_logLock;
+static LONG       g_logLockInit = 0;
+
+static void NvtcpkLogLockInit(void)
+{
+    if (InterlockedCompareExchange(&g_logLockInit, 1, 0) == 0) {
+        KeInitializeSpinLock(&g_logLock);
+    }
+}
+
 /*  Never refuse the NEW bytes.  The old behaviour was: once the 8 KiB filled up, every
  *  later line was counted as dropped and thrown away - so a long session lost exactly
  *  the late failures the log exists for.  When there is no room, discard the OLDEST
@@ -234,6 +246,10 @@ static void NvtcpkLogNum(unsigned long long v, int base, int width, int upper, i
 static void NvtcpkLogF(const char* fmt, ...)
 {
     va_list ap;
+    KIRQL irql;
+
+    NvtcpkLogLockInit();
+    KeAcquireSpinLock(&g_logLock, &irql);
     va_start(ap, fmt);
     for (const char* p = fmt; *p != 0; p++) {
         int width = 0, padZero = 0, longs = 0;
@@ -292,6 +308,7 @@ static void NvtcpkLogF(const char* fmt, ...)
     }
     va_end(ap);
     NvtcpkLogRaw("\r\n", 2);
+    KeReleaseSpinLock(&g_logLock, irql);
 }
 
 /* Publish the buffer.  Registry calls are PASSIVE_LEVEL only, so a flush from a
@@ -2155,6 +2172,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NvtcpkTraceValue(L"nvtcpk_loaded", 1);
     return STATUS_SUCCESS;
 }
+
 
 
 

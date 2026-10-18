@@ -10,7 +10,7 @@
 # port and never touches the live target).
 
 param(
-    [string]$DriverHash  = '1993A985D8B20EE6AA5D34D380AF252DD98EAE317D85AA415BC5F9E9729BF4FA',
+    [string]$DriverHash  = 'BDF0027B8D6A27881E13BD97447D8E9EE726D83772CBFD4565F3DE5594ED0F97',
     [string]$TargetHash  = 'E542194932614A6E8794E767A88B8FA52916D349F16112BB3C3D65AFFDD36D32',
     [string]$BridgeHash  = '275E1138894E83BF908CB59AE16885BD3C164C6C5880D68C3430F2587B363F7B',
     [string]$NsImageHash = 'E7180E162618C3FB00ACC3AE0EB1DB619470F5D35125496BC00D307473975DBE',
@@ -86,6 +86,7 @@ if (Test-Path $selftest) {
 Write-Output "`n================================================"
 Write-Output ('failures: ' + $script:fail)
 exit $script:fail
+
 
 
 

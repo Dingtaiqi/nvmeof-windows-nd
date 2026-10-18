@@ -351,7 +351,8 @@ typedef struct _NVMEOFND_ENGINE {
     ULONG           Count;
     volatile LONG   Stop;         // never set in practice; checked by the worker
     BOOLEAN         ThreadStarted;
-    PVOID           Conn;         // NVTCP connection (NvtcpOpen result)
+    ULONG           Queues;       // connections/worker threads actually open (1..MAX)
+    PVOID           Conn[4];      // one NVTCP connection per queue
     PVOID           IdBuf;        // 4096-byte non-paged Identify buffer
     ULONG           Blocks;       // NSZE from Identify CNS=0
     ULONG           BlockBytes;
@@ -397,7 +398,7 @@ static BOOLEAN             g_registered = FALSE;
 static BOOLEAN             g_npiCaptured = FALSE;
 static PNVMEOFND_ENGINE    g_engine = NULL;
 
-static VOID NvmeofndProcessOne(PNVMEOFND_ENGINE Eng, PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb);
+static VOID NvmeofndProcessOne(PNVMEOFND_ENGINE Eng, PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb, PVOID Conn);
 static NTSTATUS NvmeofndEngineAttach(PNVMEOFND_EXTENSION Ext);
 
 // ---------------------------------------------------------------------------
@@ -505,7 +506,7 @@ static VOID NvmeofndRefreshChunk(PNVMEOFND_ENGINE Eng)
     }
 }
 
-static NTSTATUS NvmeofndTransportRw(PNVMEOFND_ENGINE Eng, BOOLEAN IsRead, ULONG Lba,
+static NTSTATUS NvmeofndTransportRw(PNVMEOFND_ENGINE Eng, PVOID Conn, BOOLEAN IsRead, ULONG Lba,
                                     PUCHAR Buf, ULONG Bytes, UCHAR* NvmeStatus,
                                     ULONG* Done)
 {
@@ -533,7 +534,7 @@ static NTSTATUS NvmeofndTransportRw(PNVMEOFND_ENGINE Eng, BOOLEAN IsRead, ULONG 
         blocks = chunk / NVMEOFND_BLOCK_BYTES;
         cdw12  = (blocks - 1) & 0xFFFFu;
 
-        st = NvtcpCommand(Eng->Conn,
+        st = NvtcpCommand(Conn,
                           IsRead ? NVMEOF_TCPK_OPC_READ : NVMEOF_TCPK_OPC_WRITE,
                           NVMEOFND_NSID,
                           Lba + (off / NVMEOFND_BLOCK_BYTES),
@@ -602,11 +603,11 @@ static NTSTATUS NvmeofndConnect(PNVMEOFND_ENGINE Eng, PULONG OutBlocks)
     if (!NT_SUCCESS(st)) {
         return st;
     }
-    Eng->Conn = conn;
+    Eng->Conn[0] = conn;
 
     // CNS=1, nsid 0: the controller.  Its model/serial fields are worth logging
     // before the same buffer is overwritten by the namespace Identify below.
-    st = NvtcpIdentify(Eng->Conn, NVMEOF_TCPK_CNS_CONTROLLER, 0, Eng->IdBuf);
+    st = NvtcpIdentify(conn, NVMEOF_TCPK_CNS_CONTROLLER, 0, Eng->IdBuf);
     NvmeofndTrace(L"TraceIdentifyCtl", (ULONG)st);
     NvmeofndLogF("NvtcpIdentify(cns=1, nsid=0) = 0x%08X", (unsigned)st);
     if (NT_SUCCESS(st)) {
@@ -628,7 +629,7 @@ static NTSTATUS NvmeofndConnect(PNVMEOFND_ENGINE Eng, PULONG OutBlocks)
     }
 
     // CNS=0, nsid 1: the namespace, which is where the real block count lives.
-    st = NvtcpIdentify(Eng->Conn, NVMEOF_TCPK_CNS_NAMESPACE, NVMEOFND_NSID, Eng->IdBuf);
+    st = NvtcpIdentify(conn, NVMEOF_TCPK_CNS_NAMESPACE, NVMEOFND_NSID, Eng->IdBuf);
     NvmeofndTrace(L"TraceIdentifyNs", (ULONG)st);
     NvmeofndLogF("NvtcpIdentify(cns=0, nsid=%u) = 0x%08X", (unsigned)NVMEOFND_NSID, (unsigned)st);
     NvmeofndLogFlush();
@@ -668,18 +669,30 @@ static NTSTATUS NvmeofndConnect(PNVMEOFND_ENGINE Eng, PULONG OutBlocks)
 fail:
     // Nothing else has used the connection yet, so closing it here is the clean
     // path the transport supports (no command in flight, no poisoned wait).
-    (void)NvtcpClose(Eng->Conn);
-    Eng->Conn = NULL;
+    (void)NvtcpClose(Eng->Conn[0]);
+    Eng->Conn[0] = NULL;
     return st;
 }
 
+typedef struct _NVMEOFND_WORKER_CTX {
+    PNVMEOFND_ENGINE Eng;
+    ULONG            Index;
+} NVMEOFND_WORKER_CTX, *PNVMEOFND_WORKER_CTX;
+
+// One worker per connection, and one slot per wake: that is what puts several
+// commands in flight.  A worker that drained the whole queue itself would keep
+// every command serialised no matter how many connections existed.
 static VOID NvmeofndWorker(PVOID Context)
 {
-    PNVMEOFND_ENGINE eng = (PNVMEOFND_ENGINE)Context;
+    PNVMEOFND_WORKER_CTX w = (PNVMEOFND_WORKER_CTX)Context;
+    PNVMEOFND_ENGINE eng = w->Eng;
+    PVOID conn = eng->Conn[w->Index];
 
     for (;;) {
         LARGE_INTEGER t;
-        BOOLEAN again = TRUE;
+        NVMEOFND_SLOT s = { NULL, NULL };
+        KIRQL irql;
+        BOOLEAN have = FALSE;
 
         t.QuadPart = -((LONGLONG)NVMEOFND_WAIT_MS * 10000);
         (void)KeWaitForSingleObject(&eng->Wake, Executive, KernelMode, FALSE, &t);
@@ -687,58 +700,72 @@ static VOID NvmeofndWorker(PVOID Context)
         if (InterlockedCompareExchange(&eng->Stop, 0, 0) != 0) {
             break;
         }
-        // Reset BEFORE draining: a push that happens during the drain then leaves
-        // the event signalled, so the next wait returns immediately and no
-        // request can sit in the queue behind an unsignalled event.
         KeResetEvent(&eng->Wake);
 
-        while (again) {
-            NVMEOFND_SLOT s = { NULL, NULL };
-            KIRQL irql;
-            BOOLEAN have = FALSE;
-
-            KeAcquireSpinLock(&eng->Lock, &irql);
-            if (eng->Count != 0) {
-                s = eng->Slot[eng->Head];
-                eng->Head = (eng->Head + 1) % NVMEOFND_MAX_PENDING;
-                eng->Count--;
-                have = TRUE;
-            } else {
-                again = FALSE;
-            }
-            KeReleaseSpinLock(&eng->Lock, irql);
-
-            if (have) {
-                // NEVER under the spinlock: completion can call back into
-                // HwStartIo (StorPort may start the next request from here), and
-                // that path takes this same lock.
-                NvmeofndProcessOne(eng, s.Ext, s.Srb);
-            }
+        KeAcquireSpinLock(&eng->Lock, &irql);
+        if (eng->Count != 0) {
+            s = eng->Slot[eng->Head];
+            eng->Head = (eng->Head + 1) % NVMEOFND_MAX_PENDING;
+            eng->Count--;
+            have = TRUE;
         }
-        again = TRUE;
+        KeReleaseSpinLock(&eng->Lock, irql);
+
+        if (have) {
+            // NEVER under the spinlock: completion can call back into HwStartIo
+            // (StorPort may start the next request from here), and that path
+            // takes this same lock.
+            NvmeofndProcessOne(eng, s.Ext, s.Srb, conn);
+        }
+        // More work waiting: wake somebody (possibly this thread again) rather
+        // than leave a slot stranded behind an unsignalled event.
+        if (InterlockedCompareExchange((volatile LONG*)&eng->Count, 0, 0) != 0) {
+            KeSetEvent(&eng->Wake, IO_NO_INCREMENT, FALSE);
+        }
     }
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 static NTSTATUS NvmeofndStartWorker(PNVMEOFND_ENGINE Eng)
 {
-    NTSTATUS st;
-    HANDLE hThread = NULL;
+    ULONG i;
 
     if (Eng->ThreadStarted) {
         return STATUS_SUCCESS;
     }
-    st = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS, NULL, NULL, NULL,
-                              NvmeofndWorker, Eng);
-    NvmeofndTrace(L"TraceWorkerCreate", (ULONG)st);
-    NvmeofndLogF("PsCreateSystemThread(worker) = 0x%08X", (unsigned)st);
-    if (!NT_SUCCESS(st)) {
-        return st;
+    if (Eng->Queues == 0) {
+        Eng->Queues = 1;
     }
-    // The thread owns its own reference once created; the handle is not needed
-    // (and must not be waited on, because this driver is never unloaded).
-    ZwClose(hThread);
+    for (i = 0; i < Eng->Queues; i++) {
+        PNVMEOFND_WORKER_CTX ctx;
+        HANDLE hThread = NULL;
+        NTSTATUS st;
+
+        ctx = (PNVMEOFND_WORKER_CTX)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*ctx),
+                                                    NVMEOFND_TAG);
+        if (ctx == NULL) {
+            break;
+        }
+        ctx->Eng = Eng;
+        ctx->Index = i;
+        st = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+                                  NvmeofndWorker, ctx);
+        NvmeofndLogF("PsCreateSystemThread(worker %u) = 0x%08X", i, (unsigned)st);
+        if (!NT_SUCCESS(st)) {
+            ExFreePoolWithTag(ctx, NVMEOFND_TAG);
+            break;
+        }
+        // The thread owns its own reference once created; the handle is not needed
+        // (and must not be waited on, because this driver is never unloaded).
+        ZwClose(hThread);
+    }
+    NvmeofndTrace(L"TraceWorkerCreate", i);
+    if (i == 0) {
+        return STATUS_UNSUCCESSFUL;
+    }
+    Eng->Queues = i;
     Eng->ThreadStarted = TRUE;
+    NvmeofndLogF("worker threads started: %u connection(s) in flight", i);
     return STATUS_SUCCESS;
 }
 
@@ -750,6 +777,7 @@ static NTSTATUS NvmeofndStartWorker(PNVMEOFND_ENGINE Eng)
 // new value without unloading the driver.
 #define NVMEOFND_CHUNK_MIN      4096u
 #define NVMEOFND_CHUNK_MAX      (512u * 1024u)
+#define NVMEOFND_MAX_QUEUES     4u
 
 static ULONG NvmeofndReadChunkBytes(VOID)
 {
@@ -777,8 +805,42 @@ static ULONG NvmeofndReadChunkBytes(VOID)
         ZwClose(key);
     }
     if (kb < 4)   { kb = 4; }
-    if (kb > 128) { kb = 128; }
+    if (kb > (NVMEOFND_CHUNK_MAX / 1024u)) { kb = (NVMEOFND_CHUNK_MAX / 1024u); }
     return kb * 1024u;
+}
+
+// How many connections (and worker threads) to use.  Default 1 keeps the old
+// single-command-at-a-time behaviour; nvmeofnd_queues = 4 puts four commands in
+// flight on four connections.  Read at attach like the chunk size, so the value
+// is changed by a reboot (never by restarting the device: that is the 0xCE).
+static ULONG NvmeofndReadQueues(VOID)
+{
+    UNICODE_STRING keyName, valueName;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE key = NULL;
+    UCHAR buf[24];
+    ULONG len = sizeof(buf);
+    ULONG q = 1;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return 1;
+    }
+    RtlInitUnicodeString(&keyName, L"\\Registry\\Machine\\Software\\NVMeoFProbe");
+    InitializeObjectAttributes(&oa, &keyName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &oa))) {
+        RtlInitUnicodeString(&valueName, L"nvmeofnd_queues");
+        if (NT_SUCCESS(ZwQueryValueKey(key, &valueName, KeyValuePartialInformation, buf,
+                                       sizeof(buf), &len))) {
+            KEY_VALUE_PARTIAL_INFORMATION* p = (KEY_VALUE_PARTIAL_INFORMATION*)buf;
+            if (p->Type == REG_DWORD && p->DataLength == sizeof(ULONG)) {
+                q = *(ULONG*)p->Data;
+            }
+        }
+        ZwClose(key);
+    }
+    if (q < 1) { q = 1; }
+    if (q > NVMEOFND_MAX_QUEUES) { q = NVMEOFND_MAX_QUEUES; }
+    return q;
 }
 
 // Idempotent: HwInitialize calls it once, and a device restart finds the engine
@@ -810,14 +872,39 @@ static NTSTATUS NvmeofndEngineAttach(PNVMEOFND_EXTENSION Ext)
                      eng, (unsigned)NVMEOFND_MAX_PENDING);
     }
 
-    if (g_engine->Conn == NULL) {
+    if (g_engine->Conn[0] == NULL) {
         st = NvmeofndConnect(g_engine, &blocks);
         if (!NT_SUCCESS(st)) {
             return st;
         }
     } else {
-        NvmeofndLogF("connection already open (%p): reusing it", g_engine->Conn);
+        NvmeofndLogF("connection already open (%p): reusing it", g_engine->Conn[0]);
     }
+
+    // Extra connections = extra commands in flight.  Each one is a separate
+    // NVMe/TCP connection, which is exactly how the standard expresses multiple
+    // queues; the target already serves each connection in its own thread.
+    g_engine->Queues = NvmeofndReadQueues();
+    {
+        ULONG i;
+        for (i = 1; i < g_engine->Queues; i++) {
+            PVOID extra = NULL;
+            if (g_engine->Conn[i] != NULL) {
+                continue;
+            }
+            st = NvtcpOpen(&g_registration, &g_wskProvider, NVMEOFND_TARGET_IPV4,
+                           (USHORT)NVMEOFND_TARGET_PORT, &extra);
+            if (!NT_SUCCESS(st)) {
+                NvmeofndLogF("extra connection %u/%u failed 0x%08X; keeping %u queue(s)",
+                             i, g_engine->Queues, (unsigned)st, i);
+                g_engine->Queues = i;
+                break;
+            }
+            g_engine->Conn[i] = extra;
+        }
+    }
+    NvmeofndLogF("queues: %u connection(s) -> up to %u commands in flight",
+                 g_engine->Queues, g_engine->Queues);
 
     st = NvmeofndStartWorker(g_engine);
     if (!NT_SUCCESS(st)) {
@@ -892,7 +979,7 @@ static VOID NvmeofndPublishStats(PVOID DeviceExtension)
 //  key rather than a bare failure, because a host that gets a bare failure
 //  retries forever.
 // ---------------------------------------------------------------------------
-static VOID NvmeofndProcessOne(PNVMEOFND_ENGINE Eng, PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
+static VOID NvmeofndProcessOne(PNVMEOFND_ENGINE Eng, PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb, PVOID Conn)
 {
     PNVMEOFND_EXTENSION ext = (PNVMEOFND_EXTENSION)DeviceExtension;
     PUCHAR cdb;
@@ -912,7 +999,7 @@ static VOID NvmeofndProcessOne(PNVMEOFND_ENGINE Eng, PVOID DeviceExtension, PSCS
         NvmeofndComplete(DeviceExtension, Srb, SRB_STATUS_INVALID_REQUEST);
         return;
     }
-    if (!ext->Ready || Eng == NULL || Eng->Conn == NULL) {
+    if (!ext->Ready || Eng == NULL || Eng->Conn[0] == NULL) {
         // Bringing the adapter up failed, or the connection is gone.  Say "not
         // ready, initialisation required" (0x02/0x04/0x02): the host retries
         // instead of deciding the disk is broken or zero-sized.
@@ -1126,7 +1213,7 @@ static VOID NvmeofndProcessOne(PNVMEOFND_ENGINE Eng, PVOID DeviceExtension, PSCS
             return;
         }
 
-        st = NvmeofndTransportRw(Eng, isRead, lba, (PUCHAR)buffer, bytes, &nvmeStatus, &done);
+        st = NvmeofndTransportRw(Eng, Conn, isRead, lba, (PUCHAR)buffer, bytes, &nvmeStatus, &done);
         if (!NT_SUCCESS(st)) {
             ext->TransportErrors++;
             NvmeofndLogF("!! %s lba=%u blocks=%u bytes=%u: transport 0x%08X nvme_status=0x%02X"
@@ -1168,7 +1255,7 @@ static VOID NvmeofndProcessOne(PNVMEOFND_ENGINE Eng, PVOID DeviceExtension, PSCS
         // failed NVMe Flush cannot lose data that was acknowledged.  A flush that
         // the target does not implement must not fail the volume.
         UCHAR status = 0xFF;
-        NTSTATUS st = NvtcpCommand(Eng->Conn, NVMEOF_TCPK_OPC_FLUSH, NVMEOFND_NSID,
+        NTSTATUS st = NvtcpCommand(Conn, NVMEOF_TCPK_OPC_FLUSH, NVMEOFND_NSID,
                                    0, 0, NULL, 0, NULL, 0, &status);
         if (!NT_SUCCESS(st) || status != 0) {
             NvmeofndLogF("SYNC CACHE: NVMe Flush returned 0x%08X status 0x%02X"
@@ -1523,4 +1610,8 @@ NTSTATUS DriverEntry(PVOID DriverObject, PVOID RegistryPath)
     }
     return st;
 }
+
+
+
+
 
