@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿// SPDX-FileCopyrightText: 2026 Dingtaiqi
 // SPDX-License-Identifier: Apache-2.0
 //
 // ===========================================================================
@@ -749,7 +749,7 @@ static NTSTATUS NvmeofndStartWorker(PNVMEOFND_ENGINE Eng)
 // Read at engine attach, which HwInitialize calls: a device restart picks up a
 // new value without unloading the driver.
 #define NVMEOFND_CHUNK_MIN      4096u
-#define NVMEOFND_CHUNK_MAX      (128u * 1024u)
+#define NVMEOFND_CHUNK_MAX      (512u * 1024u)
 
 static ULONG NvmeofndReadChunkBytes(VOID)
 {
@@ -1523,3 +1523,4 @@ NTSTATUS DriverEntry(PVOID DriverObject, PVOID RegistryPath)
     }
     return st;
 }
+
