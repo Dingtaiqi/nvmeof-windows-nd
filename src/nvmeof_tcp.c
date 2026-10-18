@@ -96,35 +96,39 @@ static uint8_t  cqeStatus(const uint8_t* c) { return (uint8_t)((nvmeofTcpGet32(c
 
 typedef struct {
     uint8_t* ram;
-    FILE*    fp;
+    HANDLE   fh;                /* positional I/O: no shared file pointer */
     uint32_t blocks;
-    CRITICAL_SECTION lock;      /* the target serves several connections at once */
+    CRITICAL_SECTION lock;      /* only the RAM path needs it */
 } NS;
 
 static int nsOpen(NS* ns, const char* path, uint32_t blocks)
 {
     ns->ram = NULL;
-    ns->fp = NULL;
+    ns->fh = INVALID_HANDLE_VALUE;
     ns->blocks = blocks;
     InitializeCriticalSection(&ns->lock);
 
     if (path != NULL && path[0] != 0) {
-        ns->fp = fopen(path, "r+b");
-        if (ns->fp == NULL) {
-            ns->fp = fopen(path, "w+b");        /* create a fresh namespace */
-            if (ns->fp == NULL) { return -1; }
+        LARGE_INTEGER sz;
+        ns->fh = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL, NULL);
+        if (ns->fh == INVALID_HANDLE_VALUE) {
+            ns->fh = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL, NULL);
+            if (ns->fh == INVALID_HANDLE_VALUE) { return -1; }
             if (blocks > 0) {
                 /* Give it its full length immediately so reads past the end are not a
                  * special case: an unwritten block reads as zero, which is what a real
                  * namespace does. */
-                if (_fseeki64(ns->fp, (__int64)blocks * BLOCK_SIZE - 1, SEEK_SET) != 0) { return -2; }
-                fputc(0, ns->fp);
-                fflush(ns->fp);
+                sz.QuadPart = (LONGLONG)blocks * BLOCK_SIZE;
+                if (!SetFilePointerEx(ns->fh, sz, NULL, FILE_BEGIN) || !SetEndOfFile(ns->fh)) {
+                    return -2;
+                }
             }
-        } else {
-            __int64 sz = _fseeki64(ns->fp, 0, SEEK_END);
-            _fseeki64(ns->fp, 0, SEEK_SET);
-            if (sz > 0) { ns->blocks = (uint32_t)(sz / BLOCK_SIZE); }
+        } else if (GetFileSizeEx(ns->fh, &sz) && sz.QuadPart > 0) {
+            ns->blocks = (uint32_t)(sz.QuadPart / BLOCK_SIZE);
         }
         return 0;
     }
@@ -132,17 +136,25 @@ static int nsOpen(NS* ns, const char* path, uint32_t blocks)
     return ns->ram ? 0 : -3;
 }
 
+/* Positional I/O on purpose: the old stdio FILE* has one internal lock, so the four
+ * target threads (one per connection) shared one file pointer and every read
+ * serialised behind it.  An explicit offset on each call keeps them independent. */
 static int nsRead(NS* ns, uint32_t lba, uint32_t nblocks, uint8_t* out)
 {
     size_t len = (size_t)nblocks * BLOCK_SIZE;
     if (lba >= ns->blocks || lba + nblocks > ns->blocks) { return -1; }
-    EnterCriticalSection(&ns->lock);
-    if (ns->fp) {
-        _fseeki64(ns->fp, (__int64)lba * BLOCK_SIZE, SEEK_SET);
-        if (fread(out, 1, len, ns->fp) != len) { LeaveCriticalSection(&ns->lock); return -2; }
-    } else {
-        memcpy(out, ns->ram + (size_t)lba * BLOCK_SIZE, len);
+    if (ns->fh != INVALID_HANDLE_VALUE) {
+        OVERLAPPED ov;
+        DWORD done = 0;
+        uint64_t off = (uint64_t)lba * BLOCK_SIZE;
+        memset(&ov, 0, sizeof(ov));
+        ov.Offset = (DWORD)off;
+        ov.OffsetHigh = (DWORD)(off >> 32);
+        if (!ReadFile(ns->fh, out, (DWORD)len, &done, &ov) || done != (DWORD)len) { return -2; }
+        return 0;
     }
+    EnterCriticalSection(&ns->lock);
+    memcpy(out, ns->ram + (size_t)lba * BLOCK_SIZE, len);
     LeaveCriticalSection(&ns->lock);
     return 0;
 }
@@ -151,14 +163,18 @@ static int nsWrite(NS* ns, uint32_t lba, uint32_t nblocks, const uint8_t* in)
 {
     size_t len = (size_t)nblocks * BLOCK_SIZE;
     if (lba >= ns->blocks || lba + nblocks > ns->blocks) { return -1; }
-    EnterCriticalSection(&ns->lock);
-    if (ns->fp) {
-        _fseeki64(ns->fp, (__int64)lba * BLOCK_SIZE, SEEK_SET);
-        if (fwrite(in, 1, len, ns->fp) != len) { LeaveCriticalSection(&ns->lock); return -2; }
-        fflush(ns->fp);
-    } else {
-        memcpy(ns->ram + (size_t)lba * BLOCK_SIZE, in, len);
+    if (ns->fh != INVALID_HANDLE_VALUE) {
+        OVERLAPPED ov;
+        DWORD done = 0;
+        uint64_t off = (uint64_t)lba * BLOCK_SIZE;
+        memset(&ov, 0, sizeof(ov));
+        ov.Offset = (DWORD)off;
+        ov.OffsetHigh = (DWORD)(off >> 32);
+        if (!WriteFile(ns->fh, in, (DWORD)len, &done, &ov) || done != (DWORD)len) { return -2; }
+        return 0;
     }
+    EnterCriticalSection(&ns->lock);
+    memcpy(ns->ram + (size_t)lba * BLOCK_SIZE, in, len);
     LeaveCriticalSection(&ns->lock);
     return 0;
 }
@@ -276,12 +292,18 @@ static void fillIdentifyController(uint8_t* d, uint32_t blocks)
 static int sendC2HData(SOCKET s, uint16_t cid, const uint8_t* data, uint32_t len)
 {
     uint32_t off = 0;
-    uint8_t zero[4] = { 0, 0, 0, 0 };
+    uint8_t* pdu;
+    int rc = 0;
 
+    /* One send per PDU instead of two: the header and the payload go out in the
+     * same buffer, so a 62 KiB PDU is one send() and not a 24-byte send followed by
+     * a 62 KiB one (Nagle and two syscalls per PDU otherwise). */
+    pdu = (uint8_t*)malloc(NVMEOF_TCP_DATA_HDR_LEN + NVMEOF_TCP_IO_CHUNK + 4);
+    if (pdu == NULL) { return -1; }
     while (off < len) {
         NVMEOF_TCP_DATA d;
-        uint8_t hdr[NVMEOF_TCP_DATA_HDR_LEN];
         uint32_t chunk = len - off;
+        uint32_t total;
         unsigned pad;
 
         if (chunk > NVMEOF_TCP_IO_CHUNK) { chunk = NVMEOF_TCP_IO_CHUNK; }
@@ -290,15 +312,17 @@ static int sendC2HData(SOCKET s, uint16_t cid, const uint8_t* data, uint32_t len
         d.ttag = 0;
         d.datao = off;
         d.datal = chunk;
-        nvmeofTcpBuildData(hdr, NVMEOF_TCP_C2HDATA,
+        nvmeofTcpBuildData(pdu, NVMEOF_TCP_C2HDATA,
                            (off + chunk == len) ? NVMEOF_TCP_F_LAST : 0, &d);
-        if (sendAll(s, hdr, (int)sizeof(hdr)) != (int)sizeof(hdr)) { return -1; }
-        if (sendAll(s, data + off, (int)chunk) != (int)chunk) { return -1; }
+        memcpy(pdu + NVMEOF_TCP_DATA_HDR_LEN, data + off, chunk);
         pad = (unsigned)((NVMEOF_TCP_PDU_ALIGN - (chunk % NVMEOF_TCP_PDU_ALIGN)) % NVMEOF_TCP_PDU_ALIGN);
-        if (pad != 0 && sendAll(s, zero, (int)pad) != (int)pad) { return -1; }
+        if (pad != 0) { memset(pdu + NVMEOF_TCP_DATA_HDR_LEN + chunk, 0, pad); }
+        total = NVMEOF_TCP_DATA_HDR_LEN + chunk + pad;
+        if (sendAll(s, pdu, (int)total) != (int)total) { rc = -1; break; }
         off += chunk;
     }
-    return 0;
+    free(pdu);
+    return rc;
 }
 
 /* Read exactly len bytes of H2CData for this command into buf.  Any malformed PDU means
@@ -810,5 +834,6 @@ static int recvDataPdus(SOCKET s, uint8_t* out, unsigned cap, unsigned align, un
     *gotOut = got;
     return (int)got;
 }
+
 
 

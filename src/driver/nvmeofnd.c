@@ -352,7 +352,7 @@ typedef struct _NVMEOFND_ENGINE {
     volatile LONG   Stop;         // never set in practice; checked by the worker
     BOOLEAN         ThreadStarted;
     ULONG           Queues;       // connections/worker threads actually open (1..MAX)
-    PVOID           Conn[4];      // one NVTCP connection per queue
+    PVOID           Conn[8];      // one NVTCP connection per queue
     PVOID           IdBuf;        // 4096-byte non-paged Identify buffer
     ULONG           Blocks;       // NSZE from Identify CNS=0
     ULONG           BlockBytes;
@@ -777,7 +777,7 @@ static NTSTATUS NvmeofndStartWorker(PNVMEOFND_ENGINE Eng)
 // new value without unloading the driver.
 #define NVMEOFND_CHUNK_MIN      4096u
 #define NVMEOFND_CHUNK_MAX      (512u * 1024u)
-#define NVMEOFND_MAX_QUEUES     4u
+#define NVMEOFND_MAX_QUEUES     8u
 
 static ULONG NvmeofndReadChunkBytes(VOID)
 {
@@ -1610,6 +1610,7 @@ NTSTATUS DriverEntry(PVOID DriverObject, PVOID RegistryPath)
     }
     return st;
 }
+
 
 
 
