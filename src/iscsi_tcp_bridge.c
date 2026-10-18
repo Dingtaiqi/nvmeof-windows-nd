@@ -733,10 +733,10 @@ static int nvmSendDataPdus(NVM* h, uint16_t cid, const uint8_t* in, unsigned len
     return 0;
 }
 
-static int nvmReadDataPdus(NVM* h, uint16_t cid, uint8_t* out, unsigned want)
+static int nvmReadDataPdus(NVM* h, uint16_t cid, uint8_t* out, unsigned want, unsigned have0)
 {
     uint8_t zero[4];
-    unsigned have = 0;
+    unsigned have = have0;
 
     while (have < want) {
         NVMEOF_TCP_HDR hh;
@@ -791,20 +791,51 @@ static int nvmCmd(NVM* h, uint8_t opcode, uint32_t nsid, uint32_t cdw10, uint32_
         if (nvmSendDataPdus(h, cid, inData, inLen) != 0) { return -2; }
     }
 
-    if (recvAll(h->sock, hdr, 8) != 1) { return -3; }
-    nvmeofTcpReadHdr(hdr, &hh);
-    if (hh.type != NVMEOF_TCP_CAPSULERESP) { return -4; }
-    if (recvAll(h->sock, cqe, 16) != 1) { return -5; }
-    if (hh.plen > outCap) { return -6; }
-    if (hh.plen != 0) {
-        if (outData == NULL) { return -7; }
-        if (recvAll(h->sock, outData, (int)hh.plen) != 1) { return -8; }
-    }
-    if (outLen != NULL) { *outLen = hh.plen; }
-    if (bigRead && hh.plen == 0 && (hh.flags & NVMEOF_TCP_F_SUCCESS) != 0) {
-        /* A successful big read carries no data in the capsule: it follows as C2HData. */
-        if (nvmReadDataPdus(h, cid, outData, outCap) != 0) { return -9; }
-        if (outLen != NULL) { *outLen = outCap; }
+    {
+        uint8_t zero[4] = { 0, 0, 0, 0 };
+        unsigned wire = 0;
+
+        /* Data PDUs may arrive before the completion (spec order, and what the target
+         * does since 2026-10-18) or after it (what it used to do).  Accept both: read
+         * until the CapsuleResp is in hand, then finish any remaining data PDUs. */
+        for (;;) {
+            if (recvAll(h->sock, hdr, 8) != 1) { return -3; }
+            nvmeofTcpReadHdr(hdr, &hh);
+            if (hh.type == NVMEOF_TCP_C2HDATA) {
+                NVMEOF_TCP_DATA d;
+                uint8_t dh[NVMEOF_TCP_DATA_HDR_LEN];
+                unsigned pad;
+
+                if (hh.hlen != NVMEOF_TCP_DATA_HDR_LEN) { say("  [nvme] bad C2HData hlen=%u flags=0x%02X\n", (unsigned)hh.hlen, (unsigned)hh.flags); return -4; }
+                memcpy(dh, hdr, 8);
+                if (recvAll(h->sock, dh + 8, (int)(hh.hlen - 8)) != 1) { return -5; }
+                nvmeofTcpReadData(dh, &d);
+                if (d.cccid != cid || d.datal == 0) { say("  [nvme] bad C2HData cccid=%u cid=%u datal=%u\n", (unsigned)d.cccid, (unsigned)cid, (unsigned)d.datal); return -4; }
+                if (outData == NULL || (uint64_t)d.datao + (uint64_t)d.datal > (uint64_t)outCap) { say("  [nvme] C2HData range %u+%u > %u\n", (unsigned)d.datao, (unsigned)d.datal, outCap);
+                    return -4;
+                }
+                if (recvAll(h->sock, outData + d.datao, (int)d.datal) != 1) { return -5; }
+                pad = (unsigned)((NVMEOF_TCP_PDU_ALIGN - (d.datal % NVMEOF_TCP_PDU_ALIGN)) % NVMEOF_TCP_PDU_ALIGN);
+                if (pad != 0 && recvAll(h->sock, zero, (int)pad) != 1) { return -5; }
+                wire += d.datal;
+                if (outLen != NULL) { *outLen = wire; }
+                continue;
+            }
+            if (hh.type != NVMEOF_TCP_CAPSULERESP) { say("  [nvme] unexpected PDU type 0x%02X hlen=%u plen=%u\n", (unsigned)hh.type, (unsigned)hh.hlen, (unsigned)hh.plen); return -4; }
+            break;
+        }
+        if (recvAll(h->sock, cqe, 16) != 1) { return -5; }
+        if (hh.plen > outCap) { return -6; }
+        if (hh.plen != 0) {
+            if (outData == NULL) { return -7; }
+            if (recvAll(h->sock, outData, (int)hh.plen) != 1) { return -8; }
+        }
+        if (outLen != NULL) { *outLen = (wire > hh.plen) ? wire : hh.plen; }
+        if (bigRead && hh.plen == 0 && (hh.flags & NVMEOF_TCP_F_SUCCESS) != 0 && wire < outCap) {
+            /* The completion came first and the tail is still on the wire. */
+            if (nvmReadDataPdus(h, cid, outData, outCap, wire) != 0) { return -9; }
+            if (outLen != NULL) { *outLen = outCap; }
+        }
     }
     if (statusOut != NULL) {
         /* The SUCCESS flag in the capsule header is authoritative: the target in nvmeof_tcp.c
@@ -2597,7 +2628,12 @@ static void testBridgeLoopback(void)
     if (!nvme.started) { return; }
     ok(waitPort(nvmePort, 15000) == 0, "the NVMe/TCP target is accepting connections");
 
-    exeSibling("iscsi_tcp_bridge.exe", exe, sizeof(exe));
+    /* Like the target above: use the side-by-side build when it exists, because the
+     * live iscsi_tcp_bridge.exe is locked by the process serving 3260. */
+    exeSibling("iscsi_tcp_bridge_new.exe", exe, sizeof(exe));
+    if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES) {
+        exeSibling("iscsi_tcp_bridge.exe", exe, sizeof(exe));
+    }
     snprintf(args, sizeof(args),
              "-listen 127.0.0.1 %u -target 127.0.0.1 %u -lun 0 %u",
              (unsigned)iscsiPort, (unsigned)nvmePort, 8192u);
@@ -2900,6 +2936,9 @@ int main(int argc, char** argv)
         return rc;
     }
 }
+
+
+
 
 
 

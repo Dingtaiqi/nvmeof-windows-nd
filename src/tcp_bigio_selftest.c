@@ -1,4 +1,4 @@
-﻿/* SPDX-FileCopyrightText: 2026 Dingtaiqi
+/* SPDX-FileCopyrightText: 2026 Dingtaiqi
  * SPDX-License-Identifier: Apache-2.0
  *
  * tcp_bigio_selftest.c - data larger than one capsule payload, against the REAL target.
@@ -188,6 +188,58 @@ static int receiveC2H(SOCKET s, uint16_t cid, uint8_t* out, uint32_t want)
     return have == want ? 0 : -1;
 }
 
+/* Read the result of a big Read in EITHER order: data PDUs first (spec order, what the
+ * target does since 2026-10-18) or the completion first (what it used to do).  A client
+ * that only knows one order is how the kernel transport corrupted Z:. */
+static int receiveRead(SOCKET s, uint16_t cid, uint8_t* out, uint32_t want, uint32_t* plenOut)
+{
+    uint32_t have = 0, plen = 0, sc = 0;
+    int gotResp = 0;
+    uint8_t zero[4];
+
+    while (!gotResp || have < want) {
+        uint8_t hdr[8];
+        NVMEOF_TCP_HDR h;
+
+        if (recvAll(s, hdr, 8) != 8) { return -1; }
+        nvmeofTcpReadHdr(hdr, &h);
+        if (h.type == NVMEOF_TCP_C2HDATA) {
+            uint8_t dh[NVMEOF_TCP_DATA_HDR_LEN];
+            NVMEOF_TCP_DATA d;
+            unsigned pad;
+
+            if (h.hlen != NVMEOF_TCP_DATA_HDR_LEN) { return -1; }
+            memcpy(dh, hdr, 8);
+            if (recvAll(s, dh + 8, (int)(h.hlen - 8)) != (int)(h.hlen - 8)) { return -1; }
+            nvmeofTcpReadData(dh, &d);
+            if (d.cccid != cid || d.datal == 0) { return -1; }
+            if ((uint64_t)d.datao + d.datal > want) { return -1; }
+            if (recvAll(s, out + d.datao, (int)d.datal) != (int)d.datal) { return -1; }
+            pad = (unsigned)((NVMEOF_TCP_PDU_ALIGN - (d.datal % NVMEOF_TCP_PDU_ALIGN)) % NVMEOF_TCP_PDU_ALIGN);
+            if (pad != 0 && recvAll(s, zero, (int)pad) != (int)pad) { return -1; }
+            have += d.datal;
+            continue;
+        }
+        if (h.type != NVMEOF_TCP_CAPSULERESP || h.hlen != NVMEOF_TCP_CRSP_HDR_LEN) { return -1; }
+        {
+            uint8_t cqe[16];
+            if (recvAll(s, cqe, 16) != 16) { return -1; }
+            if ((uint16_t)(nvmeofTcpGet32(cqe, 12) & 0xFFFF) != cid) { return -1; }
+            sc = (nvmeofTcpGet32(cqe, 12) >> 17) & 0xFF;
+        }
+        plen = h.plen;
+        if (plen != 0) {
+            if (plen > want) { return -1; }
+            if (recvAll(s, out, (int)plen) != (int)plen) { return -1; }
+            have += plen;
+        }
+        gotResp = 1;
+        if (sc != 0) { return -1; }
+    }
+    if (plenOut != NULL) { *plenOut = plen; }
+    return have == want ? 0 : -1;
+}
+
 static void testBigRead(SOCKET s, uint32_t lba, uint32_t nlb, uint16_t cid, const char* label)
 {
     uint8_t sqe[64];
@@ -202,11 +254,10 @@ static void testBigRead(SOCKET s, uint32_t lba, uint32_t nlb, uint16_t cid, cons
 
     buildSqe(sqe, 0x02 /* NVMe Read */, lba, nlb, cid);
     ok(sendCapsule(s, sqe) == 0, "host sends the Read capsule");
-    ok(readCapsuleResp(s, cid, &plen) == 0, "target completes the Read with success");
+    rc = receiveRead(s, cid, got, want, &plen);
+    ok(rc == 0, "target completes the Read successfully in either PDU order");
     ok(plen == 0, "a transfer over 4096 bytes puts no data in the capsule");
-    rc = receiveC2H(s, cid, got, want);
-    ok(rc == 0, "all bytes arrive as C2HData PDUs, LAST set on the final one");
-    ok(memcmp(got, g_ns + (size_t)lba * 512u, want) == 0,
+    ok(rc == 0 && memcmp(got, g_ns + (size_t)lba * 512u, want) == 0,
        "every byte matches the namespace model");
     free(got);
 }

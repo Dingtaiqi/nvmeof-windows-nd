@@ -1613,6 +1613,8 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
     UCHAR sqe[NVMEOF_TCP_SQE_LEN];
     ULONG pdo, total, plen = 0, pdus;
     ULONG capsuleBytes;
+    ULONG dataSeen = 0;
+    BOOLEAN expectTail = FALSE;
     USHORT cid;
     BOOLEAN gotResponse = FALSE;
     BOOLEAN bigWrite;
@@ -1810,6 +1812,18 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
                 return STATUS_INVALID_NETWORK_RESPONSE;
             }
             gotResponse = TRUE;
+            if (plen == 0 && outBytes > NVMEOF_TCPK_MAX_DATA && *statusOut == 0 &&
+                dataSeen < outBytes) {
+                /* The completion arrived before the data PDUs - the order this project's
+                 * target used until 2026-10-18.  Stay in the loop and drain the C2HData
+                 * tail: returning here leaves it in the socket, the next command reads it
+                 * as its own response, and the stream is out of step for good.  That is
+                 * exactly how the first 64 KiB read damaged Z:. */
+                gotResponse = FALSE;
+                expectTail = TRUE;
+                NvtcpkLogF("command 0x%02X: completion before %u bytes of C2HData; draining"
+                           " the tail", (unsigned)opcode, outBytes);
+            }
         } else if (hdr.type == NVMEOF_TCP_C2HDATA) {
             /* A read answered out-of-capsule.  Legal, and supported: the payload
              * lands at its own datao inside the caller's buffer.  R2T-paced
@@ -1847,8 +1861,13 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
                 return STATUS_BUFFER_TOO_SMALL;
             }
             RtlCopyMemory((PUCHAR)outData + d.datao, (PUCHAR)c->rspBuf + hlen, d.datal);
+            dataSeen += d.datal;
             if (dataLenOut != NULL && d.datao + d.datal > *dataLenOut) {
                 *dataLenOut = d.datao + d.datal;
+            }
+            if (expectTail && dataSeen >= outBytes) {
+                /* The completion already arrived; the data is complete now. */
+                gotResponse = TRUE;
             }
         } else if (hdr.type == NVMEOF_TCP_R2T) {
             c->broken = TRUE;
@@ -1867,6 +1886,13 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
         c->broken = TRUE;
         NvtcpkLogF("command 0x%02X cid=%u: no CapsuleResp within %u PDUs",
                    (unsigned)opcode, (unsigned)cid, (unsigned)NVMEOF_TCPK_MAX_PDUS_PER_CMD);
+        return STATUS_INVALID_NETWORK_RESPONSE;
+    }
+    if (outData != NULL && outBytes > NVMEOF_TCPK_MAX_DATA && *statusOut == 0 &&
+        dataSeen < outBytes) {
+        c->broken = TRUE;
+        NvtcpkLogF("command 0x%02X: only %u of %u bytes of C2HData arrived",
+                   (unsigned)opcode, dataSeen, outBytes);
         return STATUS_INVALID_NETWORK_RESPONSE;
     }
     c->commands++;

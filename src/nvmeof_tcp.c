@@ -439,11 +439,17 @@ static int targetServeOne(TARGET_CONN* c)
     respLen = nvmeofTcpBuildCapsuleResp(resp, cqe, sc == NVME_SC_SUCCESS ? 1 : 0,
                                         dataLen, NVMEOF_TCP_CRSP_HDR_LEN);
     (void)cq;
-    if (sendAll(c->sock, resp, (int)(respLen + dataLen)) != (int)(respLen + dataLen)) { rc = -1; }
-    if (rc == 0 && bigRead) {
+    /* Data PDUs first, completion last.  A host is allowed to stop reading when it
+     * sees the CapsuleResp; sending it first leaves the C2HData train in the socket
+     * and desynchronises the host's next command.  This transport did exactly that
+     * until 2026-10-18, and it corrupted Z: through the kernel miniport. */
+    if (bigRead) {
         if (sendC2HData(c->sock, cid, big, bigLen) != 0) {
             rc = -1;                 /* the host went away mid-transfer: close */
         }
+    }
+    if (rc == 0 && sendAll(c->sock, resp, (int)(respLen + dataLen)) != (int)(respLen + dataLen)) {
+        rc = -1;
     }
 
     free(big);
