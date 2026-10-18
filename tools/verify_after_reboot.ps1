@@ -14,7 +14,7 @@ param(
     [string]$TargetHash  = '652C7DA0ABF8DB7C030D49E1FA9CDBBC46A5CFD574FF95F55716A480D2ACE880',
     [string]$BridgeHash  = '5280DFFE995B88A4F3A9203404F5063F663C4CF44A2BC02D05E7827A4D862905',
     [string]$NsImageHash = 'E7180E162618C3FB00ACC3AE0EB1DB619470F5D35125496BC00D307473975DBE',
-    [string]$Roundtrip   = 'C0DC81BA3F03D8C865E1CF0D400EB298EF7DD3E419788D603CF45704A1455D9B'
+    [string]$Roundtrip   = '172C15DC2E12B50E523D8E657CBE7FBB11C1053252BBF1E1431077D57D8128FD'
 )
 
 $ErrorActionPreference = 'Continue'
@@ -86,6 +86,7 @@ if (Test-Path $selftest) {
 Write-Output "`n================================================"
 Write-Output ('failures: ' + $script:fail)
 exit $script:fail
+
 
 
 
