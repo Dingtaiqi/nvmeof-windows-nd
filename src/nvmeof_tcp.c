@@ -271,7 +271,7 @@ static void fillIdentifyController(uint8_t* d, uint32_t blocks)
 /* The ICResp also advertises maxr2t = 0, i.e. write data is host-driven and needs no    */
 /* R2T - the same flow the Linux host and this project's own clients use.                */
 /* ------------------------------------------------------------------------------------ */
-#define NVMEOF_TCP_IO_CHUNK 65536u
+#define NVMEOF_TCP_IO_CHUNK 63488u   /* 62 KiB: a 64 KiB+24 PDU hits a kernel receive boundary */
 
 static int sendC2HData(SOCKET s, uint16_t cid, const uint8_t* data, uint32_t len)
 {
@@ -810,4 +810,5 @@ static int recvDataPdus(SOCKET s, uint8_t* out, unsigned cap, unsigned align, un
     *gotOut = got;
     return (int)got;
 }
+
 

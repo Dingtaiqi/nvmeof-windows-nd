@@ -118,7 +118,7 @@
  * size.  Every PDU costs the host a WSK receive IRP, and 4 KiB PDUs made a 64 KiB
  * read seventeen of them - about 1.7 ms per command and 37 MB/s on Z:.  The peer
  * (nvmeof_tcp.c) sends C2HData in the same size, so one command is two IRPs. */
-#define NVMEOF_TCPK_DATA_PDU_MAX   65536u
+#define NVMEOF_TCPK_DATA_PDU_MAX   63488u   /* 62 KiB: 65560 bytes is past the 64 KiB receive boundary */
 
 /* One buffer serves every PDU in both directions.  The slack covers the capsule
  * header (72) plus whatever padding the peer's cpda demands for the data offset
@@ -2155,6 +2155,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NvtcpkTraceValue(L"nvtcpk_loaded", 1);
     return STATUS_SUCCESS;
 }
+
 
 
 
