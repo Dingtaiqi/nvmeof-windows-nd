@@ -1,4 +1,4 @@
-/* SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿/* SPDX-FileCopyrightText: 2026 Dingtaiqi
  * SPDX-License-Identifier: Apache-2.0
  *
  * iscsi_tcp_bridge.c - a minimal iSCSI target whose SCSI READ(10)/WRITE(10) become NVMe
@@ -105,6 +105,7 @@
 #define NVME_CHUNK_BLOCKS   128u                        /* 64 KiB: one ISCSI_MAX_DSL burst  */
 #define NVME_CHUNK_BYTES    (NVME_CHUNK_BLOCKS * BLOCK_SIZE)
 #define NVME_CAPSULE_DATA_MAX 4096u                     /* what fits inside one capsule PDU  */
+#define NVME_PDU_DATA_MAX    65536u                     /* one out-of-capsule data PDU       */
 #define MAX_XFER            (1024u * 1024u)             /* largest SCSI transfer accepted */
 #define ISCSI_MAX_DSL       65536u                      /* our MaxRecvDataSegmentLength   */
 #define CMD_WINDOW          8u                          /* MaxCmdSN - ExpCmdSN + 1        */
@@ -716,7 +717,7 @@ static int nvmSendDataPdus(NVM* h, uint16_t cid, const uint8_t* in, unsigned len
         unsigned chunk = len - off;
         unsigned pad;
 
-        if (chunk > NVME_CAPSULE_DATA_MAX) { chunk = NVME_CAPSULE_DATA_MAX; }
+        if (chunk > NVME_PDU_DATA_MAX) { chunk = NVME_PDU_DATA_MAX; }
         memset(&d, 0, sizeof(d));
         d.cccid = cid;
         d.ttag = 0;
@@ -2936,6 +2937,8 @@ int main(int argc, char** argv)
         return rc;
     }
 }
+
+
 
 
 

@@ -255,11 +255,12 @@ static void fillIdentifyController(uint8_t* d, uint32_t blocks)
 /* A capsule PDU carries at most one 4096-byte payload, which is why this target used to */
 /* refuse any Read or Write larger than that.  A bigger transfer keeps the command in the */
 /* capsule and moves the data in explicit data PDUs: a 24-byte header, the bytes, and    */
-/* padding up to the 4-byte capsule alignment advertised in ICResp.  The ICResp also     */
-/* advertises maxr2t = 0, i.e. write data is host-driven and needs no R2T - the same flow */
-/* the Linux host and this project's own clients use.                                   */
+/* padding up to the 4-byte capsule alignment advertised in ICResp.  One data PDU now    */
+/* carries up to 64 KiB, because every PDU costs the host a receive IRP (see below).     */
+/* The ICResp also advertises maxr2t = 0, i.e. write data is host-driven and needs no    */
+/* R2T - the same flow the Linux host and this project's own clients use.                */
 /* ------------------------------------------------------------------------------------ */
-#define NVMEOF_TCP_IO_CHUNK 4096u
+#define NVMEOF_TCP_IO_CHUNK 65536u
 
 static int sendC2HData(SOCKET s, uint16_t cid, const uint8_t* data, uint32_t len)
 {

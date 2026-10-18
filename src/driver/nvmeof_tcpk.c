@@ -1,4 +1,4 @@
-/* SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿/* SPDX-FileCopyrightText: 2026 Dingtaiqi
  * SPDX-License-Identifier: Apache-2.0
  *
  * nvmeof_tcpk.c - the NVMe/TCP transport client, in kernel mode, over WSK.
@@ -114,10 +114,16 @@
  * sanity ceiling for a single command. */
 #define NVMEOF_TCPK_IO_MAX         (1024u * 1024u)
 
+/* One data PDU carries up to 64 KiB, i.e. a whole command at the default chunk
+ * size.  Every PDU costs the host a WSK receive IRP, and 4 KiB PDUs made a 64 KiB
+ * read seventeen of them - about 1.7 ms per command and 37 MB/s on Z:.  The peer
+ * (nvmeof_tcp.c) sends C2HData in the same size, so one command is two IRPs. */
+#define NVMEOF_TCPK_DATA_PDU_MAX   65536u
+
 /* One buffer serves every PDU in both directions.  The slack covers the capsule
  * header (72) plus whatever padding the peer's cpda demands for the data offset
  * (up to 128 is accepted), plus the 4-byte tail pad of a received PDU. */
-#define NVMEOF_TCPK_BUF_BYTES      (NVMEOF_TCP_CCMD_HDR_LEN + 256u + NVMEOF_TCPK_MAX_DATA)
+#define NVMEOF_TCPK_BUF_BYTES      (NVMEOF_TCP_CCMD_HDR_LEN + 256u + NVMEOF_TCPK_DATA_PDU_MAX)
 
 /* IPPROTO_TCP.  The kernel-mode copies of ws2def.h do not define it (it lives in
  * the user-mode winsock headers), so the value is spelled out here. 6 is TCP. */
@@ -1574,7 +1580,7 @@ static NTSTATUS NvtcpkSendDataPdus(PNVMEOF_TCPK_CONN c, USHORT cid, PVOID data, 
         ULONG used, total;
         NTSTATUS st;
 
-        if (chunk > NVMEOF_TCPK_MAX_DATA) { chunk = NVMEOF_TCPK_MAX_DATA; }
+        if (chunk > NVMEOF_TCPK_DATA_PDU_MAX) { chunk = NVMEOF_TCPK_DATA_PDU_MAX; }
         RtlZeroMemory(&d, sizeof(d));
         d.cccid = cid;
         d.ttag = 0;
@@ -1836,7 +1842,7 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
                 return STATUS_INVALID_NETWORK_RESPONSE;
             }
             nvmeofTcpReadData((const uint8_t*)c->rspBuf, &d);
-            if (d.datal > NVMEOF_TCPK_MAX_DATA || hlen + d.datal > NVMEOF_TCPK_BUF_BYTES) {
+            if (d.datal > NVMEOF_TCPK_DATA_PDU_MAX || hlen + d.datal > NVMEOF_TCPK_BUF_BYTES) {
                 c->broken = TRUE;
                 NvtcpkLogF("command 0x%02X: C2HData datal=%u", (unsigned)opcode, d.datal);
                 return STATUS_INVALID_NETWORK_RESPONSE;
@@ -2120,4 +2126,5 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NvtcpkTraceValue(L"nvtcpk_loaded", 1);
     return STATUS_SUCCESS;
 }
+
 
