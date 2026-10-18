@@ -1,4 +1,4 @@
-﻿/* SPDX-FileCopyrightText: 2026 Dingtaiqi
+/* SPDX-FileCopyrightText: 2026 Dingtaiqi
  * SPDX-License-Identifier: Apache-2.0
  *
  * nvmeof_tcp.c - NVMe/TCP, both ends, user mode.
@@ -249,12 +249,82 @@ static void fillIdentifyController(uint8_t* d, uint32_t blocks)
  * tcp_identify_selftest.c runs the same function this target runs.  The LBA Format
  * table is at 128 and LBADS at 130; see the comment there. */
 
+/* ------------------------------------------------------------------------------------ */
+/* Out-of-capsule data: C2HData (target -> host) and H2CData (host -> target).           */
+/*                                                                                      */
+/* A capsule PDU carries at most one 4096-byte payload, which is why this target used to */
+/* refuse any Read or Write larger than that.  A bigger transfer keeps the command in the */
+/* capsule and moves the data in explicit data PDUs: a 24-byte header, the bytes, and    */
+/* padding up to the 4-byte capsule alignment advertised in ICResp.  The ICResp also     */
+/* advertises maxr2t = 0, i.e. write data is host-driven and needs no R2T - the same flow */
+/* the Linux host and this project's own clients use.                                   */
+/* ------------------------------------------------------------------------------------ */
+#define NVMEOF_TCP_IO_CHUNK 4096u
+
+static int sendC2HData(SOCKET s, uint16_t cid, const uint8_t* data, uint32_t len)
+{
+    uint32_t off = 0;
+    uint8_t zero[4] = { 0, 0, 0, 0 };
+
+    while (off < len) {
+        NVMEOF_TCP_DATA d;
+        uint8_t hdr[NVMEOF_TCP_DATA_HDR_LEN];
+        uint32_t chunk = len - off;
+        unsigned pad;
+
+        if (chunk > NVMEOF_TCP_IO_CHUNK) { chunk = NVMEOF_TCP_IO_CHUNK; }
+        memset(&d, 0, sizeof(d));
+        d.cccid = cid;
+        d.ttag = 0;
+        d.datao = off;
+        d.datal = chunk;
+        nvmeofTcpBuildData(hdr, NVMEOF_TCP_C2HDATA,
+                           (off + chunk == len) ? NVMEOF_TCP_F_LAST : 0, &d);
+        if (sendAll(s, hdr, (int)sizeof(hdr)) != (int)sizeof(hdr)) { return -1; }
+        if (sendAll(s, data + off, (int)chunk) != (int)chunk) { return -1; }
+        pad = (unsigned)((NVMEOF_TCP_PDU_ALIGN - (chunk % NVMEOF_TCP_PDU_ALIGN)) % NVMEOF_TCP_PDU_ALIGN);
+        if (pad != 0 && sendAll(s, zero, (int)pad) != (int)pad) { return -1; }
+        off += chunk;
+    }
+    return 0;
+}
+
+/* Read exactly len bytes of H2CData for this command into buf.  Any malformed PDU means
+ * the stream can no longer be trusted, so the caller closes the connection. */
+static int recvH2CData(SOCKET s, uint16_t cid, uint8_t* buf, uint32_t len)
+{
+    uint32_t got = 0;
+    uint8_t zero[4];
+
+    while (got < len) {
+        NVMEOF_TCP_HDR h;
+        NVMEOF_TCP_DATA d;
+        uint8_t hdr[NVMEOF_TCP_DATA_HDR_LEN];
+        unsigned pad;
+
+        if (recvAll(s, hdr, (int)sizeof(hdr)) != (int)sizeof(hdr)) { return -1; }
+        nvmeofTcpReadHdr(hdr, &h);
+        if (h.type != NVMEOF_TCP_H2CDATA || h.hlen != NVMEOF_TCP_DATA_HDR_LEN) { return -1; }
+        nvmeofTcpReadData(hdr, &d);
+        if (d.cccid != cid || d.datal == 0) { return -1; }
+        if ((uint64_t)d.datao + (uint64_t)d.datal > (uint64_t)len) { return -1; }
+        if (recvAll(s, buf + d.datao, (int)d.datal) != (int)d.datal) { return -1; }
+        pad = (unsigned)((NVMEOF_TCP_PDU_ALIGN - (d.datal % NVMEOF_TCP_PDU_ALIGN)) % NVMEOF_TCP_PDU_ALIGN);
+        if (pad != 0 && recvAll(s, zero, (int)pad) != (int)pad) { return -1; }
+        got += d.datal;
+    }
+    return 0;
+}
+
 /* Serve one capsule.  Returns 0 to keep the connection, -1 to close it. */
 static int targetServeOne(TARGET_CONN* c)
 {
     uint8_t hdr[8], sqe[64], cqe[16], cq[16];
     uint8_t* data = NULL;
     uint8_t* resp = NULL;
+    uint8_t* big = NULL;          /* out-of-capsule read data */
+    uint32_t bigLen = 0;
+    int bigRead = 0;
     unsigned capLen, respLen = 0, dataLen = 0;
     NVMEOF_TCP_HDR h;
     uint16_t cid;
@@ -305,17 +375,54 @@ static int targetServeOne(TARGET_CONN* c)
 
         if (nsid == 0 || nsid > 1) {
             sc = NVME_SC_INVALID_NS;
-        } else if (bytes > 4096) {   /* one PDU fits in the capsule; larger needs C2HData, not wired yet */
-            /* Larger transfers need H2CData/C2HData and an R2T; that is the next piece of
-             * work, and saying so is better than silently truncating. */
-            sc = NVME_SC_DATA_XFER_ERR;
         } else if (opcode == NVME_ADMIN_READ) {
-            if (nsRead(c->ns, lba, nlb, resp + NVMEOF_TCP_CRSP_HDR_LEN) != 0) { sc = NVME_SC_DATA_XFER_ERR; }
-            else { dataLen = bytes; }
+            if (bytes > 4096) {
+                /* Larger than one capsule payload: the data goes out as C2HData PDUs
+                 * after a capsule that carries only the completion. */
+                big = (uint8_t*)malloc(bytes);
+                if (big == NULL) {
+                    sc = NVME_SC_DATA_XFER_ERR;
+                } else if (nsRead(c->ns, lba, nlb, big) != 0) {
+                    sc = NVME_SC_DATA_XFER_ERR;
+                } else {
+                    bigLen = bytes;
+                    bigRead = 1;
+                }
+            } else if (nsRead(c->ns, lba, nlb, resp + NVMEOF_TCP_CRSP_HDR_LEN) != 0) {
+                sc = NVME_SC_DATA_XFER_ERR;
+            } else {
+                dataLen = bytes;
+            }
         } else {
-            if (h.plen < bytes) { sc = NVME_SC_DATA_XFER_ERR; }
-            else if (nsWrite(c->ns, lba, nlb, data) != 0) { sc = NVME_SC_DATA_XFER_ERR; }
-            else { dataLen = 0; }
+            if (bytes > 4096) {
+                /* Host-driven write: the capsule carried no data, so read the H2CData
+                 * PDUs that follow it.  A malformed one desynchronises the stream, so
+                 * the connection is closed instead of guessing. */
+                uint8_t* w = (uint8_t*)malloc(bytes);
+                if (w == NULL) {
+                    sc = NVME_SC_DATA_XFER_ERR;
+                } else {
+                    if (h.plen > 0) {
+                        memcpy(w, data, (h.plen < bytes) ? h.plen : bytes);
+                    }
+                    if (recvH2CData(c->sock, cid, w, bytes) != 0) {
+                        free(w);
+                        free(data);
+                        free(resp);
+                        return -1;
+                    }
+                    if (nsWrite(c->ns, lba, nlb, w) != 0) {
+                        sc = NVME_SC_DATA_XFER_ERR;
+                    }
+                    free(w);
+                }
+            } else if (h.plen < bytes) {
+                sc = NVME_SC_DATA_XFER_ERR;
+            } else if (nsWrite(c->ns, lba, nlb, data) != 0) {
+                sc = NVME_SC_DATA_XFER_ERR;
+            } else {
+                dataLen = 0;
+            }
         }
     } else if (opcode == NVME_ADMIN_FLUSH) {
         dataLen = 0;
@@ -333,7 +440,13 @@ static int targetServeOne(TARGET_CONN* c)
                                         dataLen, NVMEOF_TCP_CRSP_HDR_LEN);
     (void)cq;
     if (sendAll(c->sock, resp, (int)(respLen + dataLen)) != (int)(respLen + dataLen)) { rc = -1; }
+    if (rc == 0 && bigRead) {
+        if (sendC2HData(c->sock, cid, big, bigLen) != 0) {
+            rc = -1;                 /* the host went away mid-transfer: close */
+        }
+    }
 
+    free(big);
     free(data);
     free(resp);
     return rc;
