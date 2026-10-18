@@ -102,8 +102,9 @@
 /* ==================================================================================== */
 
 #define BLOCK_SIZE          512u
-#define NVME_CHUNK_BLOCKS   8u                          /* 4096 bytes: the capsule limit  */
+#define NVME_CHUNK_BLOCKS   128u                        /* 64 KiB: one ISCSI_MAX_DSL burst  */
 #define NVME_CHUNK_BYTES    (NVME_CHUNK_BLOCKS * BLOCK_SIZE)
+#define NVME_CAPSULE_DATA_MAX 4096u                     /* what fits inside one capsule PDU  */
 #define MAX_XFER            (1024u * 1024u)             /* largest SCSI transfer accepted */
 #define ISCSI_MAX_DSL       65536u                      /* our MaxRecvDataSegmentLength   */
 #define CMD_WINDOW          8u                          /* MaxCmdSN - ExpCmdSN + 1        */
@@ -700,9 +701,64 @@ static void nvmClose(NVM* h)
     h->sock = INVALID_SOCKET;
 }
 
-/* One command, response read back.  inData rides inside the command capsule (the only form
- * the target in this project accepts, and 4096 bytes is its limit); outData receives the
- * data part of the response capsule. */
+/* One command, response read back.  Up to 4096 bytes of data ride inside the capsule
+ * (that is one capsule payload); anything larger is moved as C2HData (Read) or H2CData
+ * (Write) PDUs, which the target in nvmeof_tcp.c implements.  The target advertises
+ * maxr2t = 0, so write data is host-driven and no R2T is expected. */
+static int nvmSendDataPdus(NVM* h, uint16_t cid, const uint8_t* in, unsigned len)
+{
+    static const uint8_t zero[4] = { 0, 0, 0, 0 };
+    unsigned off = 0;
+
+    while (off < len) {
+        NVMEOF_TCP_DATA d;
+        uint8_t dh[NVMEOF_TCP_DATA_HDR_LEN];
+        unsigned chunk = len - off;
+        unsigned pad;
+
+        if (chunk > NVME_CAPSULE_DATA_MAX) { chunk = NVME_CAPSULE_DATA_MAX; }
+        memset(&d, 0, sizeof(d));
+        d.cccid = cid;
+        d.ttag = 0;
+        d.datao = off;
+        d.datal = chunk;
+        nvmeofTcpBuildData(dh, NVMEOF_TCP_H2CDATA,
+                           (off + chunk == len) ? NVMEOF_TCP_F_LAST : 0, &d);
+        if (sendAll(h->sock, dh, (int)sizeof(dh)) != (int)sizeof(dh)) { return -1; }
+        if (sendAll(h->sock, in + off, (int)chunk) != (int)chunk) { return -1; }
+        pad = (unsigned)((NVMEOF_TCP_PDU_ALIGN - (chunk % NVMEOF_TCP_PDU_ALIGN)) % NVMEOF_TCP_PDU_ALIGN);
+        if (pad != 0 && sendAll(h->sock, zero, (int)pad) != (int)pad) { return -1; }
+        off += chunk;
+    }
+    return 0;
+}
+
+static int nvmReadDataPdus(NVM* h, uint16_t cid, uint8_t* out, unsigned want)
+{
+    uint8_t zero[4];
+    unsigned have = 0;
+
+    while (have < want) {
+        NVMEOF_TCP_HDR hh;
+        NVMEOF_TCP_DATA d;
+        uint8_t dh[NVMEOF_TCP_DATA_HDR_LEN];
+        unsigned pad;
+
+        if (recvAll(h->sock, dh, (int)sizeof(dh)) != 1) { return -1; }
+        nvmeofTcpReadHdr(dh, &hh);
+        if (hh.type != NVMEOF_TCP_C2HDATA || hh.hlen != NVMEOF_TCP_DATA_HDR_LEN) { return -1; }
+        nvmeofTcpReadData(dh, &d);
+        if (d.cccid != cid || d.datal == 0) { return -1; }
+        if ((uint64_t)d.datao + (uint64_t)d.datal > (uint64_t)want) { return -1; }
+        if (recvAll(h->sock, out + d.datao, (int)d.datal) != 1) { return -1; }
+        pad = (unsigned)((NVMEOF_TCP_PDU_ALIGN - (d.datal % NVMEOF_TCP_PDU_ALIGN)) % NVMEOF_TCP_PDU_ALIGN);
+        if (pad != 0 && recvAll(h->sock, zero, (int)pad) != 1) { return -1; }
+        have += d.datal;
+        if ((hh.flags & NVMEOF_TCP_F_LAST) != 0) { break; }
+    }
+    return have == want ? 0 : -1;
+}
+
 static int nvmCmd(NVM* h, uint8_t opcode, uint32_t nsid, uint32_t cdw10, uint32_t cdw12,
                   const uint8_t* inData, unsigned inLen, uint8_t* outData, unsigned outCap,
                   unsigned* outLen, uint8_t* statusOut)
@@ -715,19 +771,25 @@ static int nvmCmd(NVM* h, uint8_t opcode, uint32_t nsid, uint32_t cdw10, uint32_
     unsigned n, total;
     NVMEOF_TCP_HDR hh;
     uint16_t cid = h->nextCid++;
+    int bigWrite = (inLen > NVME_CAPSULE_DATA_MAX);
+    int bigRead  = (outData != NULL && outCap > NVME_CAPSULE_DATA_MAX);
 
     nvmSqeBuild(sqe, opcode, nsid, cid, cdw10, cdw12);
-    n = nvmeofTcpBuildCapsuleCmd(cap, sqe, inLen, NVMEOF_TCP_CCMD_HDR_LEN);
-    total = n + inLen;
+    n = nvmeofTcpBuildCapsuleCmd(cap, sqe, bigWrite ? 0u : inLen, NVMEOF_TCP_CCMD_HDR_LEN);
+    total = n + (bigWrite ? 0u : inLen);
     big = (uint8_t*)malloc(total);
     if (big == NULL) { return -1; }
     memcpy(big, cap, n);
-    if (inLen != 0) {
+    if (!bigWrite && inLen != 0) {
         if (inData == NULL) { free(big); return -1; }
         memcpy(big + n, inData, inLen);
     }
     if (sendAll(h->sock, big, (int)total) != (int)total) { free(big); return -2; }
     free(big);
+    if (bigWrite) {
+        if (inData == NULL) { return -1; }
+        if (nvmSendDataPdus(h, cid, inData, inLen) != 0) { return -2; }
+    }
 
     if (recvAll(h->sock, hdr, 8) != 1) { return -3; }
     nvmeofTcpReadHdr(hdr, &hh);
@@ -739,6 +801,11 @@ static int nvmCmd(NVM* h, uint8_t opcode, uint32_t nsid, uint32_t cdw10, uint32_
         if (recvAll(h->sock, outData, (int)hh.plen) != 1) { return -8; }
     }
     if (outLen != NULL) { *outLen = hh.plen; }
+    if (bigRead && hh.plen == 0 && (hh.flags & NVMEOF_TCP_F_SUCCESS) != 0) {
+        /* A successful big read carries no data in the capsule: it follows as C2HData. */
+        if (nvmReadDataPdus(h, cid, outData, outCap) != 0) { return -9; }
+        if (outLen != NULL) { *outLen = outCap; }
+    }
     if (statusOut != NULL) {
         /* The SUCCESS flag in the capsule header is authoritative: the target in nvmeof_tcp.c
          * sets that flag from its own status but leaves the 16-byte completion it places
@@ -842,7 +909,7 @@ static int nvmEnsure(SESS* s)
     return 0;
 }
 
-/* One NVMe Read of at most 8 blocks (4096 bytes).  On a transport error the connection is
+/* One NVMe Read of up to NVME_CHUNK_BLOCKS (64 KiB) blocks; data over 4096 bytes comes back as C2HData PDUs.  On a transport error the connection is
  * dropped so the next command reopens it: the NVMe/TCP target closes an idle connection
  * after its own receive timeout, and a bridge that kept a dead socket would answer every
  * later SCSI command with an I/O error. */
@@ -878,8 +945,8 @@ static int nvmWriteChunk(SESS* s, uint32_t lba, uint32_t nblocks, const uint8_t*
     return 0;
 }
 
-/* A whole SCSI transfer, split into 4096-byte NVMe commands and reassembled.  This loop is
- * the documented size limit in one place. */
+/* A whole SCSI transfer, split into NVME_CHUNK_BLOCKS (64 KiB) NVMe commands and
+ * reassembled.  One command per iSCSI Data-In/Data-Out burst instead of sixteen. */
 static int nvmReadRange(SESS* s, uint64_t lba, uint32_t nblocks, uint8_t* out)
 {
     uint32_t done = 0;
@@ -1183,9 +1250,9 @@ static int sessRead10(SESS* s, uint32_t itt, uint32_t edtl, uint64_t lba, uint32
     }
     free(buf);
     s->bytesRead += (unsigned long long)nblocks * BLOCK_SIZE;
-    say("  [scsi] READ(10) lba=%llu n=%u (%u B) -> %u NVMe Read cmd(s) of <=4096 B, %lu ms\n",
+    say("  [scsi] READ(10) lba=%llu n=%u (%u B) -> %u NVMe Read cmd(s) of <=%u KiB, %lu ms\n",
         (unsigned long long)lba, nblocks, nblocks * BLOCK_SIZE,
-        nvmeChunkCount(nblocks), (unsigned long)(GetTickCount() - t0));
+        nvmeChunkCount(nblocks), (unsigned)(NVME_CHUNK_BYTES / 1024u), (unsigned long)(GetTickCount() - t0));
     return sessScsiRsp(s, itt, SCSI_STATUS_GOOD, NULL, 0, 0, 0);
 }
 
@@ -1319,9 +1386,9 @@ static int sessWrite10(SESS* s, uint32_t itt, uint32_t edtl, uint64_t lba, uint3
     }
     free(buf);
     s->bytesWritten += (unsigned long long)nblocks * BLOCK_SIZE;
-    say("  [scsi] WRITE(10) lba=%llu n=%u (%u B) -> %u NVMe Write cmd(s) of <=4096 B, %lu ms\n",
+    say("  [scsi] WRITE(10) lba=%llu n=%u (%u B) -> %u NVMe Write cmd(s) of <=%u KiB, %lu ms\n",
         (unsigned long long)lba, nblocks, nblocks * BLOCK_SIZE,
-        nvmeChunkCount(nblocks), (unsigned long)(GetTickCount() - t0));
+        nvmeChunkCount(nblocks), (unsigned)(NVME_CHUNK_BYTES / 1024u), (unsigned long)(GetTickCount() - t0));
     return sessScsiRsp(s, itt, SCSI_STATUS_GOOD, NULL, 0, 0, 0);
 }
 
@@ -2141,7 +2208,13 @@ static void testBackend(void)
     snprintf(logPath, sizeof(logPath), "%siscsi_bridge_nvme.log", nsPath);
     snprintf(nsPath + strlen(nsPath), sizeof(nsPath) - strlen(nsPath), "iscsi_bridge_ns.img");
 
-    exeSibling("nvmeof_tcp.exe", exe, sizeof(exe));
+    /* Prefer the side-by-side big-IO target build when it exists: the live
+     * nvmeof_tcp.exe is locked by the process serving Z:, so the out-of-capsule
+     * path is tested against nvmeof_tcp_bigio.exe until those binaries merge. */
+    exeSibling("nvmeof_tcp_bigio.exe", exe, sizeof(exe));
+    if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES) {
+        exeSibling("nvmeof_tcp.exe", exe, sizeof(exe));
+    }
     port = freePort();
     ok(port != 0, "a free TCP port was found for the NVMe/TCP target");
     if (port == 0) { return; }
@@ -2207,6 +2280,31 @@ static void testBackend(void)
         }
         free(tail);
         free(tailBack);
+    }
+
+    /* 64 KiB in one NVMe command.  The data no longer fits in a capsule, so it moves as
+     * H2CData (write) and C2HData (read) PDUs - and it must take exactly one command
+     * instead of the sixteen 4 KiB commands this backend used to issue. */
+    {
+        uint32_t bigBytes = NVME_CHUNK_BLOCKS * BLOCK_SIZE;
+        uint8_t* bigPat = (uint8_t*)malloc(bigBytes);
+        uint8_t* bigBack = (uint8_t*)calloc(1, bigBytes);
+        unsigned long long beforeW = s->nvmeWrites;
+        unsigned long long beforeR = s->nvmeReads;
+        if (bigPat != NULL && bigBack != NULL) {
+            for (i = 0; i < (int)bigBytes; i++) { bigPat[i] = (uint8_t)((i * 13 + 7) & 0xFF); }
+            ok(nvmWriteRange(s, 128, NVME_CHUNK_BLOCKS, bigPat) == 0,
+               "64 KiB written as one NVMe Write, data pushed as H2CData PDUs");
+            ok(s->nvmeWrites - beforeW == 1ull, "it took exactly one NVMe Write command");
+            ok(nvmReadRange(s, 128, NVME_CHUNK_BLOCKS, bigBack) == 0,
+               "the same 64 KiB read back as one NVMe Read, data returned as C2HData PDUs");
+            ok(s->nvmeReads - beforeR == 1ull, "it took exactly one NVMe Read command");
+            ok(memcmp(bigPat, bigBack, bigBytes) == 0, "all 65536 bytes come back byte for byte");
+        } else {
+            ok(0, "memory for the 64 KiB pattern");
+        }
+        free(bigPat);
+        free(bigBack);
     }
 
     /* An LBA the namespace does not have must fail cleanly, not silently succeed. */
@@ -2480,7 +2578,13 @@ static void testBridgeLoopback(void)
     snprintf(nsPath + strlen(nsPath), sizeof(nsPath) - strlen(nsPath), "iscsi_bridge_bt.img");
     DeleteFileA(nsPath);
 
-    exeSibling("nvmeof_tcp.exe", exe, sizeof(exe));
+    /* Prefer the side-by-side big-IO target build when it exists: the live
+     * nvmeof_tcp.exe is locked by the process serving Z:, so the out-of-capsule
+     * path is tested against nvmeof_tcp_bigio.exe until those binaries merge. */
+    exeSibling("nvmeof_tcp_bigio.exe", exe, sizeof(exe));
+    if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES) {
+        exeSibling("nvmeof_tcp.exe", exe, sizeof(exe));
+    }
     nvmePort = freePort();
     iscsiPort = freePort();
     ok(nvmePort != 0 && iscsiPort != 0 && nvmePort != iscsiPort,
@@ -2796,3 +2900,6 @@ int main(int argc, char** argv)
         return rc;
     }
 }
+
+
+
