@@ -1,4 +1,4 @@
-/* SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿/* SPDX-FileCopyrightText: 2026 Dingtaiqi
  * SPDX-License-Identifier: Apache-2.0
  *
  * nvmeof_tcpk.c - the NVMe/TCP transport client, in kernel mode, over WSK.
@@ -1951,6 +1951,234 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
     return STATUS_SUCCESS;
 }
 
+/* ------------------------------------------------------------------------- */
+/*  Batch: several commands in flight on ONE connection.                     */
+/*                                                                           */
+/*  Send every capsule (and, for a Write, its H2CData tail) before reading    */
+/*  anything, then read PDUs until every command has its completion, matching */
+/*  data and completions by command id.  The target answers in order today,   */
+/*  but matching by cid is what the protocol promises and costs one loop.     */
+/*                                                                           */
+/*  A batch never reconnects: it refuses an out-of-step connection so the      */
+/*  caller can fall back to NvtcpCommand, which owns the reconnect logic.      */
+/* ------------------------------------------------------------------------- */
+static NTSTATUS NvtcpkBatchEx(PNVMEOF_TCPK_CONN c, NVTCPK_CMD* cmds, ULONG n)
+{
+    NTSTATUS st = STATUS_SUCCESS;
+    ULONG i, done = 0, pdus;
+    const ULONG maxPdus = NVMEOF_TCPK_MAX_PDUS_PER_CMD * n;
+
+    /* 1. send */
+    for (i = 0; i < n; i++) {
+        NVTCPK_CMD* m = &cmds[i];
+        UCHAR sqe[NVMEOF_TCP_SQE_LEN];
+        ULONG pdo, capsuleBytes;
+
+        m->done = FALSE;
+        m->status = 0xFF;
+        m->dataLen = 0;
+        m->cid = c->cidNext++;
+        NvtcpkBuildSqe(sqe, m->opcode, m->cid, m->nsid, m->cdw10, m->cdw12);
+        capsuleBytes = (m->inBytes > NVMEOF_TCPK_MAX_DATA) ? 0 : m->inBytes;
+        pdo = nvmeofTcpPduTotal(NVMEOF_TCP_CCMD_HDR_LEN, 0, c->cpda);
+        if (pdo + capsuleBytes > NVMEOF_TCPK_BUF_BYTES) {
+            st = STATUS_INVALID_BUFFER_SIZE;
+            goto fail;
+        }
+        NvtcpkBuildCapsule(c, sqe, pdo, m->inData, capsuleBytes);
+        st = NvtcpkSend(c, pdo + capsuleBytes);
+        if (!NT_SUCCESS(st)) {
+            NvtcpkLogF("batch[%u/%u] opcode 0x%02X: capsule send failed 0x%08X %s",
+                       i, n, (unsigned)m->opcode, (unsigned)st, NvtcpkStatusName(st));
+            goto fail;
+        }
+        if (m->inBytes > NVMEOF_TCPK_MAX_DATA) {
+            st = NvtcpkSendDataPdus(c, m->cid, m->inData, m->inBytes);
+            if (!NT_SUCCESS(st)) {
+                c->broken = TRUE;
+                goto fail;
+            }
+        }
+    }
+
+    /* 2. receive until every command is complete */
+    for (pdus = 0; pdus < maxPdus && done < n; pdus++) {
+        NVMEOF_TCP_HDR hdr;
+        ULONG hlen, body;
+
+        st = NvtcpkRecv(c, 0, NVMEOF_TCP_HDR_LEN);
+        if (!NT_SUCCESS(st)) {
+            NvtcpkLogF("batch: no PDU header, 0x%08X", (unsigned)st);
+            goto fail;
+        }
+        nvmeofTcpReadHdr((const uint8_t*)c->rspBuf, &hdr);
+        hlen = hdr.hlen;
+        if (hlen < NVMEOF_TCP_HDR_LEN || hlen > NVMEOF_TCPK_BUF_BYTES) {
+            NvtcpkLogF("batch: PDU type 0x%02X announces hlen=%u", (unsigned)hdr.type, hlen);
+            st = STATUS_INVALID_NETWORK_RESPONSE;
+            goto fail;
+        }
+        if ((hdr.flags & (NVMEOF_TCP_F_HDGST | NVMEOF_TCP_F_DDGST)) != 0) {
+            st = STATUS_NOT_SUPPORTED;
+            goto fail;
+        }
+        body = hlen - NVMEOF_TCP_HDR_LEN;
+        if (body != 0) {
+            st = NvtcpkRecv(c, NVMEOF_TCP_HDR_LEN, body);
+            if (!NT_SUCCESS(st)) {
+                goto fail;
+            }
+        }
+
+        if (hdr.type == NVMEOF_TCP_CAPSULERESP) {
+            NVTCPK_CMD* m = NULL;
+            ULONG dataOff, plen;
+            USHORT rcid;
+
+            if (hlen < NVMEOF_TCP_CRSP_HDR_LEN) {
+                st = STATUS_INVALID_NETWORK_RESPONSE;
+                goto fail;
+            }
+            rcid = NvtcpkCqeCid((const UCHAR*)c->rspBuf + NVMEOF_TCP_HDR_LEN);
+            for (i = 0; i < n; i++) {
+                if (cmds[i].cid == rcid && !cmds[i].done) { m = &cmds[i]; break; }
+            }
+            if (m == NULL) {
+                NvtcpkLogF("batch: completion for cid=%u that is not in the batch",
+                           (unsigned)rcid);
+                st = STATUS_INVALID_NETWORK_RESPONSE;
+                goto fail;
+            }
+            dataOff = ((ULONG)hdr.pdo >= hlen) ? (ULONG)hdr.pdo : hlen;
+            if (dataOff > hlen) {
+                st = NvtcpkRecv(c, hlen, dataOff - hlen);
+                if (!NT_SUCCESS(st)) {
+                    goto fail;
+                }
+            }
+            plen = hdr.plen;
+            if (plen > NVMEOF_TCPK_MAX_DATA || dataOff + plen > NVMEOF_TCPK_BUF_BYTES) {
+                st = STATUS_INVALID_NETWORK_RESPONSE;
+                goto fail;
+            }
+            if (plen != 0) {
+                ULONG pad;
+                st = NvtcpkRecv(c, dataOff, plen);
+                if (!NT_SUCCESS(st)) {
+                    goto fail;
+                }
+                if (m->outData != NULL && plen <= m->outBytes) {
+                    RtlCopyMemory(m->outData, (PUCHAR)c->rspBuf + dataOff, plen);
+                }
+                m->dataLen = plen;
+                pad = nvmeofTcpPduTotal(dataOff + plen, 0, c->cpda) - (dataOff + plen);
+                if (pad != 0) {
+                    st = NvtcpkRecv(c, dataOff + plen, pad);
+                    if (!NT_SUCCESS(st)) {
+                        goto fail;
+                    }
+                }
+            }
+            m->status = NvtcpkCqeStatus((const UCHAR*)c->rspBuf + NVMEOF_TCP_HDR_LEN);
+            m->done = TRUE;
+            done++;
+        } else if (hdr.type == NVMEOF_TCP_C2HDATA) {
+            NVMEOF_TCP_DATA d;
+            NVTCPK_CMD* m = NULL;
+            ULONG pad;
+
+            if (hlen < NVMEOF_TCP_DATA_HDR_LEN) {
+                st = STATUS_INVALID_NETWORK_RESPONSE;
+                goto fail;
+            }
+            nvmeofTcpReadData((const uint8_t*)c->rspBuf, &d);
+            for (i = 0; i < n; i++) {
+                if (cmds[i].cid == d.cccid && !cmds[i].done) { m = &cmds[i]; break; }
+            }
+            if (m == NULL || m->outData == NULL ||
+                (ULONGLONG)d.datao + (ULONGLONG)d.datal > (ULONGLONG)m->outBytes) {
+                NvtcpkLogF("batch: C2HData cid=%u range %u+%u does not fit its command",
+                           (unsigned)d.cccid, (unsigned)d.datao, (unsigned)d.datal);
+                st = STATUS_INVALID_NETWORK_RESPONSE;
+                goto fail;
+            }
+            if (d.datal > NVMEOF_TCPK_DATA_PDU_MAX || hlen + d.datal > NVMEOF_TCPK_BUF_BYTES) {
+                st = STATUS_INVALID_NETWORK_RESPONSE;
+                goto fail;
+            }
+            st = NvtcpkRecv(c, hlen, d.datal);
+            if (!NT_SUCCESS(st)) {
+                goto fail;
+            }
+            RtlCopyMemory((PUCHAR)m->outData + d.datao, (PUCHAR)c->rspBuf + hlen, d.datal);
+            if (d.datao + d.datal > m->dataLen) {
+                m->dataLen = d.datao + d.datal;
+            }
+            pad = nvmeofTcpPduTotal(hlen + d.datal, 0, c->cpda) - (hlen + d.datal);
+            if (pad != 0) {
+                st = NvtcpkRecv(c, hlen + d.datal, pad);
+                if (!NT_SUCCESS(st)) {
+                    goto fail;
+                }
+            }
+        } else {
+            NvtcpkLogF("batch: unexpected PDU type 0x%02X", (unsigned)hdr.type);
+            st = STATUS_INVALID_NETWORK_RESPONSE;
+            goto fail;
+        }
+    }
+
+    if (done < n) {
+        NvtcpkLogF("batch: only %u of %u commands completed within %u PDUs",
+                   done, n, maxPdus);
+        st = STATUS_INVALID_NETWORK_RESPONSE;
+        goto fail;
+    }
+    InterlockedExchange(&c->busy, 0);
+    c->commands += n;
+    NvtcpkDropRef(c);
+    return STATUS_SUCCESS;
+
+fail:
+    c->broken = TRUE;
+    InterlockedExchange(&c->busy, 0);
+    NvtcpkDropRef(c);
+    return st;
+}
+
+NTSTATUS NvtcpkBatch(PVOID conn, NVTCPK_CMD* cmds, ULONG n)
+{
+    PNVMEOF_TCPK_CONN c;
+
+    if (n == 0) {
+        return STATUS_SUCCESS;
+    }
+    if (n > NVMEOF_TCPK_BATCH_MAX) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    NvtcpkGlobalsInit();
+    c = NvtcpkLookupRef(conn);
+    if (c == NULL) {
+        return STATUS_INVALID_HANDLE;
+    }
+    if (c->poisoned) {
+        NvtcpkDropRef(c);
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (c->broken || c->needReconnect) {
+        NvtcpkLogF("batch: connection %p is out of step; the caller will use the"
+                   " single-command path", c);
+        NvtcpkDropRef(c);
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (InterlockedCompareExchange(&c->busy, 1, 0) != 0) {
+        NvtcpkLogF("batch: connection %p is busy with another command", c);
+        NvtcpkDropRef(c);
+        return STATUS_DEVICE_BUSY;
+    }
+    return NvtcpkBatchEx(c, cmds, n);
+}
+
 static NTSTATUS NvtcpkCommandEx(PVOID conn, UINT8 opcode, UINT32 nsid, UINT32 cdw10,
                                 UINT32 cdw12, PVOID inData, ULONG inBytes,
                                 PVOID outData, ULONG outBytes, UINT8* statusOut,
@@ -2172,6 +2400,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NvtcpkTraceValue(L"nvtcpk_loaded", 1);
     return STATUS_SUCCESS;
 }
+
 
 
 

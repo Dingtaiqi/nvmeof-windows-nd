@@ -90,4 +90,30 @@ NTSTATUS NvtcpCommand(_In_ PVOID conn, _In_ UINT8 opcode, _In_ UINT32 nsid,
 NTSTATUS NvtcpIdentify(_In_ PVOID conn, _In_ UINT8 cns, _In_ UINT32 nsid,
                        _Out_writes_bytes_(4096) PVOID out4096);
 
+/* Batch submission: several commands in flight on ONE connection.  This is what
+ * NVMe/TCP calls multiple commands per queue - the caller hands over an array, the
+ * transport sends every capsule (and write payload) before reading any response,
+ * and then matches responses back by command id.  A batch never reconnects: it
+ * fails with STATUS_DEVICE_NOT_READY if the connection is out of step, and the
+ * caller falls back to the one-at-a-time path, which owns the reconnect logic. */
+#define NVMEOF_TCPK_BATCH_MAX       8u
+
+typedef struct _NVTCPK_CMD {
+    UINT8   opcode;
+    UINT32  nsid;
+    UINT32  cdw10;
+    UINT32  cdw12;
+    PVOID   inData;
+    ULONG   inBytes;
+    PVOID   outData;
+    ULONG   outBytes;
+    USHORT  cid;        /* filled in by the transport */
+    UINT8   status;     /* NVMe status of the completion, 0 = success */
+    ULONG   dataLen;    /* bytes the completion carried into outData */
+    BOOLEAN done;       /* transport-internal */
+} NVTCPK_CMD, *PNVTCPK_CMD;
+
+NTSTATUS NvtcpkBatch(_In_ PVOID conn, _Inout_updates_(count) NVTCPK_CMD* cmds,
+                     _In_ ULONG count);
+
 #endif /* NVMEOF_TCPK_H */

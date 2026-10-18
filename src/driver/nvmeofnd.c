@@ -137,6 +137,8 @@
 // Queue depth: StorPort is told 32 outstanding requests per LUN; the queue is
 // twice that so a burst can never be refused in practice.
 #define NVMEOFND_MAX_PENDING  64
+#define NVMEOFND_MAX_QUEUES   8u
+#define NVMEOFND_MAX_PIPELINE 8u
 
 // The worker waits with a timeout rather than forever, so a stop request can
 // never leave a thread parked on an event that nobody will signal.
@@ -352,6 +354,7 @@ typedef struct _NVMEOFND_ENGINE {
     volatile LONG   Stop;         // never set in practice; checked by the worker
     BOOLEAN         ThreadStarted;
     ULONG           Queues;       // connections/worker threads actually open (1..MAX)
+    ULONG           PipeDepth;    // SRBs batched per wake (nvmeofnd_pipelinedepth)
     PVOID           Conn[8];      // one NVTCP connection per queue
     PVOID           IdBuf;        // 4096-byte non-paged Identify buffer
     ULONG           Blocks;       // NSZE from Identify CNS=0
@@ -679,9 +682,91 @@ typedef struct _NVMEOFND_WORKER_CTX {
     ULONG            Index;
 } NVMEOFND_WORKER_CTX, *PNVMEOFND_WORKER_CTX;
 
-// One worker per connection, and one slot per wake: that is what puts several
-// commands in flight.  A worker that drained the whole queue itself would keep
-// every command serialised no matter how many connections existed.
+// A READ/WRITE SRB that fits in ONE NVMe command at the current chunk size can go
+// into a batch.  The parsing deliberately matches ProcessOne: same CDB forms,
+// same range check, same whole-block rounding; anything that does not fit is left
+// to ProcessOne, which also owns the chunked path.
+static BOOLEAN NvmeofndPrepareRw(PNVMEOFND_ENGINE Eng, PVOID Ext, PSCSI_REQUEST_BLOCK Srb,
+                                 NVTCPK_CMD* Cmd, ULONG* BytesOut, BOOLEAN* IsReadOut)
+{
+    PNVMEOFND_EXTENSION ext = (PNVMEOFND_EXTENSION)Ext;
+    UCHAR* cdb = Srb->Cdb;
+    UCHAR op = cdb[0];
+    BOOLEAN isRead;
+    ULONG lba = 0, blocks = 0, bytes;
+    ULONGLONG lba64 = 0;
+    PVOID buffer = NULL;
+
+    switch (op) {
+    case NVMEOFND_OPC_READ6:
+    case NVMEOFND_OPC_WRITE6:
+    case NVMEOFND_OPC_READ10:
+    case NVMEOFND_OPC_WRITE10:
+    case NVMEOFND_OPC_READ16:
+    case NVMEOFND_OPC_WRITE16:
+        break;
+    default:
+        return FALSE;
+    }
+    isRead = (op == NVMEOFND_OPC_READ6 || op == NVMEOFND_OPC_READ10 ||
+              op == NVMEOFND_OPC_READ16);
+    if (op == NVMEOFND_OPC_READ6 || op == NVMEOFND_OPC_WRITE6) {
+        lba    = ((ULONG)(cdb[1] & 0x1F) << 16) | ((ULONG)cdb[2] << 8) | cdb[3];
+        blocks = (cdb[4] == 0) ? 256u : (ULONG)cdb[4];
+    } else if (op == NVMEOFND_OPC_READ10 || op == NVMEOFND_OPC_WRITE10) {
+        lba    = ((ULONG)cdb[2] << 24) | ((ULONG)cdb[3] << 16) | ((ULONG)cdb[4] << 8) | cdb[5];
+        blocks = ((ULONG)cdb[7] << 8) | cdb[8];
+    } else {
+        lba64  = ((ULONGLONG)cdb[2] << 56) | ((ULONGLONG)cdb[3] << 48) |
+                 ((ULONGLONG)cdb[4] << 40) | ((ULONGLONG)cdb[5] << 32) |
+                 ((ULONGLONG)cdb[6] << 24) | ((ULONGLONG)cdb[7] << 16) |
+                 ((ULONGLONG)cdb[8] << 8)  | (ULONGLONG)cdb[9];
+        blocks = ((ULONG)cdb[10] << 24) | ((ULONG)cdb[11] << 16) |
+                 ((ULONG)cdb[12] << 8)  | (ULONG)cdb[13];
+        lba    = (lba64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (ULONG)lba64;
+    }
+    if (blocks == 0) {
+        return FALSE;
+    }
+    if (lba64 > 0xFFFFFFFFull || lba >= ext->Blocks || blocks > (ext->Blocks - lba)) {
+        return FALSE;                       // out of range: let ProcessOne reject it
+    }
+    bytes = blocks * ext->BlockBytes;
+    if (bytes > Srb->DataTransferLength) {
+        ULONG fits = Srb->DataTransferLength / ext->BlockBytes;
+        if (fits == 0) {
+            return FALSE;
+        }
+        blocks = fits;
+        bytes  = blocks * ext->BlockBytes;
+    }
+    if (bytes == 0 || bytes > Eng->ChunkBytes) {
+        return FALSE;                       // needs the chunked path
+    }
+    if (StorPortGetSystemAddress(Ext, Srb, &buffer) != STOR_STATUS_SUCCESS || buffer == NULL) {
+        return FALSE;
+    }
+
+    RtlZeroMemory(Cmd, sizeof(*Cmd));
+    Cmd->opcode = isRead ? NVMEOF_TCPK_OPC_READ : NVMEOF_TCPK_OPC_WRITE;
+    Cmd->nsid   = NVMEOFND_NSID;
+    Cmd->cdw10  = lba;
+    Cmd->cdw12  = (blocks - 1) & 0xFFFFu;
+    if (isRead) {
+        Cmd->outData  = buffer;
+        Cmd->outBytes = bytes;
+    } else {
+        Cmd->inData   = buffer;
+        Cmd->inBytes  = bytes;
+    }
+    *BytesOut = bytes;
+    *IsReadOut = isRead;
+    return TRUE;
+}
+
+// One worker per connection.  With nvmeofnd_pipelinedepth = 1 it takes one slot per
+// wake and runs it; above that it takes up to that many ready READ/WRITE SRBs and
+// hands them to NvtcpkBatch, so one connection keeps several commands in flight.
 static VOID NvmeofndWorker(PVOID Context)
 {
     PNVMEOFND_WORKER_CTX w = (PNVMEOFND_WORKER_CTX)Context;
@@ -690,9 +775,7 @@ static VOID NvmeofndWorker(PVOID Context)
 
     for (;;) {
         LARGE_INTEGER t;
-        NVMEOFND_SLOT s = { NULL, NULL };
         KIRQL irql;
-        BOOLEAN have = FALSE;
 
         t.QuadPart = -((LONGLONG)NVMEOFND_WAIT_MS * 10000);
         (void)KeWaitForSingleObject(&eng->Wake, Executive, KernelMode, FALSE, &t);
@@ -702,20 +785,105 @@ static VOID NvmeofndWorker(PVOID Context)
         }
         KeResetEvent(&eng->Wake);
 
-        KeAcquireSpinLock(&eng->Lock, &irql);
-        if (eng->Count != 0) {
-            s = eng->Slot[eng->Head];
-            eng->Head = (eng->Head + 1) % NVMEOFND_MAX_PENDING;
-            eng->Count--;
-            have = TRUE;
-        }
-        KeReleaseSpinLock(&eng->Lock, irql);
+        if (eng->PipeDepth > 1) {
+            NVTCPK_CMD cmds[NVMEOFND_MAX_PIPELINE];
+            PSCSI_REQUEST_BLOCK srbs[NVMEOFND_MAX_PIPELINE];
+            PVOID exts[NVMEOFND_MAX_PIPELINE];
+            ULONG lens[NVMEOFND_MAX_PIPELINE];
+            BOOLEAN isReads[NVMEOFND_MAX_PIPELINE];
+            ULONG n = 0, i;
+            NTSTATUS st;
 
-        if (have) {
-            // NEVER under the spinlock: completion can call back into HwStartIo
-            // (StorPort may start the next request from here), and that path
-            // takes this same lock.
-            NvmeofndProcessOne(eng, s.Ext, s.Srb, conn);
+            while (n < eng->PipeDepth) {
+                NVMEOFND_SLOT sl = { NULL, NULL };
+                BOOLEAN got = FALSE;
+                BOOLEAN isRead = FALSE;
+                ULONG bytes = 0;
+
+                KeAcquireSpinLock(&eng->Lock, &irql);
+                if (eng->Count != 0) {
+                    sl = eng->Slot[eng->Head];
+                    eng->Head = (eng->Head + 1) % NVMEOFND_MAX_PENDING;
+                    eng->Count--;
+                    got = TRUE;
+                }
+                KeReleaseSpinLock(&eng->Lock, irql);
+                if (!got) {
+                    break;
+                }
+                if (NvmeofndPrepareRw(eng, sl.Ext, sl.Srb, &cmds[n], &bytes, &isRead)) {
+                    srbs[n] = sl.Srb;
+                    exts[n] = sl.Ext;
+                    lens[n] = bytes;
+                    isReads[n] = isRead;
+                    n++;
+                } else {
+                    NvmeofndProcessOne(eng, sl.Ext, sl.Srb, conn);
+                }
+            }
+            if (n == 0) {
+                // nothing to do this wake
+            } else if (NT_SUCCESS(st = NvtcpkBatch(conn, cmds, n))) {
+                for (i = 0; i < n; i++) {
+                    PNVMEOFND_EXTENSION ext = (PNVMEOFND_EXTENSION)exts[i];
+                    PSCSI_REQUEST_BLOCK srb = srbs[i];
+
+                    if (cmds[i].status != 0) {
+                        if (isReads[i]) {
+                            NvmeofndSetSense(ext, srb, NVMEOFND_SENSE_MEDIUM_ERROR, 0x11, 0x00);
+                        } else {
+                            NvmeofndSetSense(ext, srb, NVMEOFND_SENSE_MEDIUM_ERROR, 0x0C, 0x00);
+                        }
+                        NvmeofndComplete(ext, srb, SRB_STATUS_ERROR);
+                        continue;
+                    }
+                    if (isReads[i]) {
+                        ext->Reads++;
+                    } else {
+                        ext->Writes++;
+                    }
+                    ext->IoBytes += lens[i];
+                    srb->DataTransferLength = (cmds[i].dataLen != 0) ? cmds[i].dataLen : lens[i];
+                    srb->ScsiStatus = NVMEOFND_STAT_GOOD;
+                    NvmeofndComplete(ext, srb, SRB_STATUS_SUCCESS);
+                }
+            } else {
+                for (i = 0; i < n; i++) {
+                    PNVMEOFND_EXTENSION ext = (PNVMEOFND_EXTENSION)exts[i];
+                    PSCSI_REQUEST_BLOCK srb = srbs[i];
+
+                    ext->TransportErrors++;
+                    if (st == STATUS_DEVICE_NOT_READY || st == STATUS_DEVICE_BUSY ||
+                        st == STATUS_INVALID_HANDLE) {
+                        ext->NotReadyAnswers++;
+                        NvmeofndSetSense(ext, srb, NVMEOFND_SENSE_NOT_READY, 0x04, 0x02);
+                    } else if (isReads[i]) {
+                        NvmeofndSetSense(ext, srb, NVMEOFND_SENSE_MEDIUM_ERROR, 0x11, 0x00);
+                    } else {
+                        NvmeofndSetSense(ext, srb, NVMEOFND_SENSE_MEDIUM_ERROR, 0x0C, 0x00);
+                    }
+                    NvmeofndComplete(ext, srb, SRB_STATUS_ERROR);
+                }
+            }
+        } else {
+            NVMEOFND_SLOT s = { NULL, NULL };
+            BOOLEAN have = FALSE;
+
+            KeAcquireSpinLock(&eng->Lock, &irql);
+            if (eng->Count != 0) {
+                s = eng->Slot[eng->Head];
+                eng->Head = (eng->Head + 1) % NVMEOFND_MAX_PENDING;
+                eng->Count--;
+                have = TRUE;
+            }
+            KeReleaseSpinLock(&eng->Lock, irql);
+
+            if (have) {
+                // NEVER under the spinlock: completion can call back into HwStartIo
+                // (StorPort may start the next request from here), and that path
+                // takes this same lock.
+                NvmeofndProcessOne(eng, s.Ext, s.Srb, conn);
+            }
         }
         // More work waiting: wake somebody (possibly this thread again) rather
         // than leave a slot stranded behind an unsignalled event.
@@ -778,6 +946,7 @@ static NTSTATUS NvmeofndStartWorker(PNVMEOFND_ENGINE Eng)
 #define NVMEOFND_CHUNK_MIN      4096u
 #define NVMEOFND_CHUNK_MAX      (512u * 1024u)
 #define NVMEOFND_MAX_QUEUES     8u
+#define NVMEOFND_MAX_PIPELINE   8u
 
 static ULONG NvmeofndReadChunkBytes(VOID)
 {
@@ -843,6 +1012,39 @@ static ULONG NvmeofndReadQueues(VOID)
     return q;
 }
 
+// How many SRBs one worker hands to the transport at once.  Default 1 keeps the
+// old behaviour exactly; nvmeofnd_pipelinedepth = 4 sends four capsules before
+// reading any response, which is what hides the per-command round trip.
+static ULONG NvmeofndReadDepth(VOID)
+{
+    UNICODE_STRING keyName, valueName;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE key = NULL;
+    UCHAR buf[24];
+    ULONG len = sizeof(buf);
+    ULONG d = 1;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return 1;
+    }
+    RtlInitUnicodeString(&keyName, L"\\Registry\\Machine\\Software\\NVMeoFProbe");
+    InitializeObjectAttributes(&oa, &keyName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (NT_SUCCESS(ZwOpenKey(&key, KEY_READ, &oa))) {
+        RtlInitUnicodeString(&valueName, L"nvmeofnd_pipelinedepth");
+        if (NT_SUCCESS(ZwQueryValueKey(key, &valueName, KeyValuePartialInformation, buf,
+                                       sizeof(buf), &len))) {
+            KEY_VALUE_PARTIAL_INFORMATION* p = (KEY_VALUE_PARTIAL_INFORMATION*)buf;
+            if (p->Type == REG_DWORD && p->DataLength == sizeof(ULONG)) {
+                d = *(ULONG*)p->Data;
+            }
+        }
+        ZwClose(key);
+    }
+    if (d < 1) { d = 1; }
+    if (d > NVMEOFND_MAX_PIPELINE) { d = NVMEOFND_MAX_PIPELINE; }
+    return d;
+}
+
 // Idempotent: HwInitialize calls it once, and a device restart finds the engine
 // already built and simply reuses it.
 static NTSTATUS NvmeofndEngineAttach(PNVMEOFND_EXTENSION Ext)
@@ -905,6 +1107,10 @@ static NTSTATUS NvmeofndEngineAttach(PNVMEOFND_EXTENSION Ext)
     }
     NvmeofndLogF("queues: %u connection(s) -> up to %u commands in flight",
                  g_engine->Queues, g_engine->Queues);
+
+    g_engine->PipeDepth = NvmeofndReadDepth();
+    NvmeofndLogF("pipeline depth: %u SRB(s) per batch (nvmeofnd_pipelinedepth)",
+                 g_engine->PipeDepth);
 
     st = NvmeofndStartWorker(g_engine);
     if (!NT_SUCCESS(st)) {
@@ -1610,6 +1816,9 @@ NTSTATUS DriverEntry(PVOID DriverObject, PVOID RegistryPath)
     }
     return st;
 }
+
+
+
 
 
 
