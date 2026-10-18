@@ -129,6 +129,12 @@
  * the user-mode winsock headers), so the value is spelled out here. 6 is TCP. */
 #define NVMEOF_TCPK_IPPROTO_TCP    6
 
+/* Socket-option level and names, spelled out for the same reason: SOL_SOCKET is
+ * 0xFFFF and the SO_* codes are the winsock ones. */
+#define NVMEOF_TCPK_SOL_SOCKET     0xFFFF
+#define NVMEOF_TCPK_SO_RCVBUF      0x1002
+#define NVMEOF_TCPK_SO_SNDBUF      0x1001
+
 /* Timeouts, in milliseconds.  Nothing here waits forever: an infinite wait in a
  * kernel driver is a machine that dies slowly with no dump at all. */
 #define NVMEOF_TCPK_CONNECT_MS     20000u
@@ -705,6 +711,29 @@ static NTSTATUS NvtcpkSocketCreate(PNVMEOF_TCPK_CONN c, PWSK_CLIENT client)
         c->socket = (PWSK_SOCKET)c->async.info;
         if (c->socket == NULL || c->socket->Dispatch == NULL) {
             return STATUS_UNSUCCESSFUL;
+        }
+        /* A 64 KiB data PDU plus its 24-byte header is 24 bytes past the default
+         * 64 KiB socket window, and the sender then stalls on a zero window for
+         * the rest of every command: measured 13 MB/s at 64 KiB versus 63 MB/s at
+         * 48 KiB.  1 MiB each way keeps the window open across several PDUs. */
+        {
+            const WSK_PROVIDER_CONNECTION_DISPATCH* cd =
+                (const WSK_PROVIDER_CONNECTION_DISPATCH*)c->socket->Dispatch;
+            ULONG win = 1024u * 1024u;
+            NTSTATUS ost = cd->WskControlSocket(c->socket, WskSetOption,
+                                               NVMEOF_TCPK_SO_RCVBUF, NVMEOF_TCPK_SOL_SOCKET,
+                                               sizeof(win), &win, 0, NULL, NULL, NULL);
+            if (!NT_SUCCESS(ost)) {
+                NvtcpkLogF("WskSetOption(SO_RCVBUF) = 0x%08X %s; keeping the default window",
+                           (unsigned)ost, NvtcpkStatusName(ost));
+            }
+            ost = cd->WskControlSocket(c->socket, WskSetOption,
+                                      NVMEOF_TCPK_SO_SNDBUF, NVMEOF_TCPK_SOL_SOCKET,
+                                      sizeof(win), &win, 0, NULL, NULL, NULL);
+            if (!NT_SUCCESS(ost)) {
+                NvtcpkLogF("WskSetOption(SO_SNDBUF) = 0x%08X %s; keeping the default buffer",
+                           (unsigned)ost, NvtcpkStatusName(ost));
+            }
         }
     }
     return st;
@@ -2126,5 +2155,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NvtcpkTraceValue(L"nvtcpk_loaded", 1);
     return STATUS_SUCCESS;
 }
+
 
 

@@ -1,4 +1,4 @@
-﻿/* SPDX-FileCopyrightText: 2026 Dingtaiqi
+/* SPDX-FileCopyrightText: 2026 Dingtaiqi
  * SPDX-License-Identifier: Apache-2.0
  *
  * iscsi_tcp_bridge.c - a minimal iSCSI target whose SCSI READ(10)/WRITE(10) become NVMe
@@ -250,6 +250,15 @@ static void setSendTimeout(SOCKET s, int ms)
 {
     DWORD t = (DWORD)ms;
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&t, sizeof(t));
+}
+
+/* 1 MiB each way: 64 KiB data PDUs over the default 64 KiB window stall on a
+ * zero window for the rest of every command (13 MB/s vs 63 MB/s measured). */
+static void setSocketBuffers(SOCKET s)
+{
+    int v = 1024 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&v, sizeof(v));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&v, sizeof(v));
 }
 
 /* 1 = all n bytes, 0 = peer closed, -1 = timed out before the first byte, -2 = error (or
@@ -681,6 +690,7 @@ static int nvmOpen(NVM* h, const char* ip, uint16_t port)
     }
     setRecvTimeout(h->sock, 30000);
     setSendTimeout(h->sock, 30000);
+    setSocketBuffers(h->sock);
     h->nextCid = 1;
 
     memset(&ic, 0, sizeof(ic));
@@ -1988,6 +1998,7 @@ static int runBridge(BRIDGE* br)
         CONNARG* a;
         HANDLE t;
         if (c == INVALID_SOCKET) { break; }
+        setSocketBuffers(c);
         a = (CONNARG*)calloc(1, sizeof(*a));
         if (a == NULL) { closesocket(c); continue; }
         a->sock = c;
@@ -2937,6 +2948,8 @@ int main(int argc, char** argv)
         return rc;
     }
 }
+
+
 
 
 
