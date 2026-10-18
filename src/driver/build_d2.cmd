@@ -30,6 +30,16 @@ echo === linking ===
 link /nologo /DRIVER:WDM /SUBSYSTEM:NATIVE,1.10 /MACHINE:X64 /GUARD:CF /OPT:REF /OPT:ICF /DEBUG /ENTRY:GsDriverEntry /LIBPATH:"%WDKLIB%\km\x64" /OUT:"%OUT%\nvmeofnd2.sys" "%OUT%\nvmeofnd.obj" "%OUT%\nvmeof_tcpk.obj" ntoskrnl.lib hal.lib wdm.lib storport.lib netio.lib BufferOverflowK.lib
 if errorlevel 1 (echo LINK FAILED & exit /b 4)
 
+rem Sign here, not by hand later: a freshly linked driver is unsigned, and when one
+rem was deployed unsigned the device refused to start with problem 52
+rem (CM_PROB_UNSIGNED_DRIVER, 0xC0000428) on 2026-10-18 - the build and the deploy
+rem both looked fine and only the device knew.  testsigning is on, so the local test
+rem certificate is enough.
+echo === signing ===
+set SIGNTOOL=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
+"%SIGNTOOL%" sign /fd sha256 /s My /n "NVMeoF Test Driver" "%OUT%\nvmeofnd2.sys"
+if errorlevel 1 (echo SIGN FAILED & exit /b 5)
+
 echo === result ===
 dir "%OUT%\nvmeofnd2.sys"
 exit /b 0

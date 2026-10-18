@@ -182,3 +182,39 @@
   3. `Z:` 出现，`Z:\roundtrip.bin` 的 SHA256 应为 `C0DC81BA3F03D8C865E1CF0D400EB298EF7DD3E419788D603CF45704A1455D9B`；
   4. 若 `Z:` 没出现：先确认 4421/3260 在监听（开机任务），再
      `pnputil /restart-device "ROOT\HDC\0002"`。
+
+---
+
+## 2026-10-18 09:2x 重启后的结果（新驱动已加载，`Z:` 已恢复）
+
+### 结果
+
+- 重启时 `nvmeofnd2.staged.sys` 被成功替换成 `nvmeofnd2.sys`，staged 文件已消失，
+  `PendingFileRenameOperations` 里的两条 nvmeof 记录也已被消费。
+- **新驱动现在真的在跑**：`ROOT\HDC\0002` = `Started`，`nvmeofnd2` = `RUNNING`，
+  部署文件 SHA256 = `C2A87053EFACDC7CB60A3EB92F7AC49F9A052150068E287CEE069250FFF1CC56`。
+- `Z:` 回来，3 个文件都在；`roundtrip.bin` 的 SHA256 仍是
+  `C0DC81BA3F03D8C865E1CF0D400EB298EF7DD3E419788D603CF45704A1455D9B`；
+  新写 64 KiB 再读回，**逐字节相同**。
+
+### 两个必须记住的坑
+
+1. **构建出来的驱动是未签名的，部署前必须签名。**
+   第一次重启后设备直接 `Problem 52 (CM_PROB_UNSIGNED_DRIVER, 0xC0000428)`，
+   文件 hash 是未签名的 `B40537DC...`。补签（`signtool sign /fd sha256 /s My
+   /n "NVMeoF Test Driver"`）后 hash 变成 `C2A87053...`；因为驱动没在运行，
+   文件当时可写，直接覆盖 + `pnputil /restart-device` 就恢复了，**不用再重启**。
+   现在 `src/driver/build_d2.cmd` **自带签名步骤**，构建完就是签好的。
+2. **SYSTEM 计划任务里不能用 PowerShell `Start-Process -RedirectStandardOutput
+   -WindowStyle Hidden` 来起 target/bridge。** 本机 A/B 实测（2026-10-18 09:22）：
+   同样以 SYSTEM 运行，`Start-Process` 版本**无输出、无进程、无监听**；
+   换成 `cmd /c start "" /b "<exe>" args > log 2>&1` 就正常打印并监听。
+   这就是为什么之前每次重启后 target 都起不来、微端口 problem 10。
+   `tools/boot_4421.ps1` 与 `tools/boot_bridge.ps1` 已改成 `cmd /c start`，
+   并在 SYSTEM 计划任务下实测通过（4421/3260 都在监听）。
+
+### 火绒
+
+操作者在火绒里"信任 D 盘"后，**SYSTEM 计划任务运行 `nvmeof_tcp.exe` 打开
+`D:\nvmeof\bridge-ns.img` 仍然 `cannot open namespace`**。所以命名空间继续放在
+`D:\rdma\nvmeof-ns.img`，开机脚本也指向那里；`D:\nvmeof\bridge-ns.img` 仅作旧副本保留。
