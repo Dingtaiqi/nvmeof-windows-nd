@@ -355,7 +355,8 @@ typedef struct _NVMEOFND_ENGINE {
     PVOID           IdBuf;        // 4096-byte non-paged Identify buffer
     ULONG           Blocks;       // NSZE from Identify CNS=0
     ULONG           BlockBytes;
-    ULONG           ChunkBytes;   // bytes per NVMe READ/WRITE (nvmeofnd_chunkkb, default 4 KiB)
+    ULONG           ChunkBytes;   // bytes per NVMe READ/WRITE (nvmeofnd_chunkkb, live)
+    ULONG           ChunkCheckedAt; // ms of the last live re-read of the knob
     ULONG           CmdOk;        // NVMe commands answered with status 0
     ULONG           CmdNvmeErr;   // NVMe commands answered with a non-zero status
     ULONG           CmdTransportErr;
@@ -463,13 +464,47 @@ static ULONGLONG NvmeofndGet64(const UCHAR* p)
 }
 
 // ---------------------------------------------------------------------------
-//  Transport: one SCSI READ/WRITE, split into <= 4096-byte NVMe commands.
+//  Transport: one SCSI READ/WRITE, split into chunks of at most Eng->ChunkBytes.
+//  The chunk size is a LIVE knob (nvmeofnd_chunkkb): the default is 4096, and
+//  setting 64 makes one NVMe command move 64 KiB, whose payload the transport
+//  carries as H2CData/C2HData PDUs.  It is deliberately NOT applied by restarting
+//  the device: on 2026-10-18 `pnputil /restart-device` on this connected miniport
+//  bugchecked with 0xCE (P2 = 0x10, unload with pending operations).
 //
 //  The CDW12 low 16 bits are the zero-based NLB, exactly as the NVMe spec and
 //  this target's parser (nvmeof_tcp.c: nlb = (cdw12 & 0xFFFF) + 1) expect.  The
 //  transport always puts CDW11 at zero, so SLBA[63:32] is zero: rejected here
 //  rather than silently addressing the wrong blocks.
 // ---------------------------------------------------------------------------
+static ULONG NvmeofndReadChunkBytes(VOID);
+
+static ULONG NvmeofndNowMs(VOID)
+{
+    LARGE_INTEGER t;
+    KeQuerySystemTime(&t);          // 100 ns units since 1601
+    return (ULONG)(t.QuadPart / 10000);
+}
+
+// At most one registry read per second: the knob is a test control, not something
+// that changes per command, and ZwOpenKey/ZwQueryValueKey at PASSIVE is cheap but
+// not free.
+static VOID NvmeofndRefreshChunk(PNVMEOFND_ENGINE Eng)
+{
+    ULONG now = NvmeofndNowMs();
+    ULONG bytes;
+
+    if (Eng->ChunkCheckedAt != 0 && (ULONG)(now - Eng->ChunkCheckedAt) < 1000u) {
+        return;
+    }
+    Eng->ChunkCheckedAt = now;
+    bytes = NvmeofndReadChunkBytes();
+    if (bytes != Eng->ChunkBytes) {
+        NvmeofndLogF("command size changed live: %u -> %u bytes (nvmeofnd_chunkkb)",
+                     Eng->ChunkBytes, bytes);
+        Eng->ChunkBytes = bytes;
+    }
+}
+
 static NTSTATUS NvmeofndTransportRw(PNVMEOFND_ENGINE Eng, BOOLEAN IsRead, ULONG Lba,
                                     PUCHAR Buf, ULONG Bytes, UCHAR* NvmeStatus,
                                     ULONG* Done)
@@ -478,6 +513,7 @@ static NTSTATUS NvmeofndTransportRw(PNVMEOFND_ENGINE Eng, BOOLEAN IsRead, ULONG 
 
     *Done = 0;
     *NvmeStatus = 0xFF;
+    NvmeofndRefreshChunk(Eng);
 
     while (off < Bytes) {
         ULONG chunk = Bytes - off;
@@ -788,10 +824,14 @@ static NTSTATUS NvmeofndEngineAttach(PNVMEOFND_EXTENSION Ext)
         return st;
     }
 
-    // Re-read on every attach: a device restart is how a new chunk size is applied.
-    g_engine->ChunkBytes = NvmeofndReadChunkBytes();
-    NvmeofndLogF("command size: %u bytes per NVMe READ/WRITE (nvmeofnd_chunkkb=%u)",
-                 g_engine->ChunkBytes, g_engine->ChunkBytes / 1024u);
+    // Boot SAFE: always start at 4 KiB and write that back to the registry, so a
+    // crash caused by a larger live value cannot arm the next boot with it too.
+    // NvmeofndRefreshChunk picks up a live change within a second.
+    g_engine->ChunkBytes = NVMEOFND_CHUNK_MIN;
+    g_engine->ChunkCheckedAt = 0;
+    NvmeofndTrace(L"nvmeofnd_chunkkb", NVMEOFND_CHUNK_MIN / 1024u);
+    NvmeofndLogF("command size at boot: %u bytes; nvmeofnd_chunkkb is re-read live (1 s)",
+                 g_engine->ChunkBytes);
 
     Ext->Eng        = g_engine;
     Ext->Blocks     = g_engine->Blocks;
