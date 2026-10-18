@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
 // SPDX-License-Identifier: Apache-2.0
 //
 // ===========================================================================
@@ -276,6 +276,7 @@ static volatile LONG g_lcqCount;
 static volatile LONG g_lcqDropped;
 
 static KEVENT g_acceptEvent;
+static KEVENT g_delayEvent;          // D3.1: the post-connect delay knob waits on this
 static volatile LONG g_acceptEvents;
 static NDK_CONNECTOR* g_incoming;    // handed to the connect-event callback
 static NDK_CONNECTOR* g_accepted;    // the same object, after NdkAccept was issued
@@ -1681,6 +1682,26 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING registryPath)
             writeLog();
             return STATUS_SUCCESS;
         }
+
+        // D3.1: the first data-path call (NdkSend) hung synchronously inside the
+        // provider after a successful connect/accept/CompleteConnect.  One possible
+        // cause is that the provider is still finishing the connection when the send
+        // arrives, so this knob waits nvmeofk_lpostdelay milliseconds before the
+        // exchange starts.  0 = the old behaviour, exactly.
+        {
+            ULONG delayMs = regDword(L"nvmeofk_lpostdelay", 0);
+            if (delayMs > 0) {
+                LARGE_INTEGER t;
+                logf("post-connect delay: waiting %u ms before the first send", delayMs);
+                writeLog();
+                KeInitializeEvent(&g_delayEvent, NotificationEvent, FALSE);
+                t.QuadPart = -((LONGLONG)delayMs * 10000);
+                st = KeWaitForSingleObject(&g_delayEvent, Executive, KernelMode, FALSE, &t);
+                logf("post-connect delay done: 0x%08X (%u ms elapsed)", st, delayMs);
+                writeLog();
+            }
+        }
+
         st = nvmeofRun();
         logf("nvmeofRun = 0x%08X%s", st, NT_SUCCESS(st) ? "  (NVME-OF OVER SAME-CARD RDMA: OK)" : "");
         LoopTeardown();

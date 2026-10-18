@@ -17,11 +17,12 @@ param(
     [ValidateSet(0, 1)][int]$Connect = 0,
     [string]$Tag = 'listen-only',
     [string]$Instance = (Get-Date -Format 'HHmmss'),
-    [int]$Port = 4420
+    [int]$Port = 4420,
+    [int]$PostDelay = 0
 )
 
 $ErrorActionPreference = 'Continue'
-$base   = 'D:\rdma\nvmeof\src\driver\sym\k\nvmeofk_d4.sys'
+$base   = 'D:\rdma\nvmeof\src\driver\sym\k\nvmeofk_d5.sys'
 $driver = 'D:\rdma\nvmeof\src\driver\sym\k\nvmeofk_lb_' + $Instance + '.sys'
 $svc    = 'nvmeofkloop' + $Instance
 $out    = 'D:\rdma\klisten_' + $Tag + '.txt'
@@ -75,11 +76,12 @@ $sig = & 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.e
 $knobs = @{
     nvmeofk_dolisten = 1
     nvmeofk_lconnect = $Connect
-    nvmeofk_ifindex  = 17
-    nvmeofk_lifindex = 30
+    nvmeofk_ifindex  = (Get-NetIPAddress -IPAddress '192.168.100.3' -AddressFamily IPv4 -EA SilentlyContinue).InterfaceIndex
+    nvmeofk_lifindex = (Get-NetIPAddress -IPAddress '192.168.100.2' -AddressFamily IPv4 -EA SilentlyContinue).InterfaceIndex
     nvmeofk_local    = (AddrToNetOrder '192.168.100.3')
     nvmeofk_target   = (AddrToNetOrder '192.168.100.2')
     nvmeofk_lport    = $Port
+    nvmeofk_lpostdelay = $PostDelay
 }
 foreach ($k in $knobs.Keys) {
     & reg.exe add 'HKLM\Software\NVMeoFProbe' /v $k /t REG_DWORD /d $knobs[$k] /f 2>&1 | Out-Null
@@ -98,8 +100,11 @@ $c = & sc.exe create $svc type= kernel start= demand binPath= $driver 2>&1
 Say ('sc create: ' + (($c | Where-Object { $_ -match 'SUCCESS|FAILED' }) -join ' '))
 
 $t0 = Get-Date
-$s = & sc.exe start $svc 2>&1
-Say ('sc start: ' + (($s | Where-Object { $_ -match 'STATE|FAILED' }) -join ' | '))
+# sc start blocks until DriverEntry returns; a wedged DriverEntry must not wedge
+# this script too, so the start is bounded and the registry log is read anyway.
+$sp = Start-Process -FilePath 'sc.exe' -ArgumentList @('start', $svc) -NoNewWindow -PassThru
+$exited = $sp.WaitForExit(30000)
+Say ('sc start returned within 30 s: ' + $exited + '  exit=' + $(if ($exited) { $sp.ExitCode } else { 'running' }))
 for ($i = 0; $i -lt 60; $i++) {
     Start-Sleep -Seconds 1
     $q = (& sc.exe query $svc 2>&1 | Where-Object { $_ -match 'STATE' }) -join ' '
@@ -125,6 +130,9 @@ $st = & sc.exe stop $svc 2>&1
 Say ('sc stop : ' + (($st | Where-Object { $_ -match 'STATE|FAILED' }) -join ' | '))
 Say ('sc delete: ' + ((& sc.exe delete $svc 2>&1) -join ' '))
 Say '=== RUN DONE ==='
+
+
+
 
 
 
