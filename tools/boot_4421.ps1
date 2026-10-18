@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Dingtaiqi
+﻿# SPDX-FileCopyrightText: 2026 Dingtaiqi
 # SPDX-License-Identifier: Apache-2.0
 #
 # 2026-10-18: two fixes learned the hard way.
@@ -16,6 +16,6 @@ $p   = 'D:\rdma\nvmeof-ns.img'
 $exe = 'D:\rdma\nvmeof\src\nvmeof_tcp.exe'
 if (-not (Test-Path $p)) { New-Item -ItemType Directory -Path 'D:\rdma' -Force | Out-Null }
 if (-not (Get-NetTCPConnection -LocalPort 4421 -State Listen -EA SilentlyContinue)) {
-  $line = 'start "" /b "' + $exe + '" -target 127.0.0.1 4421 -nsfile "' + $p + '" -blocks 32768 -serve > D:\rdma\target4421.out 2>&1'
+  $line = 'start "" /b "' + $exe + '" -target 127.0.0.1 4421 -nsfile "' + $p + '" -blocks 524288 -serve > D:\rdma\target4421.out 2>&1'
   & cmd.exe /c $line
 }

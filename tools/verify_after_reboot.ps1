@@ -44,7 +44,7 @@ $th = HashOf 'D:\rdma\nvmeof\src\nvmeof_tcp.exe'
 $bh = HashOf 'D:\rdma\nvmeof\src\iscsi_tcp_bridge.exe'
 Check ($th -eq $TargetHash) 'nvmeof_tcp.exe is the out-of-capsule build' $th
 Check ($bh -eq $BridgeHash) 'iscsi_tcp_bridge.exe is the 64 KiB build' $bh
-Check ((Test-Path 'D:\rdma\nvmeof-ns.img') -and ((Get-Item 'D:\rdma\nvmeof-ns.img').Length -eq 16777216)) 'the namespace image is the 16 MiB one (hash unreadable while the target holds it open)'
+Check ((Test-Path 'D:\rdma\nvmeof-ns.img') -and ((Get-Item 'D:\rdma\nvmeof-ns.img').Length -eq 268435456)) 'the namespace image is the 256 MiB one (hash unreadable while the target holds it open)'
 $l4421 = (Get-NetTCPConnection -LocalPort 4421 -State Listen -EA SilentlyContinue)
 $l3260 = (Get-NetTCPConnection -LocalPort 3260 -State Listen -EA SilentlyContinue)
 Check ($null -ne $l4421) 'target is listening on 4421'
@@ -86,6 +86,7 @@ if (Test-Path $selftest) {
 Write-Output "`n================================================"
 Write-Output ('failures: ' + $script:fail)
 exit $script:fail
+
 
 
 
