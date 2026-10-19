@@ -39,10 +39,11 @@
 # ===========================================================================
 name: ci
 
+# Automatic runs are OFF on purpose.  Every push to main used to start a
+# windows-2022 job, and pushing progress several times an hour burned through this
+# account's Actions minutes.  Run it by hand from the Actions tab when a change
+# actually needs the wire-format / constant gate (workflow_dispatch).
 on:
-  push:
-    branches: [ main ]
-  pull_request:
   workflow_dispatch:
 
 jobs:
