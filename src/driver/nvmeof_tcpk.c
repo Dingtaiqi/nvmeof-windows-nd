@@ -1,4 +1,4 @@
-﻿/* SPDX-FileCopyrightText: 2026 Dingtaiqi
+/* SPDX-FileCopyrightText: 2026 Dingtaiqi
  * SPDX-License-Identifier: Apache-2.0
  *
  * nvmeof_tcpk.c - the NVMe/TCP transport client, in kernel mode, over WSK.
@@ -1968,6 +1968,9 @@ static NTSTATUS NvtcpkBatchEx(PNVMEOF_TCPK_CONN c, NVTCPK_CMD* cmds, ULONG n)
     ULONG i, done = 0, pdus;
     const ULONG maxPdus = NVMEOF_TCPK_MAX_PDUS_PER_CMD * n;
 
+    NvtcpkLogF("batch: n=%u first op=0x%02X in=%u out=%u",
+               n, (unsigned)cmds[0].opcode, cmds[0].inBytes, cmds[0].outBytes);
+
     /* 1. send */
     for (i = 0; i < n; i++) {
         NVTCPK_CMD* m = &cmds[i];
@@ -1986,6 +1989,9 @@ static NTSTATUS NvtcpkBatchEx(PNVMEOF_TCPK_CONN c, NVTCPK_CMD* cmds, ULONG n)
             goto fail;
         }
         NvtcpkBuildCapsule(c, sqe, pdo, m->inData, capsuleBytes);
+        NvtcpkLogF("batch[%u] cid=%u op=0x%02X pdo=%u cap=%u total=%u",
+                   i, (unsigned)m->cid, (unsigned)m->opcode, pdo, capsuleBytes,
+                   pdo + capsuleBytes);
         st = NvtcpkSend(c, pdo + capsuleBytes);
         if (!NT_SUCCESS(st)) {
             NvtcpkLogF("batch[%u/%u] opcode 0x%02X: capsule send failed 0x%08X %s",
@@ -2013,6 +2019,9 @@ static NTSTATUS NvtcpkBatchEx(PNVMEOF_TCPK_CONN c, NVTCPK_CMD* cmds, ULONG n)
         }
         nvmeofTcpReadHdr((const uint8_t*)c->rspBuf, &hdr);
         hlen = hdr.hlen;
+        NvtcpkLogF("batch: rx pdu #%u type=0x%02X flags=0x%02X hlen=%u pdo=%u plen=%u",
+                   pdus, (unsigned)hdr.type, (unsigned)hdr.flags, hlen,
+                   (unsigned)hdr.pdo, (unsigned)hdr.plen);
         if (hlen < NVMEOF_TCP_HDR_LEN || hlen > NVMEOF_TCPK_BUF_BYTES) {
             NvtcpkLogF("batch: PDU type 0x%02X announces hlen=%u", (unsigned)hdr.type, hlen);
             st = STATUS_INVALID_NETWORK_RESPONSE;
@@ -2400,6 +2409,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NvtcpkTraceValue(L"nvtcpk_loaded", 1);
     return STATUS_SUCCESS;
 }
+
 
 
 
