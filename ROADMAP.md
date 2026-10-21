@@ -1,5 +1,10 @@
 # 路线图：从"能用"到"完备"的 NVMe-oF
 
+> **时效说明（2026-10-21）**：本文档写于 2026-10-05，描述的是 **RDMA/ND 路线**的排期。
+> 之后新增了**内核 NVMe/TCP 路线**（`nvmeofnd2.sys` 微端口 + 用户态 target，`Z:` 256 MiB、
+> 8 队列、512 KiB 命令、实测 ~223 MB/s），以及批量流水线实验的结论；
+> 这些都在 **[KERNEL-NVMEOF-STATUS.md](KERNEL-NVMEOF-STATUS.md)**，本文的 G-9 等条目已按其更新。
+
 这份表是给排期用的。它把"距离完备还差什么"拆成可独立交付的条目，每条都带**验收判据**——
 没有判据的条目不进这张表（这是本仓库一贯的规矩：一个不会失败的检查不是检查）。
 
@@ -40,7 +45,7 @@ C 中，D、E 低（见 §6）。**每个里程碑与合计的人日都由 §3 �
 | G-6 | NDSPI 无 `IB_WR_SEND_WITH_INV` → 远端 STag 作废只能靠 host 本地 invalidation | DESIGN §7 风险表 |
 | G-7 | 无 SRQ、无多 QP 负载均衡、CQ 轮询（非中断） | DESIGN §2 非目标 |
 | G-8 | initiator 是**用户态进程** → 不能做系统卷、不出现在磁盘管理、无真实队列深度 | 架构事实 |
-| G-9 | 只有 RDMA 一种 transport（无 NVMe/TCP、无 FC-NVMe） | `nvmeof_wire.h` 只有 fabrics/RDMA 路径 |
+| G-9 | **RDMA 路线**只有 RDMA 一种 transport；**内核 NVMe/TCP 已另行实现**（`nvmeofnd2.sys` + 用户态 target，见 `KERNEL-NVMEOF-STATUS.md`），但仍无 FC-NVMe；用户态 RDMA initiator 的限制（G-8）不变 | `nvmeof_wire.h` 只有 fabrics/RDMA 路径；NVMe/TCP 在 `src/nvmeof_tcp.c` / `src/driver/` |
 | G-10 | CI 只跑 4 套（无硬件）；无 fuzz、无 soak；互操作只对过 Linux `nvmet` 与 LIO | `.github/workflows/ci.yml` |
 
 ## 3. 工作计划表

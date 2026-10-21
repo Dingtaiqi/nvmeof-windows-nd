@@ -18,6 +18,8 @@ hypervisor 接管 DMA 重映射/IOMMU → Mellanox (WinOF 5.50, CX3) 的 NDK 提
 - 以太网 23 是网桥成员，是通往局域网那条路，不可动
 - 对端是 EndeavourOS 笔记本 + 千兆网卡上的软件 RoCE (rda_rxe)，192.168.100.5
 - **同卡回环被 RDMA-CM 拒绝** → 必须两台机器
+  **（此条后来被推翻：同卡自环的 CM 握手是通的，当时失败是目标端缺 `ndv2.dll`；
+  见 `KERNEL-NVMEOF-STATUS.md` 与 `evidence/NDK-LOOPBACK-2026-10-18.md`）**
 
 ## 驱动侧真缺陷（都修了，都有实证）
 1. StepStart 每次 KeInitializeEvent → 破坏等待链表（转储实证）
@@ -27,11 +29,13 @@ hypervisor 接管 DMA 重映射/IOMMU → Mellanox (WinOF 5.50, CX3) 的 NDK 提
 5. NdkGetConnectionData 的 pPrivateDataLength 是 IN/OUT，传了未初始化栈变量（ndkpi.h）
 6. teardown 连续 5 次复用同一上下文
 
-## 当前状态
-- 内核 NDK 通路**全绿且稳定** ✓（hypervisor 关闭时）
-- 只差一个**活的监听目标**（笔记本的 nvmet 需重新拉起），即可完成
-  NdkConnect → Fabrics Connect → Property Get CAP → NVMe 读 + RDMA Read + 字节比对
+## 当前状态（2026-10-21 更新）
 
-## 机器设置改动（可还原）
-`bcdedit /set hypervisorlaunchtype off` —— 会让虚拟机/WSL2/沙盒不可用；
-还原：`bcdedit /set hypervisorlaunchtype auto`
+- 内核 NDK 通路在 hypervisor 关闭时能建连（CM 握手 0x0、`NdkAccept` 0x0），
+  但**第一个 `NdkSend` 在 provider 内部挂死**（无 CQ 完成、无超时，随后 `0x139`），
+  延迟 2 秒再发也一样。证据：`evidence/NDK-LOOPBACK-2026-10-18.md`。
+- 结论：这台机器上 mlx4/WinOF-5.50 的 NDK 提供程序不可用；**RDMA 路线等 CX-4 硬件**。
+- 可用的路线是内核 NVMe/TCP（`nvmeofnd2.sys` + 用户态 target），当前 `Z:` 256 MiB、
+  实测 ~223 MB/s；详见 `KERNEL-NVMEOF-STATUS.md`。
+- 机器设置改动（可还原）：`bcdedit /set hypervisorlaunchtype off` —— 会让虚拟机/WSL2/
+  沙盒不可用；还原：`bcdedit /set hypervisorlaunchtype auto`。

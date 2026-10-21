@@ -7,6 +7,13 @@
 内存注册、每个 I/O 队列独立 queue pair，**initiator 与 target 两端都是我们的代码**，
 没有使用任何第三方 NVMe-oF 实现。
 
+> **当前状态（2026-10-21）**：这台机器上实际可用的是**内核 NVMe/TCP** 路线
+> （`nvmeofnd2.sys` 微端口 + 用户态 `nvmeof_tcp.exe` target）：`Z:` 是 256 MiB 的
+> NVMe/TCP 卷，8 条队列、512 KiB 命令，回环聚合 ~223 MB/s，验收脚本 0 失败。
+> 下面的 RDMA/ND 路线受硬件限制（hypervisor 下 mlx4/WinOF-5.50 的 NDK 提供程序返回
+> `0xC0010011`，等 CX-4 到货），它的验收表是 2026-10-05 的状态。
+> 逐日状态、实测数据与规矩见 **[KERNEL-NVMEOF-STATUS.md](KERNEL-NVMEOF-STATUS.md)**。
+
 先读结论再读代码：**[DESIGN.md](DESIGN.md)** 是设计与实测记录（§8 是逐条踩坑史），
 **[INTEROP_F5.md](INTEROP_F5.md)** 是"如何用一台 Linux 机器做独立对端"的操作手册。
 

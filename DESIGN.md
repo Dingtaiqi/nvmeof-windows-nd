@@ -3,6 +3,12 @@
 目标：用我们自己的 NetworkDirect 栈（`D:\rdma\rdmaio`，已在 CX3 Pro / RoCE v2 上跑到
 2.53 GB/s）实现 NVMe-oF，**不用第三方免费阉割版**。
 
+> **时效说明（2026-10-21）**：本文件是 RDMA/ND 路线的设计与实测记录。当前这台机器上
+> 实际部署的是内核 **NVMe/TCP** 路线（StorPort 微端口 + 用户态 target，`Z:` 256 MiB、
+> 8 队列、512 KiB、~223 MB/s）——状态、时间线与教训见
+> [KERNEL-NVMEOF-STATUS.md](KERNEL-NVMEOF-STATUS.md)。ND 路线因 hypervisor 下
+> `NdkOpenAdapter` 返回 `0xC0010011` 而暂停，等 CX-4 硬件。
+
 ---
 
 ## 0. 为什么这条路和之前那轮调研完全不同

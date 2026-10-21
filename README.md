@@ -7,6 +7,15 @@ commands, 64-byte capsules, keyed SGL/STag, RDMA Read/Write, memory registration
 queue pair per I/O queue. **Both ends — initiator and target — are this repository's own
 code.** No third-party NVMe-oF implementation is used anywhere.
 
+> **Current state (2026-10-21).** The active path on this machine is now the **kernel
+> NVMe/TCP** stack (`nvmeofnd2.sys` miniport + the user-mode `nvmeof_tcp.exe` target):
+> `Z:` is a 256 MiB NVMe/TCP volume, 8 queues, 512 KiB commands, ~223 MB/s aggregate on
+> loopback, and `tools/verify_after_reboot.ps1` passes with 0 failures. The RDMA/ND stack
+> described below is blocked on hardware here (the mlx4/WinOF-5.50 NDK provider fails under
+> the hypervisor with `0xC0010011`; a ConnectX-4 is on order), so its acceptance table is
+> the state as of 2026-10-05. Day-to-day status, measurements and rules live in
+> **[KERNEL-NVMEOF-STATUS.md](KERNEL-NVMEOF-STATUS.md)**.
+
 Two things this gets you that Windows does not have on its own:
 
 1. **A working NVMe-oF initiator on a client SKU.** Windows Server ships one; client
@@ -426,9 +435,11 @@ drops the link.
 
 | File | Contents |
 |---|---|
+| [KERNEL-NVMEOF-STATUS.md](KERNEL-NVMEOF-STATUS.md) | **Start here for day-to-day state**: the kernel NVMe/TCP path (driver, target, `Z:` volume, measurements), the timeline and the rules learned the hard way |
 | [DESIGN.md](DESIGN.md) | Design and measurement log; §8 is the defect-by-defect history |
 | [INTEROP_F5.md](INTEROP_F5.md) | How to use a separate Linux machine as an independent peer (link script, steps, rollback) |
 | [EVIDENCE-1TB.md](EVIDENCE-1TB.md) | Raw evidence for the 1 TB disk on Windows, including the teardown record |
+| [HYPERVISOR-WAS-THE-CAUSE.md](HYPERVISOR-WAS-THE-CAUSE.md) | Why the mlx4 NDK provider fails under the hypervisor (`0xC0010011`), and what that means for the RDMA route |
 | [DRIVER-D0.md](DRIVER-D0.md) | Preparation for the kernel-mode route (D0/D1): what is already proven about this machine (the WDK is installed, ndkpi.h and storport.h are present), what the probe must prove, how to build and load a driver here, and the risks in the order that decides whether the route exists at all |
 | [ROADMAP.md](ROADMAP.md) | What is still missing for a complete NVMe-oF, as a work plan: per-item scope, dependencies, effort estimate and — for every item — an acceptance criterion, plus milestones, the critical path and the decisions that change the ordering |
 | [COMMERCIAL.md](COMMERCIAL.md) | Commercial licensing (Apache-2.0 dual licensing) and license-compatibility notes |
