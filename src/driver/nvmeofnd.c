@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: 2026 Dingtaiqi
+// SPDX-FileCopyrightText: 2026 Dingtaiqi
 // SPDX-License-Identifier: Apache-2.0
 //
 // ===========================================================================
@@ -354,7 +354,8 @@ typedef struct _NVMEOFND_ENGINE {
     volatile LONG   Stop;         // never set in practice; checked by the worker
     BOOLEAN         ThreadStarted;
     ULONG           Queues;       // connections/worker threads actually open (1..MAX)
-    ULONG           PipeDepth;    // SRBs batched per wake (nvmeofnd_pipelinedepth)
+    ULONG           PipeDepth;    // SRBs batched per wake (nvmeofnd_pipelinedepth, live)
+    ULONG           DepthCheckedAt; // ms of the last live re-read of the depth
     PVOID           Conn[8];      // one NVTCP connection per queue
     PVOID           IdBuf;        // 4096-byte non-paged Identify buffer
     ULONG           Blocks;       // NSZE from Identify CNS=0
@@ -682,6 +683,27 @@ typedef struct _NVMEOFND_WORKER_CTX {
     ULONG            Index;
 } NVMEOFND_WORKER_CTX, *PNVMEOFND_WORKER_CTX;
 
+static ULONG NvmeofndReadDepth(VOID);
+
+// The depth is a LIVE knob, and boot always starts at 1 (the safe value): a batch
+// test that wedges the machine therefore comes back safe by itself.  Read at most
+// once a second, so setting 1 in the registry stops batching within a second.
+static VOID NvmeofndRefreshDepth(PNVMEOFND_ENGINE Eng)
+{
+    ULONG now = NvmeofndNowMs();
+    ULONG d;
+
+    if (Eng->DepthCheckedAt != 0 && (ULONG)(now - Eng->DepthCheckedAt) < 1000u) {
+        return;
+    }
+    Eng->DepthCheckedAt = now;
+    d = NvmeofndReadDepth();
+    if (d != Eng->PipeDepth) {
+        NvmeofndLogF("pipeline depth changed live: %u -> %u", Eng->PipeDepth, d);
+        Eng->PipeDepth = d;
+    }
+}
+
 // A READ/WRITE SRB that fits in ONE NVMe command at the current chunk size can go
 // into a batch.  The parsing deliberately matches ProcessOne: same CDB forms,
 // same range check, same whole-block rounding; anything that does not fit is left
@@ -784,6 +806,7 @@ static VOID NvmeofndWorker(PVOID Context)
             break;
         }
         KeResetEvent(&eng->Wake);
+        NvmeofndRefreshDepth(eng);
 
         if (eng->PipeDepth > 1) {
             NVTCPK_CMD cmds[NVMEOFND_MAX_PIPELINE];
@@ -792,6 +815,8 @@ static VOID NvmeofndWorker(PVOID Context)
             ULONG lens[NVMEOFND_MAX_PIPELINE];
             BOOLEAN isReads[NVMEOFND_MAX_PIPELINE];
             ULONG n = 0, i;
+            UCHAR batchOp = 0;
+            ULONG batchBytes = 0;
             NTSTATUS st;
 
             while (n < eng->PipeDepth) {
@@ -811,15 +836,34 @@ static VOID NvmeofndWorker(PVOID Context)
                 if (!got) {
                     break;
                 }
-                if (NvmeofndPrepareRw(eng, sl.Ext, sl.Srb, &cmds[n], &bytes, &isRead)) {
-                    srbs[n] = sl.Srb;
-                    exts[n] = sl.Ext;
-                    lens[n] = bytes;
-                    isReads[n] = isRead;
-                    n++;
-                } else {
+                if (!NvmeofndPrepareRw(eng, sl.Ext, sl.Srb, &cmds[n], &bytes, &isRead)) {
                     NvmeofndProcessOne(eng, sl.Ext, sl.Srb, conn);
+                    continue;
                 }
+                // ONE DIRECTION PER BATCH.  A mixed batch is what deadlocked the
+                // first version: the host sends a Write's payload before reading,
+                // while the target is blocked sending the earlier Read's data that
+                // the host has not read yet - with the default (small) socket
+                // buffers both sides end up waiting for the other.  Reads only send
+                // tiny capsules; Writes only receive tiny completions; mixing them
+                // is what fills both directions.
+                if (n != 0 && cmds[n].opcode != batchOp) {
+                    NvmeofndProcessOne(eng, sl.Ext, sl.Srb, conn);
+                    continue;
+                }
+                if (n != 0 && batchBytes + bytes > 1024u * 1024u) {
+                    NvmeofndProcessOne(eng, sl.Ext, sl.Srb, conn);
+                    continue;
+                }
+                if (n == 0) {
+                    batchOp = cmds[n].opcode;
+                }
+                batchBytes += bytes;
+                srbs[n] = sl.Srb;
+                exts[n] = sl.Ext;
+                lens[n] = bytes;
+                isReads[n] = isRead;
+                n++;
             }
             if (n == 0) {
                 // nothing to do this wake
@@ -1108,9 +1152,12 @@ static NTSTATUS NvmeofndEngineAttach(PNVMEOFND_EXTENSION Ext)
     NvmeofndLogF("queues: %u connection(s) -> up to %u commands in flight",
                  g_engine->Queues, g_engine->Queues);
 
-    g_engine->PipeDepth = NvmeofndReadDepth();
-    NvmeofndLogF("pipeline depth: %u SRB(s) per batch (nvmeofnd_pipelinedepth)",
-                 g_engine->PipeDepth);
+    // Boot always arms depth 1 AND writes 1 back: a batch test that wedges the
+    // machine therefore cannot arm a wedge loop at the next boot.  The knob is
+    // live (NvmeofndRefreshDepth), so a test sets 2 once the system is up.
+    g_engine->PipeDepth = 1;
+    NvmeofndTrace(L"nvmeofnd_pipelinedepth", 1);
+    NvmeofndLogF("pipeline depth: 1 at boot; nvmeofnd_pipelinedepth is a live knob");
 
     st = NvmeofndStartWorker(g_engine);
     if (!NT_SUCCESS(st)) {
@@ -1816,6 +1863,8 @@ NTSTATUS DriverEntry(PVOID DriverObject, PVOID RegistryPath)
     }
     return st;
 }
+
+
 
 
 
