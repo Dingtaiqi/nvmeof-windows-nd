@@ -1,4 +1,4 @@
-﻿/* SPDX-FileCopyrightText: 2026 Dingtaiqi
+/* SPDX-FileCopyrightText: 2026 Dingtaiqi
  * SPDX-License-Identifier: Apache-2.0
  *
  * nvmeof_tcp.c - NVMe/TCP, both ends, user mode.
@@ -287,7 +287,16 @@ static void fillIdentifyController(uint8_t* d, uint32_t blocks)
 /* The ICResp also advertises maxr2t = 0, i.e. write data is host-driven and needs no    */
 /* R2T - the same flow the Linux host and this project's own clients use.                */
 /* ------------------------------------------------------------------------------------ */
-#define NVMEOF_TCP_IO_CHUNK 63488u   /* 62 KiB: a 64 KiB+24 PDU hits a kernel receive boundary */
+#define NVMEOF_TCP_IO_CHUNK 262144u  /* 256 KiB.  The kernel receive window is a REAL
+                                        1 MiB now (the IRP-issued WskSetOption took:
+                                        0x00000000 in the log), so the 62 KiB cap -
+                                        born from the old default-64-KiB window - only
+                                        multiplied the per-PDU cost: one PDU round trip
+                                        measures ~775 us on this stack, so 4x fewer
+                                        PDUs is the lever.  H2C (the other direction)
+                                        stays 62 KiB in the driver: WSK answers
+                                        SO_SNDBUF with STATUS_NOT_SUPPORTED, so the
+                                        send window is still the default one. */
 
 static int sendC2HData(SOCKET s, uint16_t cid, const uint8_t* data, uint32_t len)
 {

@@ -114,16 +114,23 @@
  * sanity ceiling for a single command. */
 #define NVMEOF_TCPK_IO_MAX         (1024u * 1024u)
 
-/* One data PDU carries up to 64 KiB, i.e. a whole command at the default chunk
- * size.  Every PDU costs the host a WSK receive IRP, and 4 KiB PDUs made a 64 KiB
- * read seventeen of them - about 1.7 ms per command and 37 MB/s on Z:.  The peer
- * (nvmeof_tcp.c) sends C2HData in the same size, so one command is two IRPs. */
-#define NVMEOF_TCPK_DATA_PDU_MAX   63488u   /* 62 KiB: 65560 bytes is past the 64 KiB receive boundary */
+/* The two data-PDU directions now have different ceilings, and the reason is
+ * asymmetric sockets: the IRP-issued WskSetOption really sets SO_RCVBUF to 1 MiB
+ * (0x00000000 in the log), but SO_SNDBUF answers STATUS_NOT_SUPPORTED, so the
+ * send window stays at the default 64 KiB.
+ *   H2C (this side sends):  62 KiB - 65560 bytes is past the default window.
+ *   C2H (this side receives): 256 KiB - one PDU round trip costs ~775 us on this
+ *                             stack (512 KiB = 9 PDUs = 6.1 ms, 1 MiB = 17 PDUs =
+ *                             12.3 ms, fixed cost ~0), so fewer, larger PDUs are
+ *                             the whole game on the read path. */
+#define NVMEOF_TCPK_DATA_PDU_MAX   63488u   /* H2C: what this side sends */
+#define NVMEOF_TCPK_C2H_PDU_MAX    262144u  /* C2H: what this side accepts */
 
 /* One buffer serves every PDU in both directions.  The slack covers the capsule
  * header (72) plus whatever padding the peer's cpda demands for the data offset
- * (up to 128 is accepted), plus the 4-byte tail pad of a received PDU. */
-#define NVMEOF_TCPK_BUF_BYTES      (NVMEOF_TCP_CCMD_HDR_LEN + 256u + NVMEOF_TCPK_DATA_PDU_MAX)
+ * (up to 128 is accepted), plus the 4-byte tail pad of a received PDU.  Sized by
+ * the C2H ceiling: that is the direction whose PDUs land here whole. */
+#define NVMEOF_TCPK_BUF_BYTES      (NVMEOF_TCP_CCMD_HDR_LEN + 256u + NVMEOF_TCPK_C2H_PDU_MAX)
 
 /* IPPROTO_TCP.  The kernel-mode copies of ws2def.h do not define it (it lives in
  * the user-mode winsock headers), so the value is spelled out here. 6 is TCP. */
@@ -1902,7 +1909,7 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
                 return STATUS_INVALID_NETWORK_RESPONSE;
             }
             nvmeofTcpReadData((const uint8_t*)c->rspBuf, &d);
-            if (d.datal > NVMEOF_TCPK_DATA_PDU_MAX || hlen + d.datal > NVMEOF_TCPK_BUF_BYTES) {
+            if (d.datal > NVMEOF_TCPK_C2H_PDU_MAX || hlen + d.datal > NVMEOF_TCPK_BUF_BYTES) {
                 c->broken = TRUE;
                 NvtcpkLogF("command 0x%02X: C2HData datal=%u", (unsigned)opcode, d.datal);
                 return STATUS_INVALID_NETWORK_RESPONSE;
@@ -2125,7 +2132,7 @@ static NTSTATUS NvtcpkBatchEx(PNVMEOF_TCPK_CONN c, NVTCPK_CMD* cmds, ULONG n)
                 st = STATUS_INVALID_NETWORK_RESPONSE;
                 goto fail;
             }
-            if (d.datal > NVMEOF_TCPK_DATA_PDU_MAX || hlen + d.datal > NVMEOF_TCPK_BUF_BYTES) {
+            if (d.datal > NVMEOF_TCPK_C2H_PDU_MAX || hlen + d.datal > NVMEOF_TCPK_BUF_BYTES) {
                 st = STATUS_INVALID_NETWORK_RESPONSE;
                 goto fail;
             }
