@@ -703,6 +703,32 @@ static void NvtcpkIrpFree(PIRP Irp)
  * here, and a zeroed table is the same thing to a provider that copies it. */
 static const WSK_CLIENT_CONNECTION_DISPATCH g_socketDispatch = { NULL, NULL, NULL };
 
+/* WSK, unlike Winsock, requires a caller-allocated IRP for EVERY client downcall:
+ * WskControlSocket with a NULL IRP answers STATUS_INVALID_PARAMETER (0xC000000D).
+ * That is what silenced the buffer sizing below for so long - the call was spelled
+ * correctly (SO_RCVBUF at SOL_SOCKET) but never actually issued. */
+static NTSTATUS NvtcpkSetSockOpt(PNVMEOF_TCPK_CONN c, ULONG option, ULONG value)
+{
+    NTSTATUS st;
+    PIRP irp = NvtcpkIrpNew(&c->async);
+    const WSK_PROVIDER_CONNECTION_DISPATCH* cd = NvtcpkDispatch(c);
+
+    if (irp == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    NvtcpkStepStart(&c->async);
+    st = cd->WskControlSocket(c->socket, WskSetOption, option,
+                              NVMEOF_TCPK_SOL_SOCKET, sizeof(value), &value,
+                              0, NULL, NULL, irp);
+    st = NvtcpkStepFinish(st, &c->async, NVMEOF_TCPK_HS_MS, "WskSetOption");
+    if (st == STATUS_IO_TIMEOUT) {
+        NvtcpkSetPoisoned(c);
+        return st;                      /* IRP still owned by WSK: leak it */
+    }
+    NvtcpkIrpFree(irp);
+    return st;
+}
+
 static NTSTATUS NvtcpkSocketCreate(PNVMEOF_TCPK_CONN c, PWSK_CLIENT client)
 {
     NTSTATUS st;
@@ -734,23 +760,11 @@ static NTSTATUS NvtcpkSocketCreate(PNVMEOF_TCPK_CONN c, PWSK_CLIENT client)
          * the rest of every command: measured 13 MB/s at 64 KiB versus 63 MB/s at
          * 48 KiB.  1 MiB each way keeps the window open across several PDUs. */
         {
-            const WSK_PROVIDER_CONNECTION_DISPATCH* cd =
-                (const WSK_PROVIDER_CONNECTION_DISPATCH*)c->socket->Dispatch;
-            ULONG win = 1024u * 1024u;
-            NTSTATUS ost = cd->WskControlSocket(c->socket, WskSetOption,
-                                               NVMEOF_TCPK_SO_RCVBUF, NVMEOF_TCPK_SOL_SOCKET,
-                                               sizeof(win), &win, 0, NULL, NULL, NULL);
-            if (!NT_SUCCESS(ost)) {
-                NvtcpkLogF("WskSetOption(SO_RCVBUF) = 0x%08X %s; keeping the default window",
-                           (unsigned)ost, NvtcpkStatusName(ost));
-            }
-            ost = cd->WskControlSocket(c->socket, WskSetOption,
-                                      NVMEOF_TCPK_SO_SNDBUF, NVMEOF_TCPK_SOL_SOCKET,
-                                      sizeof(win), &win, 0, NULL, NULL, NULL);
-            if (!NT_SUCCESS(ost)) {
-                NvtcpkLogF("WskSetOption(SO_SNDBUF) = 0x%08X %s; keeping the default buffer",
-                           (unsigned)ost, NvtcpkStatusName(ost));
-            }
+            const ULONG win = 1024u * 1024u;
+            NTSTATUS o1 = NvtcpkSetSockOpt(c, NVMEOF_TCPK_SO_RCVBUF, win);
+            NTSTATUS o2 = NvtcpkSetSockOpt(c, NVMEOF_TCPK_SO_SNDBUF, win);
+            NvtcpkLogF("socket buffers (IRP issued): RCVBUF 0x%08X SNDBUF 0x%08X, 1 MiB asked",
+                       (unsigned)o1, (unsigned)o2);
         }
     }
     return st;

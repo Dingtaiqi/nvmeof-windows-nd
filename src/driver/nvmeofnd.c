@@ -988,7 +988,12 @@ static NTSTATUS NvmeofndStartWorker(PNVMEOFND_ENGINE Eng)
 // Read at engine attach, which HwInitialize calls: a device restart picks up a
 // new value without unloading the driver.
 #define NVMEOFND_CHUNK_MIN      4096u
-#define NVMEOFND_CHUNK_MAX      (512u * 1024u)
+/* 1 MiB now: the miniport already reports MaximumTransferLength = 1 MiB and the
+ * transport takes NVMEOF_TCPK_IO_MAX = 1 MiB, so 512 KiB only forced an internal
+ * split of exactly the commands NTFS was already issuing.  A single command is
+ * latency-bound (~6 ms per 512 KiB), so doubling the data per command is the
+ * cheapest throughput lever there is. */
+#define NVMEOFND_CHUNK_MAX      (1024u * 1024u)
 #define NVMEOFND_MAX_QUEUES     8u
 #define NVMEOFND_MAX_PIPELINE   8u
 
