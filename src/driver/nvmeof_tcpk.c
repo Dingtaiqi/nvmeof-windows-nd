@@ -1679,6 +1679,67 @@ static NTSTATUS NvtcpkSendDataPdus(PNVMEOF_TCPK_CONN c, USHORT cid, PVOID data, 
     return STATUS_SUCCESS;
 }
 
+/* ------------------------------------------------------------------------- */
+/*  Phase timing: where does a command's wall time actually go?               */
+/*                                                                             */
+/*  C = capsule sent -> first response header (the wire + the target)         */
+/*  D = first header -> whole response received (streaming)                   */
+/*  W = the whole transaction.  Accumulated over 32 commands per direction,   */
+/*  then one log line and registry DWORDs (nvtcpk_ph*_us / pl*_us).           */
+/* ------------------------------------------------------------------------- */
+static LARGE_INTEGER g_phFreq = { 0 };
+static ULONGLONG g_fC, g_fD, g_fW;      /* fast path (big reads) */
+static ULONG    g_fN;
+static ULONGLONG g_lC, g_lD, g_lW;      /* per-PDU loop (writes, in-capsule) */
+static ULONG    g_lN;
+
+static ULONGLONG NvtcpkQpcUs(ULONGLONG from, ULONGLONG to)
+{
+    if (g_phFreq.QuadPart == 0 || to < from) {
+        return 0;
+    }
+    return ((to - from) * 1000000ULL) / (ULONGLONG)g_phFreq.QuadPart;
+}
+
+static ULONGLONG NvtcpkQpcNow(VOID)
+{
+    LARGE_INTEGER now;
+
+    if (g_phFreq.QuadPart == 0) {
+        LARGE_INTEGER f;
+        (void)KeQueryPerformanceCounter(&f);
+        g_phFreq = f;
+    }
+    now = KeQueryPerformanceCounter(NULL);
+    return (ULONGLONG)now.QuadPart;
+}
+
+static VOID NvtcpkPhaseLog(VOID)
+{
+    ULONG fn = g_fN, ln = g_lN;
+
+    if (fn >= 32) {
+        NvtcpkLogF("phase fast n=%u: C(send->hdr)=%u us  D(hdr->stream)=%u us  whole=%u us",
+                   fn, (unsigned)(g_fC / fn), (unsigned)(g_fD / fn), (unsigned)(g_fW / fn));
+        NvtcpkTraceValue(L"nvtcpk_phC_us", (ULONG)(g_fC / fn));
+        NvtcpkTraceValue(L"nvtcpk_phD_us", (ULONG)(g_fD / fn));
+        NvtcpkTraceValue(L"nvtcpk_phW_us", (ULONG)(g_fW / fn));
+        NvtcpkTraceValue(L"nvtcpk_phN", fn);
+        g_fC = g_fD = g_fW = 0;
+        g_fN = 0;
+    }
+    if (ln >= 32) {
+        NvtcpkLogF("phase loop n=%u: C(send->hdr)=%u us  D(hdr->resp)=%u us  whole=%u us",
+                   ln, (unsigned)(g_lC / ln), (unsigned)(g_lD / ln), (unsigned)(g_lW / ln));
+        NvtcpkTraceValue(L"nvtcpk_plC_us", (ULONG)(g_lC / ln));
+        NvtcpkTraceValue(L"nvtcpk_plD_us", (ULONG)(g_lD / ln));
+        NvtcpkTraceValue(L"nvtcpk_plW_us", (ULONG)(g_lW / ln));
+        NvtcpkTraceValue(L"nvtcpk_plN", ln);
+        g_lC = g_lD = g_lW = 0;
+        g_lN = 0;
+    }
+}
+
 /* A big READ's response stream has a size we know before it arrives: k C2HData
  * PDUs of 24+chunk (the 4-byte-alignment pad is zero for 512-multiples) followed
  * by the 24-byte CapsuleResp.  So: read the first PDU's 24-byte header, and if it
@@ -1691,17 +1752,20 @@ static NTSTATUS NvtcpkSendDataPdus(PNVMEOF_TCPK_CONN c, USHORT cid, PVOID data, 
  * at 4 threads = 55% of 4 x 90 MB/s) is round trips, not bytes. */
 static NTSTATUS NvtcpkRecvReadStream(PNVMEOF_TCPK_CONN c, USHORT cid,
                                      PVOID outData, ULONG outBytes,
-                                     UINT8* statusOut, ULONG* dataLenOut)
+                                     UINT8* statusOut, ULONG* dataLenOut,
+                                     ULONGLONG tEntry, ULONGLONG tSend)
 {
     NTSTATUS st;
     NVMEOF_TCP_HDR hdr;
     NVMEOF_TCP_DATA d;
     ULONG k, total, off, datao = 0;
+    ULONGLONG tHdr = 0, tStr = 0;
 
     k = (outBytes + NVMEOF_TCPK_C2H_PDU_MAX - 1) / NVMEOF_TCPK_C2H_PDU_MAX;
     total = NVMEOF_TCP_DATA_HDR_LEN * k + outBytes + NVMEOF_TCP_CRSP_HDR_LEN;
 
     st = NvtcpkRecv(c, 0, NVMEOF_TCP_DATA_HDR_LEN);
+    tHdr = NvtcpkQpcNow();
     if (!NT_SUCCESS(st)) {
         NvtcpkLogF("stream cid=%u: no first PDU header, 0x%08X",
                    (unsigned)cid, (unsigned)st);
@@ -1725,6 +1789,11 @@ static NTSTATUS NvtcpkRecvReadStream(PNVMEOF_TCPK_CONN c, USHORT cid,
         }
         *statusOut = NvtcpkCqeStatus((const UCHAR*)c->rspBuf + NVMEOF_TCP_HDR_LEN);
         if (dataLenOut != NULL) { *dataLenOut = 0; }
+        g_fC += NvtcpkQpcUs(tSend, tHdr);
+        g_fD += 0;
+        g_fW += NvtcpkQpcUs(tEntry, tHdr);
+        g_fN++;
+        NvtcpkPhaseLog();
         return STATUS_SUCCESS;
     }
     if (hdr.type != NVMEOF_TCP_C2HDATA) {
@@ -1736,6 +1805,7 @@ static NTSTATUS NvtcpkRecvReadStream(PNVMEOF_TCPK_CONN c, USHORT cid,
 
     /* Everything past the first header, in one receive. */
     st = NvtcpkRecv(c, NVMEOF_TCP_DATA_HDR_LEN, total - NVMEOF_TCP_DATA_HDR_LEN);
+    tStr = NvtcpkQpcNow();
     if (!NT_SUCCESS(st)) {
         NvtcpkLogF("stream cid=%u: the %u-byte remainder did not arrive, 0x%08X",
                    (unsigned)cid, (unsigned)(total - NVMEOF_TCP_DATA_HDR_LEN),
@@ -1790,6 +1860,14 @@ static NTSTATUS NvtcpkRecvReadStream(PNVMEOF_TCPK_CONN c, USHORT cid,
     }
     *statusOut = NvtcpkCqeStatus((const UCHAR*)c->rspBuf + off + NVMEOF_TCP_HDR_LEN);
     if (dataLenOut != NULL) { *dataLenOut = outBytes; }
+    {
+        ULONGLONG tEnd = NvtcpkQpcNow();
+        g_fC += NvtcpkQpcUs(tSend, tHdr);
+        g_fD += NvtcpkQpcUs(tHdr, tStr);
+        g_fW += NvtcpkQpcUs(tEntry, tEnd);
+    }
+    g_fN++;
+    NvtcpkPhaseLog();
     return STATUS_SUCCESS;
 }
 
@@ -1809,10 +1887,12 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
     USHORT cid;
     BOOLEAN gotResponse = FALSE;
     BOOLEAN bigWrite;
+    ULONGLONG tEntry = 0, tSend = 0, tHdr = 0;
 
     if (dataLenOut != NULL) {
         *dataLenOut = 0;
     }
+    tEntry = NvtcpkQpcNow();
 
     /* Anything over one capsule payload travels as data PDUs: 0 here means the
      * capsule announces no in-line data and an H2CData train follows it. */
@@ -1896,13 +1976,15 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
      * Eligibility is decided before a single byte is consumed, so everything
      * else - writes, in-capsule reads, admin commands - keeps the per-PDU loop
      * exactly as it was. */
+    tSend = NvtcpkQpcNow();
     if (opcode == NVMEOF_TCPK_OPC_READ && outData != NULL &&
         outBytes > NVMEOF_TCPK_MAX_DATA && outBytes <= NVMEOF_TCPK_IO_MAX &&
         (outBytes % NVMEOF_TCP_PDU_ALIGN) == 0 &&
         (NVMEOF_TCP_DATA_HDR_LEN *
              ((outBytes + NVMEOF_TCPK_C2H_PDU_MAX - 1) / NVMEOF_TCPK_C2H_PDU_MAX)
          + outBytes + NVMEOF_TCP_CRSP_HDR_LEN) <= NVMEOF_TCPK_RSP_BYTES) {
-        st = NvtcpkRecvReadStream(c, cid, outData, outBytes, statusOut, dataLenOut);
+        st = NvtcpkRecvReadStream(c, cid, outData, outBytes, statusOut, dataLenOut,
+                                  tEntry, tSend);
         if (NT_SUCCESS(st)) {
             c->commands++;
             return STATUS_SUCCESS;
@@ -1921,6 +2003,9 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
             NvtcpkLogF("command 0x%02X cid=%u: no response header, 0x%08X",
                        (unsigned)opcode, (unsigned)cid, st);
             return st;
+        }
+        if (pdus == 0) {
+            tHdr = NvtcpkQpcNow();
         }
         nvmeofTcpReadHdr((const uint8_t*)c->rspBuf, &hdr);
         if (g_rspSeen < 8) {
@@ -2106,6 +2191,14 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
         NvtcpkLogF("command 0x%02X: only %u of %u bytes of C2HData arrived",
                    (unsigned)opcode, dataSeen, outBytes);
         return STATUS_INVALID_NETWORK_RESPONSE;
+    }
+    {
+        ULONGLONG tEnd = NvtcpkQpcNow();
+        g_lC += NvtcpkQpcUs(tSend, (tHdr != 0) ? tHdr : tEnd);
+        g_lD += (tHdr != 0) ? NvtcpkQpcUs(tHdr, tEnd) : 0;
+        g_lW += NvtcpkQpcUs(tEntry, tEnd);
+        g_lN++;
+        NvtcpkPhaseLog();
     }
     c->commands++;
     return STATUS_SUCCESS;

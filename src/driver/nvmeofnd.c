@@ -342,6 +342,7 @@ static VOID NvmeofndTrace(PCWSTR name, ULONG value)
 typedef struct _NVMEOFND_SLOT {
     PSCSI_REQUEST_BLOCK Srb;      // the request to complete
     PVOID               Ext;      // its adapter extension, captured at enqueue
+    ULONGLONG           Stamp;    // QPC at HwStartIo enqueue, for phase A timing
 } NVMEOFND_SLOT;
 
 typedef struct _NVMEOFND_ENGINE {
@@ -786,6 +787,35 @@ static BOOLEAN NvmeofndPrepareRw(PNVMEOFND_ENGINE Eng, PVOID Ext, PSCSI_REQUEST_
     return TRUE;
 }
 
+/* Phase A timing: how long an SRB sits between HwStartIo's enqueue and the
+ * worker picking it up (queue wait + thread wake), and how long the worker
+ * spends on the whole command.  Averaged over 64 SRBs, one log line plus two
+ * registry DWORDs (nvmeofnd_phA_us / nvmeofnd_phCmd_us). */
+static ULONGLONG g_ndFreq = 0;
+static ULONGLONG g_pmA, g_pmCmd;
+static ULONG     g_pmN;
+
+static ULONGLONG NvmeofndQpcNow(VOID)
+{
+    LARGE_INTEGER now;
+
+    if (g_ndFreq == 0) {
+        LARGE_INTEGER f;
+        (void)KeQueryPerformanceCounter(&f);
+        g_ndFreq = (ULONGLONG)f.QuadPart;
+    }
+    now = KeQueryPerformanceCounter(NULL);
+    return (ULONGLONG)now.QuadPart;
+}
+
+static ULONGLONG NvmeofndQpcUs(ULONGLONG from, ULONGLONG to)
+{
+    if (g_ndFreq == 0 || to < from) {
+        return 0;
+    }
+    return ((to - from) * 1000000ULL) / g_ndFreq;
+}
+
 // One worker per connection.  With nvmeofnd_pipelinedepth = 1 it takes one slot per
 // wake and runs it; above that it takes up to that many ready READ/WRITE SRBs and
 // hands them to NvtcpkBatch, so one connection keeps several commands in flight.
@@ -926,7 +956,23 @@ static VOID NvmeofndWorker(PVOID Context)
                 // NEVER under the spinlock: completion can call back into HwStartIo
                 // (StorPort may start the next request from here), and that path
                 // takes this same lock.
+                ULONGLONG t0 = NvmeofndQpcNow();
+                ULONGLONG t1;
+
                 NvmeofndProcessOne(eng, s.Ext, s.Srb, conn);
+                t1 = NvmeofndQpcNow();
+                g_pmA += NvmeofndQpcUs(s.Stamp, t0);
+                g_pmCmd += NvmeofndQpcUs(t0, t1);
+                if (++g_pmN >= 64) {
+                    NvmeofndLogF("phase miniport n=%u: A(startio->worker)=%u us"
+                                 "  cmd(worker whole)=%u us",
+                                 g_pmN, (unsigned)(g_pmA / g_pmN),
+                                 (unsigned)(g_pmCmd / g_pmN));
+                    NvmeofndTrace(L"nvmeofnd_phA_us", (ULONG)(g_pmA / g_pmN));
+                    NvmeofndTrace(L"nvmeofnd_phCmd_us", (ULONG)(g_pmCmd / g_pmN));
+                    g_pmA = g_pmCmd = 0;
+                    g_pmN = 0;
+                }
             }
         }
         // More work waiting: wake somebody (possibly this thread again) rather
@@ -1699,6 +1745,7 @@ static BOOLEAN NvmeofndStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
     if (eng->Count < NVMEOFND_MAX_PENDING) {
         eng->Slot[eng->Tail].Srb = Srb;
         eng->Slot[eng->Tail].Ext = DeviceExtension;
+        eng->Slot[eng->Tail].Stamp = (ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart;
         eng->Tail = (eng->Tail + 1) % NVMEOFND_MAX_PENDING;
         eng->Count++;
         pushed = TRUE;
