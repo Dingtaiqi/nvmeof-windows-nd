@@ -62,7 +62,7 @@ int main(int argc, char** argv)
     WSAStartup(MAKEWORD(2, 2), &w);
     sa.sin_family = AF_INET;
     sa.sin_port = htons((u_short)port);
-    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    inet_pton(AF_INET, (argc > 5) ? argv[5] : "127.0.0.1", &sa.sin_addr);
 
     if (!strcmp(mode, "-serve") || !strcmp(mode, "-serves")) {
         struct sockaddr_in ca;
