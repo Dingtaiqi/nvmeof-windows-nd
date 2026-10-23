@@ -1762,6 +1762,17 @@ static BOOLEAN NvmeofndStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb)
         return TRUE;
     }
     KeSetEvent(&eng->Wake, IO_NO_INCREMENT, FALSE);
+
+    /* The documented contract this driver never kept: tell StorPort it may hand
+     * over the NEXT request right away.  Without NextRequest the port driver
+     * falls back to a slow delivery path, which is exactly the signature the
+     * phase timers found - the driver itself answers a 1 MiB command in
+     * ~0.9 ms while the application waits 10-17 ms, the queue stamp shows
+     * HwStartIo -> worker at 10 us (so the wait is BEFORE HwStartIo), and the
+     * same uncached pattern runs at 400+ MB/s on the local NVMe.  The engine
+     * has room for 64 slots while StorPort queues at 32, so this is always
+     * true whenever a slot was pushed. */
+    StorPortNotification(NextRequest, DeviceExtension);
     return TRUE;
 }
 
