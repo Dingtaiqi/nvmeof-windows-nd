@@ -341,4 +341,41 @@
 | [ROADMAP.md](ROADMAP.md) | 路线图 |
 | [HYPERVISOR-WAS-THE-CAUSE.md](HYPERVISOR-WAS-THE-CAUSE.md) | hypervisor 下 NDK 失败的定位 |
 | [evidence/](evidence/) | 原始测试日志与复现记录 |
+
+---
+
+## 2026-10-22/23 IRP 修复、256 KiB C2H、以及"墙在本机回环"的定性
+
+### 修复与实测
+
+1. **`WskSetOption` 需要 IRP**（`13a4190`）：WSK 与 Winsock 不同，每个下投调用都必须给
+   调用者分配的 IRP；传 `NULL` 得 `0xC000000D`。补上 IRP 后实测
+   **`SO_RCVBUF = 1 MiB` 真正生效（0x00000000）**，`SO_SNDBUF` 返回
+   `0xC00000BB`（NOT_SUPPORTED）——文档里"内核缓冲从未生效"的旧结论按此修正。
+2. **chunk 上限 512 KiB → 1 MiB**：`MaximumTransferLength` 本来就是 1 MiB，纯拆分浪费。
+   实测**无提升**（4 线程 177/187 vs 169/192），并由此推翻"每命令固定延迟"假设。
+3. **C2H PDU 62 → 256 KiB**（`bee3a48`，按方向拆分：发送仍 62 KiB）：单线程读
+   82 → 78–98 MB/s，只有 ~15%；4×PDU 减少换来不到 20%，**"每 PDU ~775 µs"模型被证伪**。
+   自测 18/0、104/0；数据逐字节校验通过。
+
+### 平台基线（`src/tcp_bwprobe.c`，裸回环 TCP，无任何 NVMe）
+
+| 块大小 | 单流吞吐 |
+|---|---|
+| 4 KiB | 73 MB/s |
+| 64 KiB | **147 MB/s** |
+| 1 MiB | ~142 MB/s |
+
+**结论：本机 127.0.0.1 同步往返的 TCP 每流封顶 ~150 MB/s、总封顶 ~200–300 MB/s**
+（4 流 180–200，bridge 8 读 230）。我们的栈单流 75–98 = 裸平台的 **50–65%**。
+在此机器、此路径、同步请求-响应协议下，~90 MB/s/流、~200 MB/s 聚合
+**已接近平台包络**；PDU/命令尺寸调整不会再有数量级收益。
+
+### 剩下的真杠杆（按预期收益排序，全部未验证）
+
+1. **改走 CX3 自环双口**（target 绑 192.168.100.2）：绕开回环的线程乒乓，
+   TCP offload + RSS + 真 DMA 是另一条包络；先用 `tcp_bwprobe` 测该路径基线。
+2. **重叠往返**：IOCP（target）/ 多 IRP 在飞（内核）——本质是流水线，
+   需先用 CrashOnCtrlScroll + 离线 cdb 根因批量挂死。
+3. 8 线程聚合回退（~195 vs 223）：`eng->Lock` 全引擎一把自旋锁，可按队列分片。
 | [tools/verify_after_reboot.ps1](tools/verify_after_reboot.ps1) | 一键验收 |
