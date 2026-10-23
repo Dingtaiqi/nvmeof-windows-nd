@@ -126,11 +126,15 @@
 #define NVMEOF_TCPK_DATA_PDU_MAX   63488u   /* H2C: what this side sends */
 #define NVMEOF_TCPK_C2H_PDU_MAX    262144u  /* C2H: what this side accepts */
 
-/* One buffer serves every PDU in both directions.  The slack covers the capsule
- * header (72) plus whatever padding the peer's cpda demands for the data offset
- * (up to 128 is accepted), plus the 4-byte tail pad of a received PDU.  Sized by
- * the C2H ceiling: that is the direction whose PDUs land here whole. */
-#define NVMEOF_TCPK_BUF_BYTES      (NVMEOF_TCP_CCMD_HDR_LEN + 256u + NVMEOF_TCPK_C2H_PDU_MAX)
+/* Send side: one outgoing PDU (a capsule or one H2CData) at a time. */
+#define NVMEOF_TCPK_BUF_BYTES      (NVMEOF_TCP_CCMD_HDR_LEN + 256u + NVMEOF_TCPK_DATA_PDU_MAX)
+
+/* Receive side: one WHOLE command's response stream - k C2HData PDUs of
+ * 24+chunk(+pad) plus the 24-byte CapsuleResp - so a read command can land in
+ * ONE receive call and be validated offline, instead of one IRP wait per PDU.
+ * The measured cost this attacks: the stack runs at ~55% of the raw loopback
+ * envelope, and the gap is per-command round trips, not bytes. */
+#define NVMEOF_TCPK_RSP_BYTES      (NVMEOF_TCPK_IO_MAX + 512u)
 
 /* IPPROTO_TCP.  The kernel-mode copies of ws2def.h do not define it (it lives in
  * the user-mode winsock headers), so the value is spelled out here. 6 is TCP. */
@@ -1028,13 +1032,13 @@ static NTSTATUS NvtcpkRecv(PNVMEOF_TCPK_CONN c, ULONG off, ULONG want)
     if (want == 0) {
         return STATUS_SUCCESS;
     }
-    if (off > NVMEOF_TCPK_BUF_BYTES || want > NVMEOF_TCPK_BUF_BYTES - off) {
+    if (off > NVMEOF_TCPK_RSP_BYTES || want > NVMEOF_TCPK_RSP_BYTES - off) {
         /* Asking for more than the buffer holds means the caller's PDU arithmetic
          * is wrong, and by this point part of that PDU may already have been
          * read: the stream can no longer be trusted to be in step. */
         c->broken = TRUE;
         NvtcpkLogF("!! receive of %u bytes at offset %u does not fit the %u-byte PDU buffer",
-                   want, off, (unsigned)NVMEOF_TCPK_BUF_BYTES);
+                   want, off, (unsigned)NVMEOF_TCPK_RSP_BYTES);
         return STATUS_INVALID_PARAMETER;
     }
     while (got < want) {
@@ -1365,21 +1369,21 @@ NTSTATUS NvtcpOpen(_In_ WSK_REGISTRATION* reg, _In_ WSK_PROVIDER_NPI* provider,
     c->remote.sin_addr.S_un.S_addr = ipv4NetworkOrder;
 
     c->pduBuf = ExAllocatePool2(POOL_FLAG_NON_PAGED, NVMEOF_TCPK_BUF_BYTES, NVMEOF_TCPK_TAG);
-    c->rspBuf = ExAllocatePool2(POOL_FLAG_NON_PAGED, NVMEOF_TCPK_BUF_BYTES, NVMEOF_TCPK_TAG);
+    c->rspBuf = ExAllocatePool2(POOL_FLAG_NON_PAGED, NVMEOF_TCPK_RSP_BYTES, NVMEOF_TCPK_TAG);
     if (c->pduBuf == NULL || c->rspBuf == NULL) {
         NvtcpkLogF("NvtcpOpen: no non-paged pool for the PDU buffers");
         st = STATUS_INSUFFICIENT_RESOURCES;
         goto fail_free;
     }
     RtlZeroMemory(c->pduBuf, NVMEOF_TCPK_BUF_BYTES);
-    RtlZeroMemory(c->rspBuf, NVMEOF_TCPK_BUF_BYTES);
+    RtlZeroMemory(c->rspBuf, NVMEOF_TCPK_RSP_BYTES);
 
     /* Both buffers are non-paged pool, so MmBuildMdlForNonPagedPool is the
      * documented way to describe them and the pages are already resident: no
      * MmProbeAndLockPages and no __try needed, which also matters because this
      * code can run at DISPATCH_LEVEL where probing is not allowed. */
     c->pduMdl = IoAllocateMdl(c->pduBuf, NVMEOF_TCPK_BUF_BYTES, FALSE, FALSE, NULL);
-    c->rspMdl = IoAllocateMdl(c->rspBuf, NVMEOF_TCPK_BUF_BYTES, FALSE, FALSE, NULL);
+    c->rspMdl = IoAllocateMdl(c->rspBuf, NVMEOF_TCPK_RSP_BYTES, FALSE, FALSE, NULL);
     if (c->pduMdl == NULL || c->rspMdl == NULL) {
         NvtcpkLogF("NvtcpOpen: IoAllocateMdl failed");
         st = STATUS_INSUFFICIENT_RESOURCES;
@@ -1569,7 +1573,7 @@ NTSTATUS NvtcpClose(_In_ PVOID conn)
         c->immortal = TRUE;
         NvtcpkLogF("!! NvtcpClose: connection %p was poisoned by a timeout; its socket and"
                    " buffers are deliberately leaked (%u bytes held). Reboot or let the peer"
-                   " time out: do not free it", c, (unsigned)(2 * NVMEOF_TCPK_BUF_BYTES));
+                   " time out: do not free it", c, (unsigned)(NVMEOF_TCPK_BUF_BYTES + NVMEOF_TCPK_RSP_BYTES));
         NvtcpkLogFlush();
         NvtcpkTraceValue(L"nvtcpk_poisoned", (ULONG)InterlockedCompareExchange(&g_poisonCount, 0, 0));
         NvtcpkDropRef(c);
@@ -1675,6 +1679,120 @@ static NTSTATUS NvtcpkSendDataPdus(PNVMEOF_TCPK_CONN c, USHORT cid, PVOID data, 
     return STATUS_SUCCESS;
 }
 
+/* A big READ's response stream has a size we know before it arrives: k C2HData
+ * PDUs of 24+chunk (the 4-byte-alignment pad is zero for 512-multiples) followed
+ * by the 24-byte CapsuleResp.  So: read the first PDU's 24-byte header, and if it
+ * is C2HData - the normal case - take the WHOLE remainder in one NvtcpkRecv and
+ * validate every PDU offline.  If the peer answered with the response first (an
+ * error: out of range, backing-file failure) that too is finished here; either
+ * way the command completes without falling back onto the per-PDU loop, because
+ * half a consumed stream cannot be handed back to it.  Per-command IRP waits
+ * drop from 2k+2 to 2 - the measured gap to the raw loopback envelope (our stack
+ * at 4 threads = 55% of 4 x 90 MB/s) is round trips, not bytes. */
+static NTSTATUS NvtcpkRecvReadStream(PNVMEOF_TCPK_CONN c, USHORT cid,
+                                     PVOID outData, ULONG outBytes,
+                                     UINT8* statusOut, ULONG* dataLenOut)
+{
+    NTSTATUS st;
+    NVMEOF_TCP_HDR hdr;
+    NVMEOF_TCP_DATA d;
+    ULONG k, total, off, datao = 0;
+
+    k = (outBytes + NVMEOF_TCPK_C2H_PDU_MAX - 1) / NVMEOF_TCPK_C2H_PDU_MAX;
+    total = NVMEOF_TCP_DATA_HDR_LEN * k + outBytes + NVMEOF_TCP_CRSP_HDR_LEN;
+
+    st = NvtcpkRecv(c, 0, NVMEOF_TCP_DATA_HDR_LEN);
+    if (!NT_SUCCESS(st)) {
+        NvtcpkLogF("stream cid=%u: no first PDU header, 0x%08X",
+                   (unsigned)cid, (unsigned)st);
+        return st;
+    }
+    nvmeofTcpReadHdr((const uint8_t*)c->rspBuf, &hdr);
+
+    if (hdr.type == NVMEOF_TCP_CAPSULERESP) {
+        /* The peer completed the command without sending any data PDU. */
+        if (hdr.hlen != NVMEOF_TCP_CRSP_HDR_LEN || hdr.plen != 0) {
+            c->broken = TRUE;
+            NvtcpkLogF("stream cid=%u: unexpected response hlen=%u plen=%u",
+                       (unsigned)cid, (unsigned)hdr.hlen, (unsigned)hdr.plen);
+            return STATUS_INVALID_NETWORK_RESPONSE;
+        }
+        if (NvtcpkCqeCid((const UCHAR*)c->rspBuf + NVMEOF_TCP_HDR_LEN) != cid) {
+            c->broken = TRUE;
+            NvtcpkLogF("stream cid=%u: response is for cid=%u", (unsigned)cid,
+                       (unsigned)NvtcpkCqeCid((const UCHAR*)c->rspBuf + NVMEOF_TCP_HDR_LEN));
+            return STATUS_INVALID_NETWORK_RESPONSE;
+        }
+        *statusOut = NvtcpkCqeStatus((const UCHAR*)c->rspBuf + NVMEOF_TCP_HDR_LEN);
+        if (dataLenOut != NULL) { *dataLenOut = 0; }
+        return STATUS_SUCCESS;
+    }
+    if (hdr.type != NVMEOF_TCP_C2HDATA) {
+        c->broken = TRUE;
+        NvtcpkLogF("stream cid=%u: first PDU is type 0x%02X, not C2HData",
+                   (unsigned)cid, (unsigned)hdr.type);
+        return STATUS_INVALID_NETWORK_RESPONSE;
+    }
+
+    /* Everything past the first header, in one receive. */
+    st = NvtcpkRecv(c, NVMEOF_TCP_DATA_HDR_LEN, total - NVMEOF_TCP_DATA_HDR_LEN);
+    if (!NT_SUCCESS(st)) {
+        NvtcpkLogF("stream cid=%u: the %u-byte remainder did not arrive, 0x%08X",
+                   (unsigned)cid, (unsigned)(total - NVMEOF_TCP_DATA_HDR_LEN),
+                   (unsigned)st);
+        return st;
+    }
+
+    off = 0;
+    while (datao < outBytes) {
+        BOOLEAN lastFlag;
+        BOOLEAN lastChunk;
+        ULONG chunk, pad;
+
+        nvmeofTcpReadHdr((const uint8_t*)c->rspBuf + off, &hdr);
+        nvmeofTcpReadData((const uint8_t*)c->rspBuf + off, &d);
+        chunk = d.datal;
+        pad = (NVMEOF_TCP_PDU_ALIGN - (chunk % NVMEOF_TCP_PDU_ALIGN)) % NVMEOF_TCP_PDU_ALIGN;
+        lastFlag = (hdr.flags & NVMEOF_TCP_F_LAST) != 0;
+        lastChunk = (datao + chunk) == outBytes;
+        if (hdr.type != NVMEOF_TCP_C2HDATA || hdr.hlen != NVMEOF_TCP_DATA_HDR_LEN ||
+            (hdr.flags & (NVMEOF_TCP_F_HDGST | NVMEOF_TCP_F_DDGST)) != 0 ||
+            d.cccid != cid || d.datao != datao || chunk == 0 ||
+            (ULONGLONG)datao + chunk > (ULONGLONG)outBytes || lastFlag != lastChunk) {
+            c->broken = TRUE;
+            NvtcpkLogF("stream cid=%u: PDU at %u mismatch (type=0x%02X hlen=%u cccid=%u"
+                       " datao=%u datal=%u flags=0x%02X; expected datao=%u of %u)",
+                       (unsigned)cid, off, (unsigned)hdr.type, (unsigned)hdr.hlen,
+                       (unsigned)d.cccid, (unsigned)d.datao, (unsigned)chunk,
+                       (unsigned)hdr.flags, datao, outBytes);
+            return STATUS_INVALID_NETWORK_RESPONSE;
+        }
+        RtlCopyMemory((PUCHAR)outData + datao,
+                      (PUCHAR)c->rspBuf + off + NVMEOF_TCP_DATA_HDR_LEN, chunk);
+        datao += chunk;
+        off += NVMEOF_TCP_DATA_HDR_LEN + chunk + pad;
+    }
+
+    nvmeofTcpReadHdr((const uint8_t*)c->rspBuf + off, &hdr);
+    if (hdr.type != NVMEOF_TCP_CAPSULERESP || hdr.hlen != NVMEOF_TCP_CRSP_HDR_LEN ||
+        hdr.plen != 0) {
+        c->broken = TRUE;
+        NvtcpkLogF("stream cid=%u: trailing PDU is type 0x%02X hlen=%u plen=%u",
+                   (unsigned)cid, (unsigned)hdr.type, (unsigned)hdr.hlen,
+                   (unsigned)hdr.plen);
+        return STATUS_INVALID_NETWORK_RESPONSE;
+    }
+    if (NvtcpkCqeCid((const UCHAR*)c->rspBuf + off + NVMEOF_TCP_HDR_LEN) != cid) {
+        c->broken = TRUE;
+        NvtcpkLogF("stream cid=%u: trailing response is for cid=%u", (unsigned)cid,
+                   (unsigned)NvtcpkCqeCid((const UCHAR*)c->rspBuf + off + NVMEOF_TCP_HDR_LEN));
+        return STATUS_INVALID_NETWORK_RESPONSE;
+    }
+    *statusOut = NvtcpkCqeStatus((const UCHAR*)c->rspBuf + off + NVMEOF_TCP_HDR_LEN);
+    if (dataLenOut != NULL) { *dataLenOut = outBytes; }
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid,
                                   UINT32 cdw10, UINT32 cdw12,
                                   PVOID inData, ULONG inBytes,
@@ -1774,6 +1892,27 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
         return st;
     }
 
+    /* The big-read fast path: two IRP waits per command instead of one per PDU.
+     * Eligibility is decided before a single byte is consumed, so everything
+     * else - writes, in-capsule reads, admin commands - keeps the per-PDU loop
+     * exactly as it was. */
+    if (opcode == NVMEOF_TCPK_OPC_READ && outData != NULL &&
+        outBytes > NVMEOF_TCPK_MAX_DATA && outBytes <= NVMEOF_TCPK_IO_MAX &&
+        (outBytes % NVMEOF_TCP_PDU_ALIGN) == 0 &&
+        (NVMEOF_TCP_DATA_HDR_LEN *
+             ((outBytes + NVMEOF_TCPK_C2H_PDU_MAX - 1) / NVMEOF_TCPK_C2H_PDU_MAX)
+         + outBytes + NVMEOF_TCP_CRSP_HDR_LEN) <= NVMEOF_TCPK_RSP_BYTES) {
+        st = NvtcpkRecvReadStream(c, cid, outData, outBytes, statusOut, dataLenOut);
+        if (NT_SUCCESS(st)) {
+            c->commands++;
+            return STATUS_SUCCESS;
+        }
+        NvtcpkLogF("command 0x%02X cid=%u: stream receive failed 0x%08X %s",
+                   (unsigned)opcode, (unsigned)cid, (unsigned)st, NvtcpkStatusName(st));
+        NvtcpkDiagDump(c, "stream receive failed");
+        return st;
+    }
+
     for (pdus = 0; pdus < NVMEOF_TCPK_MAX_PDUS_PER_CMD && !gotResponse; pdus++) {
         ULONG hlen, body, dataOff, pad;
 
@@ -1791,7 +1930,7 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
         }
         g_rspSeen++;
         hlen = hdr.hlen;
-        if (hlen < NVMEOF_TCP_HDR_LEN || hlen > NVMEOF_TCPK_BUF_BYTES) {
+        if (hlen < NVMEOF_TCP_HDR_LEN || hlen > NVMEOF_TCPK_RSP_BYTES) {
             c->broken = TRUE;
             NvtcpkLogF("command 0x%02X: PDU type 0x%02X announces hlen=%u, which cannot be right",
                        (unsigned)opcode, (unsigned)hdr.type, hlen);
@@ -1836,7 +1975,7 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
                 }
             }
             plen = hdr.plen;
-            if (plen > NVMEOF_TCPK_MAX_DATA || dataOff + plen > NVMEOF_TCPK_BUF_BYTES) {
+            if (plen > NVMEOF_TCPK_MAX_DATA || dataOff + plen > NVMEOF_TCPK_RSP_BYTES) {
                 c->broken = TRUE;
                 NvtcpkLogF("command 0x%02X: CapsuleResp announces plen=%u at offset %u",
                            (unsigned)opcode, plen, dataOff);
@@ -1909,7 +2048,7 @@ static NTSTATUS NvtcpkTransaction(PNVMEOF_TCPK_CONN c, UINT8 opcode, UINT32 nsid
                 return STATUS_INVALID_NETWORK_RESPONSE;
             }
             nvmeofTcpReadData((const uint8_t*)c->rspBuf, &d);
-            if (d.datal > NVMEOF_TCPK_C2H_PDU_MAX || hlen + d.datal > NVMEOF_TCPK_BUF_BYTES) {
+            if (d.datal > NVMEOF_TCPK_C2H_PDU_MAX || hlen + d.datal > NVMEOF_TCPK_RSP_BYTES) {
                 c->broken = TRUE;
                 NvtcpkLogF("command 0x%02X: C2HData datal=%u", (unsigned)opcode, d.datal);
                 return STATUS_INVALID_NETWORK_RESPONSE;
@@ -2043,7 +2182,7 @@ static NTSTATUS NvtcpkBatchEx(PNVMEOF_TCPK_CONN c, NVTCPK_CMD* cmds, ULONG n)
         NvtcpkLogF("batch: rx pdu #%u type=0x%02X flags=0x%02X hlen=%u pdo=%u plen=%u",
                    pdus, (unsigned)hdr.type, (unsigned)hdr.flags, hlen,
                    (unsigned)hdr.pdo, (unsigned)hdr.plen);
-        if (hlen < NVMEOF_TCP_HDR_LEN || hlen > NVMEOF_TCPK_BUF_BYTES) {
+        if (hlen < NVMEOF_TCP_HDR_LEN || hlen > NVMEOF_TCPK_RSP_BYTES) {
             NvtcpkLogF("batch: PDU type 0x%02X announces hlen=%u", (unsigned)hdr.type, hlen);
             st = STATUS_INVALID_NETWORK_RESPONSE;
             goto fail;
@@ -2087,7 +2226,7 @@ static NTSTATUS NvtcpkBatchEx(PNVMEOF_TCPK_CONN c, NVTCPK_CMD* cmds, ULONG n)
                 }
             }
             plen = hdr.plen;
-            if (plen > NVMEOF_TCPK_MAX_DATA || dataOff + plen > NVMEOF_TCPK_BUF_BYTES) {
+            if (plen > NVMEOF_TCPK_MAX_DATA || dataOff + plen > NVMEOF_TCPK_RSP_BYTES) {
                 st = STATUS_INVALID_NETWORK_RESPONSE;
                 goto fail;
             }
@@ -2132,7 +2271,7 @@ static NTSTATUS NvtcpkBatchEx(PNVMEOF_TCPK_CONN c, NVTCPK_CMD* cmds, ULONG n)
                 st = STATUS_INVALID_NETWORK_RESPONSE;
                 goto fail;
             }
-            if (d.datal > NVMEOF_TCPK_C2H_PDU_MAX || hlen + d.datal > NVMEOF_TCPK_BUF_BYTES) {
+            if (d.datal > NVMEOF_TCPK_C2H_PDU_MAX || hlen + d.datal > NVMEOF_TCPK_RSP_BYTES) {
                 st = STATUS_INVALID_NETWORK_RESPONSE;
                 goto fail;
             }
